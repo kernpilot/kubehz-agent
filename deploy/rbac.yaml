@@ -1,0 +1,77 @@
+# Managed-tier least-privilege RBAC for the live-view agent.
+#
+# The agent runs SharedInformers on nodes/pods/events, which require CLUSTER-WIDE
+# list/watch on those three resources. That is the entire blast radius: read-only
+# on nodes/pods/events, plus a get on ITS OWN token Secret (scoped by name). No
+# writes anywhere; no logs/exec/secret-reads beyond the one agent Secret — those
+# are deliberately absent so the pod cannot read workload contents or credentials.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubehz-agent
+  labels:
+    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  # Live view: node inventory/roles/version/capacity, pod-phase summary, and
+  # recent Warning events. get/list/watch only — the informers need list+watch;
+  # get rounds out the read verb set. NO create/update/patch/delete.
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - events
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubehz-agent
+  labels:
+    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubehz-agent
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-agent
+    namespace: kubehz-system
+---
+# Token Secret read — the FALLBACK path only. The Deployment mounts the Secret as
+# a read-only file (the default, needing NO RBAC), so this Role is dormant unless
+# an operator disables the mount and relies on the k8s-API read. It is scoped to
+# the single kubehz-agent Secret by resourceNames and grants ONLY get — the agent
+# can never read any other Secret, and never create/update/delete this one (the
+# never-rotate invariant: the bash CronJob owns bootstrap; the Go agent consumes).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubehz-agent-secret
+  namespace: kubehz-system
+  labels:
+    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [kubehz-agent]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehz-agent-secret
+  namespace: kubehz-system
+  labels:
+    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubehz-agent-secret
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-agent
+    namespace: kubehz-system

@@ -1,0 +1,144 @@
+name: CI
+
+# Verified action + tool versions (2026-07-05): actions/checkout v7,
+# actions/setup-go v6, golangci-lint-action v9, docker/* (buildx v4, qemu v4,
+# login v4, metadata v6, build-push v7), cosign-installer v4, sbom-action v0.24,
+# govulncheck v1.5.0. For production, pin each action by commit SHA.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.4"
+
+jobs:
+  test:
+    name: lint · vet · test · vuln
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: gofmt (must be clean)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+      - name: go test (race + coverage)
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  image:
+    name: build · push image
+    # Publish only from main / tags, never from PRs (no secrets to forks).
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # public GHCR push
+      id-token: write # keyless cosign (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      # ── Internal mirror: Harbor (docker.kubehz.in.net) for our own dogfooding
+      #    pulls. Requires the HARBOR_USERNAME / HARBOR_PASSWORD repo secrets.
+      - name: Log in to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: docker.kubehz.in.net
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      # ── Public, anonymously-pullable canonical image on GHCR (spec §1.5).
+      #    Uses the built-in GITHUB_TOKEN (packages:write). This is the artifact
+      #    customer clusters pull — Harbor is only the internal mirror.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/kernpilot/kubehz-agent
+            docker.kubehz.in.net/kubehz-builds/kubehz-agent
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,format=long
+            type=ref,event=branch
+
+      - name: Build & push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: true # SLSA build provenance attestation
+          sbom: true # attach an SBOM to the image
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+      # ── Supply-chain attestations. Keyless cosign signs the pushed digest via
+      #    the Actions OIDC identity (no long-lived key). A standalone SBOM is
+      #    also generated + attested. NOTE: these run against the PUBLIC GHCR
+      #    image so downstream users can `cosign verify` what runs on their nodes.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign the image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "ghcr.io/kernpilot/kubehz-agent@${{ steps.build.outputs.digest }}"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: "ghcr.io/kernpilot/kubehz-agent@${{ steps.build.outputs.digest }}"
+          format: spdx-json
+          artifact-name: kubehz-agent.spdx.json
+
+      - name: Attest the SBOM
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign attest --yes --type spdxjson \
+            --predicate kubehz-agent.spdx.json \
+            "ghcr.io/kernpilot/kubehz-agent@${{ steps.build.outputs.digest }}"
