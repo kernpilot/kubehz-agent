@@ -1,0 +1,12 @@
+# Keep the build context minimal and reproducible: only the module + source is
+# needed to `go build`. Everything below is either output, VCS, CI, or docs.
+.git
+.github
+bin
+dist
+deploy
+*.md
+Dockerfile
+.dockerignore
+.gitignore
+LICENSE

@@ -1,0 +1,19 @@
+# Build output (root-anchored so it never matches the cmd/kubehz-agent/ package)
+/bin/
+/dist/
+/kubehz-agent
+*.exe
+
+# Test / coverage
+*.out
+coverage.*
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
