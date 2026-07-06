@@ -33,6 +33,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/desired"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
+	"github.com/kernpilot/kubehz-agent/internal/inventory"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
 	"github.com/kernpilot/kubehz-agent/internal/machineissues"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
@@ -134,6 +135,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		EventLister: eventInf.Lister(),
 	}
 
+	// notifyChange rides the same change channel as the informers: any store
+	// that updates between pushes (actions, machine issues, inventory) wakes
+	// the coalescer so its data reaches the dashboard on the next debounced
+	// push.
+	notifyChange := func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	}
+
 	pub := publisher.New(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
 	sender := publisher.NewSender(pub, backoffBase, backoffMax, a.log)
 	go sender.Run(ctx)
@@ -147,17 +159,22 @@ func (a *Agent) Run(ctx context.Context) error {
 		"reportNamespaces", a.cfg.ReportNamespaces,
 	)
 
+	// ClusterInventory (lok8s.dev) manager: a light periodic GET at the
+	// full-beat cadence threads the lo-written deployment inventory (spec)
+	// into every beat. PURE OBSERVATION, ungated like machineIssues — and
+	// fail-soft: on a cluster that was never lok8s-deployed (no CRD/CR) the
+	// snapshot stays nil and the payload simply carries no inventory block.
+	var invManager *inventory.Manager
+	if a.dyn != nil {
+		invManager = inventory.NewManager(a.dyn, a.cfg.FullInterval, notifyChange, a.log)
+		go invManager.Run(ctx)
+	}
+
 	// P3 desired-state loop: Poller pulls the platform's intent, the Executor
 	// acts LOCALLY (MachineDeployment replica patches; execution is entirely
 	// server-gated), and the actions store threads outcomes into every beat.
 	// The store's notify rides the same change channel as the informers, so a
 	// done/failed action reaches the dashboard on the next debounced push.
-	notifyChange := func() {
-		select {
-		case changes <- struct{}{}:
-		default:
-		}
-	}
 	actionStore := actions.New(notifyChange)
 
 	// machineIssues collector: PURE OBSERVATION, deliberately ungated by the
@@ -220,6 +237,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		// are non-empty.
 		payload.Actions = actionStore.Snapshot()
 		payload.MachineIssues = issueStore.Snapshot()
+		if invManager != nil {
+			payload.Inventory = invManager.Snapshot()
+		}
 		state.ApplyCaps(payload)
 		sender.Enqueue(payload)
 		a.log.Debug("queued live-view push",
@@ -229,6 +249,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			"warnings", len(payload.Events),
 			"actions", len(payload.Actions),
 			"machineIssues", len(payload.MachineIssues),
+			"inventory", payload.Inventory != nil,
 		)
 	})
 	return ctx.Err()

@@ -52,6 +52,15 @@ const (
 	// MaxRevision mirrors HB_MAX_COUNT — the server bounds every count-like
 	// integer, including the acted desired-state revision.
 	MaxRevision = 10_000_000
+	// MaxAddons mirrors the ClusterInventory CRD's spec.addons maxItems
+	// (lok8s operator/crds/clusterinventory.yaml). The inventory block is READ
+	// off that CR, whose schema the apiserver already enforced on write, so
+	// these caps can never truncate real data — they exist so a hand-rolled or
+	// corrupt CR still cannot bloat the beat. The per-field caps conveniently
+	// coincide with the heartbeat's own: name<=253 (MaxNameLen),
+	// versions/hash/timestamps<=64 (MaxVersionLen), kind/provider/category/
+	// source<=63 (MaxStatusLen).
+	MaxAddons = 256
 )
 
 // AgentMode distinguishes the two agents that speak this contract.
@@ -107,6 +116,23 @@ type Payload struct {
 	// join. Latest-wins server-side, exactly like actions: omitempty is
 	// load-bearing (an empty list must serialize as an ABSENT key = clear).
 	MachineIssues []MachineIssue `json:"machineIssues,omitempty"`
+
+	// Inventory mirrors the SPEC of the lok8s ClusterInventory CR (cluster-
+	// scoped singleton "cluster", written by the user's own `lo` CLI at the end
+	// of provision/bootstrap) — the deployed lok8s/driver/k8s versions and the
+	// resolved addon list with pinned chart versions. STRICTLY metadata the
+	// user's own tooling already wrote into their own cluster (the CRD schema
+	// prunes anything beyond versions/names/categories/hash — never chart
+	// values, env overrides, or credentials), so it is the same privacy class
+	// as the version fields above and is NOT gated by ReportNamespaces.
+	// Absent (omitempty) when the CRD/CR does not exist — a cluster not
+	// deployed by lok8s sends no block at all.
+	//
+	// The kubehz-api ingestion of this block (+ the availableUpdates response,
+	// see AvailableUpdate) is being built in parallel; until it lands, the
+	// non-strict HeartbeatSchema accepts-and-strips the key, exactly like the
+	// other additive schema-2 fields.
+	Inventory *Inventory `json:"inventory,omitempty"`
 
 	// Pools and Desired are DESIGNED, forward-compat fields (spec §2/§3): the
 	// observed MachineDeployment pools and the desired{revision,state} ack.
@@ -230,6 +256,32 @@ type MachineIssue struct {
 	Since   string `json:"since"`
 }
 
+// Inventory is the heartbeat `inventory` block — a 1:1 mirror of
+// ClusterInventory.spec (lok8s.dev/v1alpha1, grounded against lok8s
+// operator/crds/clusterinventory.yaml on 2026-07-06). Field names are the
+// CR's field names verbatim: the block must round-trip lo → CR → beat →
+// dashboard without translation.
+type Inventory struct {
+	Lok8sVersion      string  `json:"lok8sVersion"`
+	Kind              string  `json:"kind"`
+	Provider          string  `json:"provider,omitempty"`
+	KubernetesVersion string  `json:"kubernetesVersion,omitempty"`
+	SpecHash          string  `json:"specHash"`
+	RenderedAt        string  `json:"renderedAt"`
+	Addons            []Addon `json:"addons,omitempty"`
+}
+
+// Addon is one resolved spec.bootstrap entry from the ClusterInventory spec:
+// name + pinned chart version + category label + source (framework "addon" or
+// per-cluster "target"). Metadata only — never values or overrides.
+type Addon struct {
+	Name         string `json:"name"`
+	ChartVersion string `json:"chartVersion,omitempty"`
+	AppVersion   string `json:"appVersion,omitempty"`
+	Category     string `json:"category,omitempty"`
+	Source       string `json:"source,omitempty"`
+}
+
 // Pool is an observed worker MachineDeployment (forward-compat, spec §2/§3).
 type Pool struct {
 	Name        string `json:"name"`
@@ -345,6 +397,29 @@ func ApplyCaps(p *Payload) {
 	}
 	if len(p.MachineIssues) == 0 {
 		p.MachineIssues = nil
+	}
+
+	// Inventory: mirror the ClusterInventory CRD's own bounds (see MaxAddons).
+	// The CR was schema-validated by the apiserver, so on real data every
+	// clamp is a no-op — this only defangs a hand-rolled/corrupt CR.
+	if p.Inventory != nil {
+		inv := p.Inventory
+		inv.Lok8sVersion = clamp(inv.Lok8sVersion, MaxVersionLen)
+		inv.Kind = clamp(inv.Kind, MaxStatusLen)
+		inv.Provider = clamp(inv.Provider, MaxStatusLen)
+		inv.KubernetesVersion = clamp(inv.KubernetesVersion, MaxVersionLen)
+		inv.SpecHash = clamp(inv.SpecHash, MaxVersionLen)
+		inv.RenderedAt = clamp(inv.RenderedAt, MaxVersionLen)
+		if len(inv.Addons) > MaxAddons {
+			inv.Addons = inv.Addons[:MaxAddons]
+		}
+		for i := range inv.Addons {
+			inv.Addons[i].Name = clamp(inv.Addons[i].Name, MaxNameLen)
+			inv.Addons[i].ChartVersion = clamp(inv.Addons[i].ChartVersion, MaxVersionLen)
+			inv.Addons[i].AppVersion = clamp(inv.Addons[i].AppVersion, MaxVersionLen)
+			inv.Addons[i].Category = clamp(inv.Addons[i].Category, MaxStatusLen)
+			inv.Addons[i].Source = clamp(inv.Addons[i].Source, MaxStatusLen)
+		}
 	}
 
 	// Keep the first MaxNamespaces in lexicographic order: deterministic, so

@@ -303,3 +303,91 @@ func TestPayload_WireNames(t *testing.T) {
 		t.Errorf("privacy-gated fields leaked into empty payload: %s", s)
 	}
 }
+
+// TestApplyCaps_BoundsInventory: the inventory block is clamped to the
+// ClusterInventory CRD's own bounds (a real CR can never exceed them — this
+// defangs a hand-rolled/corrupt one), and a nil block stays nil.
+func TestApplyCaps_BoundsInventory(t *testing.T) {
+	p := &Payload{Inventory: &Inventory{
+		Lok8sVersion:      strings.Repeat("v", MaxVersionLen+5),
+		Kind:              strings.Repeat("k", MaxStatusLen+5),
+		Provider:          strings.Repeat("p", MaxStatusLen+5),
+		KubernetesVersion: strings.Repeat("K", MaxVersionLen+5),
+		SpecHash:          strings.Repeat("h", MaxVersionLen+5),
+		RenderedAt:        strings.Repeat("r", MaxVersionLen+5),
+	}}
+	for i := 0; i < MaxAddons+10; i++ {
+		p.Inventory.Addons = append(p.Inventory.Addons, Addon{
+			Name:         strings.Repeat("n", MaxNameLen+5),
+			ChartVersion: strings.Repeat("c", MaxVersionLen+5),
+			AppVersion:   strings.Repeat("a", MaxVersionLen+5),
+			Category:     strings.Repeat("g", MaxStatusLen+5),
+			Source:       strings.Repeat("s", MaxStatusLen+5),
+		})
+	}
+	ApplyCaps(p)
+
+	inv := p.Inventory
+	if len(inv.Lok8sVersion) != MaxVersionLen || len(inv.Kind) != MaxStatusLen ||
+		len(inv.Provider) != MaxStatusLen || len(inv.KubernetesVersion) != MaxVersionLen ||
+		len(inv.SpecHash) != MaxVersionLen || len(inv.RenderedAt) != MaxVersionLen {
+		t.Errorf("inventory scalar fields not clamped: %+v", inv)
+	}
+	if len(inv.Addons) != MaxAddons {
+		t.Errorf("addons = %d, want %d", len(inv.Addons), MaxAddons)
+	}
+	a := inv.Addons[0]
+	if len(a.Name) != MaxNameLen || len(a.ChartVersion) != MaxVersionLen ||
+		len(a.AppVersion) != MaxVersionLen || len(a.Category) != MaxStatusLen ||
+		len(a.Source) != MaxStatusLen {
+		t.Errorf("addon fields not clamped: %+v", a)
+	}
+
+	empty := &Payload{}
+	ApplyCaps(empty)
+	if empty.Inventory != nil {
+		t.Error("nil inventory must stay nil")
+	}
+}
+
+// TestPayload_InventoryWireShape pins the inventory block to the CR's exact
+// field names (spec: lok8sVersion/kind/provider/kubernetesVersion/specHash/
+// renderedAt/addons[{name,chartVersion,appVersion,category,source}]) and to
+// omitempty semantics: no CR → no key at all.
+func TestPayload_InventoryWireShape(t *testing.T) {
+	p := &Payload{Inventory: &Inventory{
+		Lok8sVersion:      "1.4.2",
+		Kind:              "kubeone",
+		Provider:          "hetzner",
+		KubernetesVersion: "v1.35.5",
+		SpecHash:          strings.Repeat("a", 64),
+		RenderedAt:        "2026-07-06T10:00:00Z",
+		Addons: []Addon{{
+			Name: "cilium", ChartVersion: "1.16.1", AppVersion: "1.16.1",
+			Category: "networking", Source: "addon",
+		}},
+	}}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`"inventory":{`, `"lok8sVersion":"1.4.2"`, `"kind":"kubeone"`,
+		`"provider":"hetzner"`, `"kubernetesVersion":"v1.35.5"`,
+		fmt.Sprintf(`"specHash":"%s"`, strings.Repeat("a", 64)),
+		`"renderedAt":"2026-07-06T10:00:00Z"`,
+		`"addons":[{"name":"cilium","chartVersion":"1.16.1","appVersion":"1.16.1","category":"networking","source":"addon"}]`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("payload JSON missing %s\ngot: %s", want, s)
+		}
+	}
+
+	if b, err = json.Marshal(&Payload{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "inventory") {
+		t.Errorf("absent CR must serialize with NO inventory key, got: %s", b)
+	}
+}
