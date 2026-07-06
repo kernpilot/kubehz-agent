@@ -104,11 +104,18 @@ func (p *Poller) Run(ctx context.Context) {
 		default:
 			backoff.Reset()
 			cached = doc
+			// healing is logged as the ARMED state (both server bits — the same
+			// conjunction the executor acts on), plus the effective policy
+			// numbers, so arming/policy changes have a positive log signal.
 			p.log.Info("desired state pulled",
 				"revision", doc.Revision,
 				"pools", len(doc.WorkerPools),
 				"scaling", doc.Execution.Scaling,
-				"upgrades", doc.Execution.Upgrades)
+				"upgrades", doc.Execution.Upgrades,
+				"healing", doc.Execution.Healing && doc.Healing.Enabled,
+				"healingMaxUnhealthy", doc.Healing.MaxUnhealthy,
+				"healingUnhealthyAfterSeconds", doc.Healing.UnhealthyAfterSeconds,
+				"healingCooldownSeconds", doc.Healing.CooldownSeconds)
 			retryPending = p.actor.Reconcile(ctx, doc)
 			wait = p.jitteredInterval()
 		}

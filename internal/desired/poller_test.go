@@ -1,10 +1,13 @@
 package desired
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -262,4 +265,84 @@ func TestPoller_TransientFailureRetriesOn304(t *testing.T) {
 	cancel()
 	trigger <- time.Now()
 	wg.Wait()
+}
+
+// syncBuffer is a goroutine-safe bytes.Buffer for capturing the poller
+// goroutine's log output under -race.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// The "desired state pulled" log must carry a POSITIVE healing signal: the
+// armed flag (execution.healing && healing.enabled — the exact conjunction the
+// executor acts on) plus the effective policy numbers, so arming/policy
+// changes are observable without diffing documents.
+func TestPoller_LogsHealingArmStateAndPolicy(t *testing.T) {
+	for name, tc := range map[string]struct {
+		execHealing   bool
+		policyEnabled bool
+		wantArmed     string
+	}{
+		"armed":             {execHealing: true, policyEnabled: true, wantArmed: "healing=true"},
+		"policy bit off":    {execHealing: true, policyEnabled: false, wantArmed: "healing=false"},
+		"execution bit off": {execHealing: false, policyEnabled: true, wantArmed: "healing=false"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"9-001"`)
+				_, _ = fmt.Fprintf(w, `{"revision":9,"kubernetesVersion":null,"workerPools":[],`+
+					`"execution":{"scaling":false,"upgrades":false,"healing":%t},`+
+					`"healing":{"enabled":%t,"maxUnhealthy":2,"nodeStartupTimeoutSeconds":600,`+
+					`"unhealthyAfterSeconds":300,"cooldownSeconds":900}}`,
+					tc.execHealing, tc.policyEnabled)
+			}))
+			defer ts.Close()
+
+			var buf syncBuffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			c := NewClient(ts.URL, "kubehz.in.net", testToken, "0.1.0", nil)
+			p := NewPoller(c, &recordingActor{}, time.Minute, time.Second, time.Minute, logger)
+			tm := newTimers()
+			p.afterFunc = tm.afterFunc
+			p.jitter = func() float64 { return 0 }
+
+			ctx, cancel := context.WithCancel(context.Background())
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() { defer wg.Done(); p.Run(ctx) }()
+
+			trigger := tm.next(t) // parked after poll 1 (200, logged)
+			cancel()
+			trigger <- time.Now()
+			wg.Wait()
+
+			out := buf.String()
+			if !strings.Contains(out, "desired state pulled") {
+				t.Fatalf("no pull log emitted:\n%s", out)
+			}
+			for _, want := range []string{
+				tc.wantArmed,
+				"healingMaxUnhealthy=2",
+				"healingUnhealthyAfterSeconds=300",
+				"healingCooldownSeconds=900",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("pull log missing %q:\n%s", want, out)
+				}
+			}
+		})
+	}
 }
