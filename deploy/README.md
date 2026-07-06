@@ -8,24 +8,44 @@ kubectl apply -k deploy/
 kubectl apply -k deploy/managed/
 ```
 
-## The base/managed RBAC split (P3)
+## The base/managed RBAC split
 
 The base is strictly read-only. `deploy/managed/` is the base **plus**
-`rbac-managed.yaml`: a **namespaced Role in kube-system** granting
-`get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
-machine-controller API group — **not** `cluster.x-k8s.io`), bound to the
-`kubehz-live-agent` ServiceAccount. That patch permission is the entire P3
-acting blast radius: replica edits on worker MachineDeployments, executed
-only when the platform's `/desired` document authorizes scaling.
+`rbac-managed.yaml`, which grants exactly three things to the
+`kubehz-live-agent` ServiceAccount:
+
+1. **MachineDeployment patch** (namespaced Role, kube-system):
+   `get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
+   machine-controller API group — **not** `cluster.x-k8s.io`). Patch covers
+   the two fields the executors edit: `spec.replicas` (P3 scaling) and
+   `spec.template.spec.versions.kubelet` (P6 worker rolls).
+2. **Machine read + delete** (same Role): reads feed `machineIssues[]` and
+   the P5/P6 loops; **delete is the P5 self-healing permission** — loudly
+   documented in the file, removable independently (healing then fails
+   closed as a reported Forbidden).
+3. **Pods delete** (ClusterRole `kubehz-live-agent-eviction-unwedge` —
+   delete verb ONLY): exists solely to **unwedge evictions of heal-deleted
+   machines' dead nodes**. When healing deletes a Machine whose node is
+   truly unreachable, the pods stuck Terminating there never confirm and
+   machine-controller retries eviction forever — a zombie server billing the
+   user. After `KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS` (default 300) the
+   agent force-deletes exactly those already-Terminating pods, once per
+   machine, UID-preconditioned, and only while the node is still
+   unreachable. It has to be a ClusterRole (the stuck pods span arbitrary
+   namespaces); drop it and the unwedge is disabled while healing keeps
+   working.
+
+Every write is executed only when the platform's `/desired` document
+authorizes it — the overlay grants ability, never intent.
 
 **Registered-tier users should apply the base, not the overlay** — acting is
-server-gated off for their tier, so the extra permission buys nothing and
+server-gated off for their tier, so the extra permissions buy nothing and
 least privilege says an unused write should not exist. Without the overlay a
-(mis)authorized scale attempt fails closed as a reported Forbidden action.
+(mis)authorized acting attempt fails closed as a reported Forbidden action.
 
 If you relocate the pools (`KUBEHZ_MD_NAMESPACE`), move the Role's
-`namespace` in `rbac-managed.yaml` accordingly — it is deliberately a Role,
-not a ClusterRole.
+`namespace` in `rbac-managed.yaml` accordingly — the machine-side grants are
+deliberately namespaced Roles.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)
 

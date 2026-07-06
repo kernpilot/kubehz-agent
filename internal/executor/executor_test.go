@@ -57,6 +57,7 @@ func fakeDyn(objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
 		map[schema.GroupVersionResource]string{
 			MachineDeploymentGVR: "MachineDeploymentList",
 			machines.MachineGVR:  "MachineList",
+			podsGVR:              "PodList", // eviction-unwedge force-deletes
 		},
 		objects...)
 }

@@ -33,3 +33,11 @@ data:
   # Per-pool replica CEILING: a desiredReplicas outside 0..this is REFUSED and
   # reported failed — never rewritten to the bound and applied.
   KUBEHZ_MAX_REPLICAS: "50"
+  # P5 eviction unwedge: a HEAL-DELETED machine still deleting after this many
+  # seconds, with its node still unreachable, gets the pods stuck Terminating
+  # on that node force-deleted ONCE so eviction can complete (otherwise the
+  # dead server sits in deletion indefinitely, billing the user). Minimum 60.
+  # Needs the pods-delete ClusterRole from deploy/managed — without it the
+  # unwedge fails soft (loud warning + reported detail) and healing keeps
+  # working.
+  KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS: "300"

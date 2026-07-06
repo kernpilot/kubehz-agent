@@ -47,6 +47,12 @@ const (
 	// not an enable switch): a desiredReplicas outside 0..max is REFUSED and
 	// reported failed — never rewritten to the bound and applied.
 	EnvMaxReplicas = "KUBEHZ_MAX_REPLICAS"
+	// EnvHealEvictionTimeoutSeconds is how long a HEAL-DELETED machine may sit
+	// deleting before the eviction unwedge force-deletes the pods stuck
+	// Terminating on its (still-unreachable) node. Whole seconds; floored at
+	// MinHealEvictionTimeoutSeconds — force-deleting pods early would fight
+	// eviction, not unwedge it.
+	EnvHealEvictionTimeoutSeconds = "KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS"
 )
 
 // Defaults. The push cadence follows managed-platform-spec §2: a full snapshot
@@ -73,6 +79,13 @@ const (
 	// MaxMaxReplicas bounds the override itself — a ceiling of a million
 	// nodes is a typo, not a fleet.
 	MaxMaxReplicas = 10_000
+	// DefaultHealEvictionTimeout: 5 minutes of stuck eviction before the
+	// unwedge fires. The dogfooded wedge sat ~12 minutes; 5 gives normal
+	// eviction (even a slow drain) every chance to finish first.
+	DefaultHealEvictionTimeout = 300 * time.Second
+	// MinHealEvictionTimeoutSeconds rejects a timeout that would race normal
+	// eviction — a 1s "unwedge" is a typo'd foot-gun, not a policy.
+	MinHealEvictionTimeoutSeconds = 60
 )
 
 // agentTokenRE is the format of secret A (§1.7.1): khz_agt_<hex(32B)> — 64 hex
@@ -122,6 +135,11 @@ type Config struct {
 	// MaxReplicas is the agent-side per-pool ceiling: desiredReplicas outside
 	// 0..MaxReplicas is refused (reported failed), never clamped-and-applied.
 	MaxReplicas int
+	// HealEvictionTimeout: a heal-deleted machine deleting longer than this,
+	// with its node still unreachable, gets its stuck-Terminating pods
+	// force-deleted (once) so eviction can complete. See executor/unwedge.go
+	// for the hard bounds.
+	HealEvictionTimeout time.Duration
 
 	// ReportNamespaces gates the privacy-sensitive fields (per-namespace pod
 	// counts, event namespaces + messages). Default FALSE — spec §2's
@@ -140,10 +158,10 @@ func (c *Config) String() string {
 		tok = "khz_agt_***redacted***"
 	}
 	return fmt.Sprintf(
-		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s mdNamespace=%q maxReplicas=%d}",
+		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s mdNamespace=%q maxReplicas=%d healEvictionTimeout=%s}",
 		c.ClusterID, c.APIURL, tok, c.Namespace, c.SecretName,
 		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces,
-		c.DesiredPoll, c.MDNamespace, c.MaxReplicas,
+		c.DesiredPoll, c.MDNamespace, c.MaxReplicas, c.HealEvictionTimeout,
 	)
 }
 
@@ -152,15 +170,16 @@ func (c *Config) String() string {
 // the real environment or filesystem.
 func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, error)) (*Config, error) {
 	c := &Config{
-		Namespace:        lookupDefault(getenv, EnvNamespace, DefaultNamespace),
-		SecretName:       lookupDefault(getenv, EnvSecretName, DefaultSecretName),
-		FullInterval:     DefaultFullInterval,
-		Debounce:         DefaultDebounce,
-		MinGap:           DefaultMinGap,
-		DesiredPoll:      DefaultDesiredPoll,
-		MDNamespace:      lookupDefault(getenv, EnvMDNamespace, DefaultMDNamespace),
-		MaxReplicas:      DefaultMaxReplicas,
-		ReportNamespaces: false,
+		Namespace:           lookupDefault(getenv, EnvNamespace, DefaultNamespace),
+		SecretName:          lookupDefault(getenv, EnvSecretName, DefaultSecretName),
+		FullInterval:        DefaultFullInterval,
+		Debounce:            DefaultDebounce,
+		MinGap:              DefaultMinGap,
+		DesiredPoll:         DefaultDesiredPoll,
+		MDNamespace:         lookupDefault(getenv, EnvMDNamespace, DefaultMDNamespace),
+		MaxReplicas:         DefaultMaxReplicas,
+		HealEvictionTimeout: DefaultHealEvictionTimeout,
+		ReportNamespaces:    false,
 	}
 	if !namespaceRE.MatchString(c.MDNamespace) {
 		return nil, fmt.Errorf("%s must be a DNS-1123 label (got %q)", EnvMDNamespace, c.MDNamespace)
@@ -216,6 +235,16 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 			return nil, fmt.Errorf("%s must be at most %d (got %d)", EnvMaxReplicas, MaxMaxReplicas, maxR)
 		}
 		c.MaxReplicas = maxR
+	}
+
+	if secs, ok, err := lookupPositiveInt(getenv, EnvHealEvictionTimeoutSeconds); err != nil {
+		return nil, err
+	} else if ok {
+		if secs < MinHealEvictionTimeoutSeconds {
+			return nil, fmt.Errorf("%s must be at least %d seconds (got %d) — force-deleting pods early fights eviction instead of unwedging it",
+				EnvHealEvictionTimeoutSeconds, MinHealEvictionTimeoutSeconds, secs)
+		}
+		c.HealEvictionTimeout = time.Duration(secs) * time.Second
 	}
 
 	return c, nil

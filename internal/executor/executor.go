@@ -115,6 +115,16 @@ var controlPlaneLabelKeys = []string{
 // only the joinless-machine case can then fire.
 type NodeSource func() ([]*corev1.Node, error)
 
+// PodSource supplies the current pods (the agent wires the pod informer
+// lister; tests wire fixtures). nil disables the post-heal eviction unwedge
+// (see unwedge.go) — healing itself is unaffected.
+type PodSource func() ([]*corev1.Pod, error)
+
+// defaultEvictionTimeout mirrors config.DefaultHealEvictionTimeout: how long
+// a heal-deleted Machine may sit deleting before the eviction unwedge
+// considers it wedged (see unwedge.go).
+const defaultEvictionTimeout = 300 * time.Second
+
 // Executor implements desired.Actor. One instance, driven by the Poller.
 type Executor struct {
 	dyn         dynamic.Interface
@@ -127,7 +137,10 @@ type Executor struct {
 	observedVersion func() string
 	// nodes supplies node health for the P5 healer.
 	nodes NodeSource
-	log   *slog.Logger
+	// pods supplies pods for the post-heal eviction unwedge (unwedge.go).
+	// nil = unwedge disabled.
+	pods PodSource
+	log  *slog.Logger
 
 	// now is the healer's clock (injectable for tests).
 	now func() time.Time
@@ -144,6 +157,15 @@ type Executor struct {
 	// restart mid-roll it is re-derived from the machines still on the old
 	// version (see deriveFromVersion).
 	rollFrom map[string]string
+	// healDeleted tracks the machines THIS agent heal-deleted (unwedge.go's
+	// hard scope bound: never a manually-deleted machine). In-memory ON
+	// PURPOSE — a restarted agent forgets its deletions and the unwedge is
+	// then disabled for them, which is the conservative failure mode (a stuck
+	// teardown bills a zombie server; it never threatens availability).
+	healDeleted map[string]*healDeletion
+	// evictionTimeout is how long a heal-deleted Machine may sit deleting
+	// before the unwedge fires (KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS).
+	evictionTimeout time.Duration
 }
 
 // Options configures New. Namespace and MaxReplicas are required by the
@@ -153,6 +175,10 @@ type Options struct {
 	MaxReplicas     int
 	ObservedVersion func() string
 	Nodes           NodeSource
+	// Pods feeds the post-heal eviction unwedge (unwedge.go). nil disables it.
+	Pods PodSource
+	// EvictionTimeout is the unwedge trigger (<=0 → 300s default).
+	EvictionTimeout time.Duration
 	Now             func() time.Time // injectable clock (tests)
 	Logger          *slog.Logger
 }
@@ -171,6 +197,9 @@ func New(dyn dynamic.Interface, store *actions.Store, opts Options) *Executor {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.EvictionTimeout <= 0 {
+		opts.EvictionTimeout = defaultEvictionTimeout
+	}
 	return &Executor{
 		dyn:             dyn,
 		namespace:       opts.Namespace,
@@ -178,11 +207,14 @@ func New(dyn dynamic.Interface, store *actions.Store, opts Options) *Executor {
 		store:           store,
 		observedVersion: opts.ObservedVersion,
 		nodes:           opts.Nodes,
+		pods:            opts.Pods,
 		log:             opts.Logger,
 		now:             opts.Now,
 		baseline:        opts.Now(),
 		lastHeal:        make(map[string]time.Time),
 		rollFrom:        make(map[string]string),
+		healDeleted:     make(map[string]*healDeletion),
+		evictionTimeout: opts.EvictionTimeout,
 	}
 }
 

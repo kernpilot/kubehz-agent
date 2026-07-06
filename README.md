@@ -236,6 +236,21 @@ How they work, truthfully:
    become a machine-delete loop); autoscaler-owned pools and unowned machines
    are refused. Healing re-evaluates every poll tick; detection windows are
    floored at 60 s agent-side.
+   **Eviction unwedge (the bounded follow-through):** when the healed node is
+   truly dead (kubelet stopped), machine-controller's eviction of the pods
+   stuck Terminating there can never confirm, so the deleted Machine sits in
+   teardown indefinitely — a zombie server billing the user (observed live:
+   ~12 min until manual intervention). If a machine **this agent itself
+   heal-deleted** is still deleting after
+   `KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS` (default 300) *and* its node is
+   still unreachable (Ready Unknown/False), the agent force-deletes exactly
+   the pods **already Terminating on that node** (grace 0, UID-preconditioned
+   so a same-name replacement is never hit), **once per machine**, and
+   reports it on the heal action ("eviction unwedged: force-deleted N
+   pod(s)…"). A manually-deleted machine is never touched (in-memory
+   tracking — a restart conservatively forgets), a recovered node is left
+   alone, and without the pods-delete ClusterRole the attempt warns loudly
+   and fails soft while healing keeps working.
 5. **Upgrades (P6): roll workers toward the declared version.** When the
    desired `kubernetesVersion` differs from a pool MD's declared kubelet, the
    executor patches `spec.template.spec.versions.kubelet` (the exact
@@ -259,12 +274,16 @@ How they work, truthfully:
    idempotent, that costs zero cluster writes.
 
 The acting RBAC — `patch` on machinedeployments (replicas + kubelet version)
-and read + **delete** on machines, kube-system-scoped Roles — is an **opt-in
-overlay**: `kubectl apply -k deploy/managed/`, absent from the
+and read + **delete** on machines (kube-system-scoped Roles), plus a
+pods-**delete**-only ClusterRole for the eviction unwedge (the stuck pods
+span arbitrary namespaces, which no namespaced Role can express) — is an
+**opt-in overlay**: `kubectl apply -k deploy/managed/`, absent from the
 registered-tier base. The machines **delete** verb exists solely for P5 and
 is loudly documented in `deploy/managed/rbac-managed.yaml`; drop that one
 verb and healing fails closed (reported `Forbidden`) while everything else
-keeps working. See [deploy/README.md](deploy/README.md).
+keeps working. Drop the unwedge ClusterRole and only the unwedge is
+disabled — healing itself is unaffected. See
+[deploy/README.md](deploy/README.md).
 
 ## Configuration
 
@@ -281,6 +300,7 @@ keeps working. See [deploy/README.md](deploy/README.md).
 | `KUBEHZ_DESIRED_POLL_SECONDS` | `60` | desired-state pull cadence (integer seconds; + ≤10% jitter) |
 | `KUBEHZ_MD_NAMESPACE` | `kube-system` | where the executor looks for MachineDeployments |
 | `KUBEHZ_MAX_REPLICAS` | `50` | per-pool ceiling; out-of-bounds desired is **refused**, not clamped |
+| `KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS` | `300` | how long a heal-deleted machine may sit deleting (node still dead) before the one-shot eviction unwedge; min 60 |
 | `KUBEHZ_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 
 None of these enable acting — execution is authorized exclusively by the

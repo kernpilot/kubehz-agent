@@ -247,6 +247,39 @@ func TestLoad_ExecutorGuardRails(t *testing.T) {
 	}
 }
 
+// The eviction-unwedge timeout: defaults to 300s, overridable in whole
+// seconds, floored at 60 (a shorter "unwedge" would race normal eviction).
+func TestLoad_HealEvictionTimeout(t *testing.T) {
+	c, err := Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HealEvictionTimeout != DefaultHealEvictionTimeout {
+		t.Errorf("HealEvictionTimeout default = %s, want %s", c.HealEvictionTimeout, DefaultHealEvictionTimeout)
+	}
+
+	c, err = Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x",
+		EnvHealEvictionTimeoutSeconds: "600",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HealEvictionTimeout != 600*time.Second {
+		t.Errorf("HealEvictionTimeout = %s, want 600s", c.HealEvictionTimeout)
+	}
+
+	for _, bad := range []string{"0", "-5", "abc", "59", "1"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: "d", EnvAPIURL: "https://x", EnvHealEvictionTimeoutSeconds: bad,
+		}), noFile); err == nil {
+			t.Errorf("expected rejection for %s=%q", EnvHealEvictionTimeoutSeconds, bad)
+		}
+	}
+}
+
 func TestLoad_RejectsNonPositiveDuration(t *testing.T) {
 	_, err := Load(fakeEnv(map[string]string{
 		EnvClusterID: "d", EnvAPIURL: "https://x", EnvMinGap: "0s",

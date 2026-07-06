@@ -179,9 +179,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			MaxReplicas:     a.cfg.MaxReplicas,
 			ObservedVersion: a.getVersion,
 			// Node health for the P5 healer comes from the SAME informer cache
-			// the live view reports from — one watch, one truth.
-			Nodes:  func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) },
-			Logger: a.log,
+			// the live view reports from — one watch, one truth. Pods feed the
+			// post-heal eviction unwedge (executor/unwedge.go) from the same
+			// cache.
+			Nodes:           func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) },
+			Pods:            func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
+			EvictionTimeout: a.cfg.HealEvictionTimeout,
+			Logger:          a.log,
 		})
 		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
 		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
@@ -191,6 +195,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			"interval", a.cfg.DesiredPoll.String(),
 			"mdNamespace", a.cfg.MDNamespace,
 			"maxReplicas", a.cfg.MaxReplicas,
+			"healEvictionTimeout", a.cfg.HealEvictionTimeout.String(),
 		)
 	} else {
 		a.log.Warn("desired-state loop disabled (no dynamic client) — running report-only")

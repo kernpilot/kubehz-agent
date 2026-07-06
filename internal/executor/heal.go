@@ -38,6 +38,13 @@
 //   - a machine whose node NEVER appeared within nodeStartupTimeoutSeconds
 //     of creation (status.nodeRef still unset).
 //
+// FOLLOW-THROUGH: a remediated Machine whose node is truly dead can wedge on
+// eviction (pods stuck Terminating on an unreachable node never confirm) and
+// sit deleting indefinitely — a zombie server billing the user. The bounded
+// eviction unwedge in unwedge.go force-deletes exactly those stuck pods, only
+// for machines THIS agent heal-deleted, once per machine, after
+// KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS.
+//
 // Every remediation and every refusal is a `heal` action riding the
 // heartbeat. The action TARGET is the MACHINE name (contract decision: stable
 // pre-join — the startup-timeout case has no node name at all; dashboards
@@ -72,6 +79,7 @@ type healCandidate struct {
 	machineName string
 	pool        string                     // "" = unresolved (refused)
 	md          *unstructured.Unstructured // nil = unresolved (refused)
+	node        string                     // node name ("" = never joined)
 	cause       string                     // human cause for the action detail
 }
 
@@ -109,6 +117,11 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 
 	resolver := machines.NewPoolResolver(mds)
 
+	// Post-heal follow-through: unwedge evictions stuck on machines THIS agent
+	// heal-deleted whose node is still unreachable (see unwedge.go). Runs
+	// before detection so it fires even when there is no new candidate.
+	e.unwedgePass(ctx, doc.Revision, machineList, nodes, now)
+
 	// In-flight disruptions: ANY machine already being deleted counts —
 	// whether we deleted it, a scale-down did, or a P6 roll is replacing it.
 	// Conservative: healing never stacks disruption on top of disruption.
@@ -128,14 +141,14 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 	// ── Detection ────────────────────────────────────────────────────────────
 	var cands []healCandidate
 	seen := make(map[string]bool)
-	add := func(m *unstructured.Unstructured, cause string) {
+	add := func(m *unstructured.Unstructured, node, cause string) {
 		name := m.GetName()
 		if name == "" || seen[name] {
 			return
 		}
 		seen[name] = true
 		pool, md := resolver.PoolFor(m)
-		cands = append(cands, healCandidate{machineName: name, pool: pool, md: md, cause: cause})
+		cands = append(cands, healCandidate{machineName: name, pool: pool, md: md, node: node, cause: cause})
 	}
 
 	// (a) Machines whose node never joined within the startup timeout.
@@ -152,7 +165,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			e.log.Warn("heal: control-plane-labeled machine without a node ignored", "machine", m.GetName())
 			continue
 		}
-		add(m, fmt.Sprintf("no node joined within %s of creation (nodeStartupTimeout %s)",
+		add(m, "", fmt.Sprintf("no node joined within %s of creation (nodeStartupTimeout %s)",
 			age.Truncate(time.Second), startupTimeout))
 	}
 
@@ -175,7 +188,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 		if m == nil {
 			continue // no backing machine (static worker / CP): not healable
 		}
-		add(m, fmt.Sprintf("node %s %s for %s (unhealthyAfter %s)",
+		add(m, node.Name, fmt.Sprintf("node %s %s for %s (unhealthyAfter %s)",
 			node.Name, readyStateText(status), now.Sub(since).Truncate(time.Second), unhealthyAfter))
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].machineName < cands[j].machineName })
@@ -254,6 +267,12 @@ func (e *Executor) remediate(ctx context.Context, revision int, c healCandidate,
 		e.log.Warn("heal: machine delete failed",
 			"machine", c.machineName, "pool", c.pool, "namespace", e.namespace, "error", err.Error())
 		return false
+	}
+	if err == nil {
+		// Track OUR deletion for the eviction unwedge (unwedge.go): only a
+		// machine the agent itself heal-deleted is ever unwedge-eligible. A
+		// NotFound is not tracked — nothing was deleted by us just now.
+		e.healDeleted[c.machineName] = &healDeletion{node: c.node, deletedAt: now}
 	}
 
 	e.lastHeal[c.pool] = now
