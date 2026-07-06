@@ -174,7 +174,15 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	if a.dyn != nil {
-		exec := executor.New(a.dyn, a.cfg.MDNamespace, a.cfg.MaxReplicas, actionStore, a.getVersion, a.log)
+		exec := executor.New(a.dyn, actionStore, executor.Options{
+			Namespace:       a.cfg.MDNamespace,
+			MaxReplicas:     a.cfg.MaxReplicas,
+			ObservedVersion: a.getVersion,
+			// Node health for the P5 healer comes from the SAME informer cache
+			// the live view reports from — one watch, one truth.
+			Nodes:  func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) },
+			Logger: a.log,
+		})
 		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
 		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
 		go poller.Run(ctx)

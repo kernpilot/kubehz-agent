@@ -17,7 +17,21 @@
 #     is what the executor sends), no create, no delete;
 #   - machines.cluster.k8s.io: read verbs for the machineIssues collector
 #     (surfacing machine-controller provisioning failures on the heartbeat)
-#     and the P5/P6 loops' pool/health/progress reads. No machinesets.
+#     and the P5/P6 loops' pool/health/progress reads — PLUS delete, below.
+#     No machinesets.
+#
+# ⚠⚠ machines DELETE — the SHARPEST permission this agent holds. ⚠⚠
+# It exists for exactly one purpose: P5 self-healing remediates an unhealthy
+# WORKER machine by deleting its Machine object so machine-controller/
+# MachineSet recreates it (the cluster's own credentials do the actual
+# server churn — the agent still holds no cloud credential). The blast
+# radius is bounded by the executor's hard guardrails (all unit-tested):
+# server-gated (execution.healing + the served policy), never control-plane,
+# storm brake above maxUnhealthy, per-pool cooldown with a fresh-cooldown
+# restart baseline, at most maxUnhealthy disruptions in flight, autoscaler
+# pools refused, unowned machines refused. If you do not want the platform
+# to EVER delete a machine, remove the delete verb below — healing then
+# fails closed with a reported Forbidden and everything else keeps working.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -32,7 +46,8 @@ rules:
     verbs: [get, list, watch, patch]
   - apiGroups: [cluster.k8s.io]
     resources: [machines]
-    verbs: [get, list, watch]
+    # delete = P5 self-healing ONLY (see the header warning above).
+    verbs: [get, list, watch, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

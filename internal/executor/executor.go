@@ -1,17 +1,19 @@
-// Package executor is the P3 ACTING side of the desired-state loop
-// (managed-platform-spec §1.3.3): it drives worker scaling by editing
-// MachineDeployment spec.replicas — and NOTHING else — so that the cluster's
-// OWN machine-controller (which already holds the cluster's own hcloud
-// credentials) does all provisioning/deprovisioning. The agent builds no
-// provisioner and carries no cloud credential; its entire acting surface is
-// a replica-count merge patch on one namespaced custom resource.
+// Package executor is the ACTING side of the desired-state loop
+// (managed-platform-spec §1.3.3): P3 worker scaling (MachineDeployment
+// spec.replicas merge patches) and P5 self-healing (deleting unhealthy worker
+// Machines, see heal.go) — so that the cluster's OWN machine-controller
+// (which already holds the cluster's own hcloud credentials) does all
+// provisioning/deprovisioning. The agent builds no provisioner and carries no
+// cloud credential; its entire acting surface is patches/deletes on the
+// machine-controller's namespaced custom resources.
 //
 // Safety posture (every rule enforced here, in one place):
 //
 //   - SERVER-GATED: acting requires the /desired doc's server-computed
-//     execution.scaling flag. There is no agent-side override to enable it;
-//     when the flag is off the executor clears its reports and touches
-//     nothing (fail toward report-only, §1.3.4).
+//     execution flags (scaling / upgrades / healing). There is no agent-side
+//     override to enable any of them; when a flag is off the corresponding
+//     loop touches nothing, and with everything off the executor clears its
+//     reports entirely (fail toward report-only, §1.3.4).
 //   - Pools are matched to MachineDeployments BY NAME in one configurable
 //     namespace (KUBEHZ_MD_NAMESPACE, KubeOne default kube-system). The
 //     platform's worker_pools.name is assumed to equal the MD's
@@ -34,10 +36,12 @@
 //     discipline, sized to P3.
 //   - Idempotent: a pool already at desiredReplicas reports done without
 //     patching, so restarts/re-polls reconverge with zero cluster writes.
-//   - Replica edits ONLY: no MD creates, no deletes, no machineType/version
-//     changes. An authorized-but-unbuilt capability (execution.upgrades with
-//     a pending version) is reported as an unsupported/failed action rather
-//     than improvised.
+//   - MD edits are replica edits ONLY: no MD creates, no MD deletes, no
+//     machineType changes. An authorized-but-unbuilt capability
+//     (execution.upgrades with a pending version) is reported as an
+//     unsupported/failed action rather than improvised.
+//   - The P5 healer's guardrails (CP refusal, storm brake, cooldown,
+//     concurrency budget, autoscaler skip) are documented in heal.go.
 package executor
 
 import (
@@ -49,31 +53,28 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/dynamic"
 
 	"github.com/kernpilot/kubehz-agent/internal/actions"
 	"github.com/kernpilot/kubehz-agent/internal/desired"
+	"github.com/kernpilot/kubehz-agent/internal/machines"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
 
-// MachineDeploymentGVR is the executor's ONLY writable resource. KubeOne's
-// bundled kubermatic machine-controller serves MachineDeployment /
-// MachineSet / Machine on cluster.k8s.io/v1alpha1 — the LEGACY machine-api
-// group, NOT cluster.x-k8s.io (real CAPI). Grounded in spec §0: the pilot
-// runs quay.io/kubermatic/machine-controller v1.65.0 on exactly this group;
-// the old manifests' cluster.x-k8s.io RBAC was one of the fictions P0
-// retired.
-var MachineDeploymentGVR = schema.GroupVersionResource{
-	Group:    "cluster.k8s.io",
-	Version:  "v1alpha1",
-	Resource: "machinedeployments",
-}
+// MachineDeploymentGVR is re-exported from internal/machines (the single
+// source of truth for the machine-controller API surface). KubeOne's bundled
+// kubermatic machine-controller serves MachineDeployment / MachineSet /
+// Machine on cluster.k8s.io/v1alpha1 — the LEGACY machine-api group, NOT
+// cluster.x-k8s.io (real CAPI). Grounded in spec §0: the pilot runs
+// quay.io/kubermatic/machine-controller v1.65.0 on exactly this group; the
+// old manifests' cluster.x-k8s.io RBAC was one of the fictions P0 retired.
+var MachineDeploymentGVR = machines.MachineDeploymentGVR
 
 // FieldManager identifies the agent's patches in managedFields/audit logs.
 const FieldManager = "kubehz-agent"
@@ -106,6 +107,11 @@ var controlPlaneLabelKeys = []string{
 	"node-role.kubernetes.io/master",
 }
 
+// NodeSource supplies the current nodes (the agent wires the node informer
+// lister; tests wire fixtures). nil disables node-health-based healing —
+// only the joinless-machine case can then fire.
+type NodeSource func() ([]*corev1.Node, error)
+
 // Executor implements desired.Actor. One instance, driven by the Poller.
 type Executor struct {
 	dyn         dynamic.Interface
@@ -113,38 +119,78 @@ type Executor struct {
 	maxReplicas int
 	store       *actions.Store
 	// observedVersion returns the cluster's current server version (may be
-	// empty when unknown) — used only to decide whether an authorized-but-
-	// unsupported upgrade should be reported.
+	// empty when unknown) — the P6 pre-flight's control-plane truth and the
+	// upgrade-report gate.
 	observedVersion func() string
-	log             *slog.Logger
+	// nodes supplies node health for the P5 healer.
+	nodes NodeSource
+	log   *slog.Logger
+
+	// now is the healer's clock (injectable for tests).
+	now func() time.Time
+	// baseline is the executor's construction time: a RESTART starts a fresh,
+	// conservative cooldown — an agent crash-looping for any reason can never
+	// turn into a machine-delete loop (spec §4 "restart = fresh cooldown").
+	baseline time.Time
+	// lastHeal tracks the last remediation per pool (in-memory only, by
+	// design: the docs' guardrails plus baseline make persistence unnecessary
+	// and a PV/CRD would be state the user has to clean up).
+	lastHeal map[string]time.Time
 }
 
-// New builds an Executor. observedVersion and logger may be nil.
-func New(dyn dynamic.Interface, namespace string, maxReplicas int, store *actions.Store, observedVersion func() string, logger *slog.Logger) *Executor {
-	if observedVersion == nil {
-		observedVersion = func() string { return "" }
+// Options configures New. Namespace and MaxReplicas are required by the
+// caller (config defaults them); everything else may be zero.
+type Options struct {
+	Namespace       string
+	MaxReplicas     int
+	ObservedVersion func() string
+	Nodes           NodeSource
+	Now             func() time.Time // injectable clock (tests)
+	Logger          *slog.Logger
+}
+
+// New builds an Executor.
+func New(dyn dynamic.Interface, store *actions.Store, opts Options) *Executor {
+	if opts.ObservedVersion == nil {
+		opts.ObservedVersion = func() string { return "" }
 	}
-	if logger == nil {
-		logger = slog.Default()
+	if opts.Nodes == nil {
+		opts.Nodes = func() ([]*corev1.Node, error) { return nil, nil }
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
 	return &Executor{
 		dyn:             dyn,
-		namespace:       namespace,
-		maxReplicas:     maxReplicas,
+		namespace:       opts.Namespace,
+		maxReplicas:     opts.MaxReplicas,
 		store:           store,
-		observedVersion: observedVersion,
-		log:             logger,
+		observedVersion: opts.ObservedVersion,
+		nodes:           opts.Nodes,
+		log:             opts.Logger,
+		now:             opts.Now,
+		baseline:        opts.Now(),
+		lastHeal:        make(map[string]time.Time),
 	}
 }
 
 // Reconcile drives the cluster toward doc, reporting every outcome into the
 // actions store (the heartbeat carries the store's snapshot on every beat).
-// Returns true when a transient failure warrants a retry on the next poll.
+// Returns true when a re-run on the next poll tick is needed: after a
+// transient failure, and ALWAYS while healing is enabled — healing is a
+// continuous control loop (nodes fail independently of revision changes), so
+// it re-evaluates at the poll cadence rather than only on a new revision.
 func (e *Executor) Reconcile(ctx context.Context, doc *desired.Doc) (retry bool) {
 	if doc == nil {
 		return false
 	}
-	if !doc.Execution.Scaling && !doc.Execution.Upgrades {
+	// Healing requires BOTH the execution flag and the policy's enabled
+	// mirror (defense in depth against a half-updated server).
+	healing := doc.Execution.Healing && doc.Healing.Enabled
+	if !doc.Execution.Scaling && !doc.Execution.Upgrades && !healing {
 		// Report-only posture: the server (tier gate × access × kill switch)
 		// says no acting. Clear any previous reports — the next beat's absent
 		// actions[] is the server's "clear" signal — and touch NOTHING.
@@ -159,6 +205,10 @@ func (e *Executor) Reconcile(ctx context.Context, doc *desired.Doc) (retry bool)
 	}
 	if doc.Execution.Scaling {
 		retry = e.scalePools(ctx, doc)
+	}
+	if healing {
+		e.healPass(ctx, doc)
+		retry = true // continuous loop: re-evaluate health every poll tick
 	}
 	return retry
 }

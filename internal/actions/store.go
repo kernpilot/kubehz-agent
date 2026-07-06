@@ -85,6 +85,31 @@ func (s *Store) Upsert(a state.Action) {
 	}
 }
 
+// Prune removes actions of the given type whose target is NOT in keep and
+// whose status is not done. The healer uses this to retire STALE reports —
+// a node that recovered on its own before remediation leaves a pending/
+// refused heal action behind; once it is no longer a candidate the report
+// would be a lie. DONE actions are kept (they describe a remediation that
+// really happened and must stay visible for the revision). Notifies only
+// when something was actually removed.
+func (s *Store) Prune(actionType string, keep map[string]bool) {
+	s.mu.Lock()
+	kept := s.items[:0]
+	changed := false
+	for _, a := range s.items {
+		if a.Type == actionType && a.Status != state.ActionDone && !keep[a.Target] {
+			changed = true
+			continue
+		}
+		kept = append(kept, a)
+	}
+	s.items = kept
+	s.mu.Unlock()
+	if changed {
+		s.notify()
+	}
+}
+
 // Clear drops all actions (report-only posture: the next beat carries no
 // actions[], which the server treats as "clear"). Notifies only if there was
 // something to clear.

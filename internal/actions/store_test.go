@@ -136,3 +136,37 @@ func TestStore_ConcurrentAccess(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+// Prune retires pending/in-progress/failed actions of one type whose targets
+// are gone, keeps done outcomes and other types, and notifies only on change.
+func TestStore_PruneKeepsDoneAndOtherTypes(t *testing.T) {
+	notified := 0
+	s := New(func() { notified++ })
+	s.Begin(3)
+	s.Upsert(state.Action{Type: state.ActionHeal, Target: "m-done", Status: state.ActionDone, Revision: 3})
+	s.Upsert(state.Action{Type: state.ActionHeal, Target: "m-stale", Status: state.ActionPending, Revision: 3})
+	s.Upsert(state.Action{Type: state.ActionHeal, Target: "m-live", Status: state.ActionFailed, Revision: 3})
+	s.Upsert(state.Action{Type: state.ActionScale, Target: "m-stale", Status: state.ActionPending, Revision: 3})
+	base := notified
+
+	s.Prune(state.ActionHeal, map[string]bool{"m-live": true})
+
+	snap := s.Snapshot()
+	if len(snap) != 3 {
+		t.Fatalf("snapshot = %+v, want done+live heal and the scale action", snap)
+	}
+	for _, a := range snap {
+		if a.Type == state.ActionHeal && a.Target == "m-stale" {
+			t.Errorf("stale pending heal survived prune: %+v", a)
+		}
+	}
+	if notified != base+1 {
+		t.Errorf("notified = %d, want exactly one notify for the prune", notified-base)
+	}
+
+	// Idempotent: nothing left to prune → no notify.
+	s.Prune(state.ActionHeal, map[string]bool{"m-live": true})
+	if notified != base+1 {
+		t.Errorf("no-op prune notified")
+	}
+}

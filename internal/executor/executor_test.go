@@ -15,6 +15,7 @@ import (
 
 	"github.com/kernpilot/kubehz-agent/internal/actions"
 	"github.com/kernpilot/kubehz-agent/internal/desired"
+	"github.com/kernpilot/kubehz-agent/internal/machines"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
 
@@ -53,7 +54,10 @@ func withAnnotations(u *unstructured.Unstructured, ann map[string]string) *unstr
 func fakeDyn(objects ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	scheme := runtime.NewScheme()
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme,
-		map[schema.GroupVersionResource]string{MachineDeploymentGVR: "MachineDeploymentList"},
+		map[schema.GroupVersionResource]string{
+			MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:  "MachineList",
+		},
 		objects...)
 }
 
@@ -67,7 +71,7 @@ func scalingDoc(revision int, pools ...desired.WorkerPool) *desired.Doc {
 
 func newExecutor(dyn *dynamicfake.FakeDynamicClient) (*Executor, *actions.Store) {
 	store := actions.New(nil)
-	return New(dyn, ns, 50, store, nil, nil), store
+	return New(dyn, store, Options{Namespace: ns, MaxReplicas: 50}), store
 }
 
 func replicasOf(t *testing.T, dyn *dynamicfake.FakeDynamicClient, name string) int64 {
@@ -334,7 +338,7 @@ func TestReconcile_UpgradeReportedUnsupported(t *testing.T) {
 
 	dyn := fakeDyn()
 	store := actions.New(nil)
-	exec := New(dyn, ns, 50, store, func() string { return "v1.35.5" }, nil)
+	exec := New(dyn, store, Options{Namespace: ns, MaxReplicas: 50, ObservedVersion: func() string { return "v1.35.5" }})
 	exec.Reconcile(context.Background(), doc)
 
 	a := findAction(t, store, v)
@@ -344,7 +348,7 @@ func TestReconcile_UpgradeReportedUnsupported(t *testing.T) {
 
 	// Already at target (modulo the v prefix) → nothing to report.
 	store2 := actions.New(nil)
-	exec2 := New(dyn, ns, 50, store2, func() string { return "1.36.1" }, nil)
+	exec2 := New(dyn, store2, Options{Namespace: ns, MaxReplicas: 50, ObservedVersion: func() string { return "1.36.1" }})
 	exec2.Reconcile(context.Background(), doc)
 	if got := store2.Snapshot(); got != nil {
 		t.Errorf("in-sync version reported: %+v", got)
@@ -352,7 +356,7 @@ func TestReconcile_UpgradeReportedUnsupported(t *testing.T) {
 
 	// Unknown observed version → do not guess, do not report.
 	store3 := actions.New(nil)
-	exec3 := New(dyn, ns, 50, store3, nil, nil)
+	exec3 := New(dyn, store3, Options{Namespace: ns, MaxReplicas: 50})
 	exec3.Reconcile(context.Background(), doc)
 	if got := store3.Snapshot(); got != nil {
 		t.Errorf("unknown observed version reported: %+v", got)
