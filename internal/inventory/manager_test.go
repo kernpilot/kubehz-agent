@@ -265,14 +265,99 @@ func TestManager_HandleUpdatesNoCR(t *testing.T) {
 		t.Errorf("patched status with no CR present (%d patches)", n)
 	}
 
-	// Empty/absent updates never write either, even with the CR present.
+	// An empty VERDICT against an already-clear status is idempotent: the CR
+	// carries no availableUpdates, so there is nothing to clear → no patch.
 	dyn2 := fakeDyn(inventoryCR())
 	m2 := NewManager(dyn2, 0, nil, nil)
 	m2.fetchOnce(ctx)
 	m2.HandleUpdates(ctx, nil)
 	m2.HandleUpdates(ctx, []state.AvailableUpdate{})
 	if n := len(patchActions(dyn2)); n != 0 {
-		t.Errorf("empty updates produced %d patches, want 0", n)
+		t.Errorf("empty verdict on an already-clear status produced %d patches, want 0", n)
+	}
+}
+
+// TestManager_EmptyVerdictClearsStaleStatus is the upgrade-path contract
+// (kubehz-api f628c97 three-state response): the CR carries stale
+// availableUpdates (the user upgraded their addons since), the server answers
+// a PRESENT-but-empty [] ("index consulted, nothing newer") — the agent MUST
+// clear status.availableUpdates (explicit [], lastReported bumped), or the
+// stale "update available" notices live in the CR forever. The sibling
+// observedAddons stays untouched, and repeating the empty verdict is a no-op.
+func TestManager_EmptyVerdictClearsStaleStatus(t *testing.T) {
+	cr := inventoryCR()
+	if err := unstructured.SetNestedField(cr.Object, []any{
+		map[string]any{"name": "cilium", "current": "1.16.1", "latest": "1.17.4"},
+	}, "status", "availableUpdates"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedField(cr.Object, []any{
+		map[string]any{"name": "cilium", "version": "1.17.4", "healthy": true},
+	}, "status", "observedAddons"); err != nil {
+		t.Fatal(err)
+	}
+	dyn := fakeDyn(cr)
+	m := NewManager(dyn, 0, nil, nil)
+	m.now = func() time.Time { return t0 }
+	ctx := context.Background()
+	m.fetchOnce(ctx)
+
+	m.HandleUpdates(ctx, []state.AvailableUpdate{})
+
+	pas := patchActions(dyn)
+	if len(pas) != 1 {
+		t.Fatalf("patch actions = %d, want 1 (the clear)", len(pas))
+	}
+	var body map[string]map[string]any
+	if err := json.Unmarshal(pas[0].GetPatch(), &body); err != nil {
+		t.Fatalf("patch body not JSON: %v", err)
+	}
+	cleared, ok := body["status"]["availableUpdates"].([]any)
+	if !ok || len(cleared) != 0 {
+		t.Errorf("clear must patch an EXPLICIT empty array (null would delete the field), got: %s", pas[0].GetPatch())
+	}
+	if got := body["status"]["lastReported"]; got != t0.Format(time.RFC3339) {
+		t.Errorf("lastReported = %v, want %s", got, t0.Format(time.RFC3339))
+	}
+
+	got, err := dyn.Resource(GVR).Get(ctx, CRName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, found, _ := unstructured.NestedSlice(got.Object, "status", "availableUpdates")
+	if !found || len(remaining) != 0 {
+		t.Errorf("status.availableUpdates = %v (found=%t), want present-and-empty", remaining, found)
+	}
+	observed, _, _ := unstructured.NestedSlice(got.Object, "status", "observedAddons")
+	if len(observed) != 1 {
+		t.Errorf("sibling status.observedAddons clobbered by the clear: %v", observed)
+	}
+
+	// Repeating the empty verdict is idempotent — no second patch.
+	m.HandleUpdates(ctx, []state.AvailableUpdate{})
+	if n := len(patchActions(dyn)); n != 1 {
+		t.Errorf("repeated empty verdict re-patched (%d patches)", n)
+	}
+}
+
+// TestManager_AllInvalidVerdictDoesNotClear: a NON-empty verdict whose entries
+// are all invalid (nameless) is a buggy server, not a clear — the stale-but-
+// real status must survive it. Only an explicit [] clears.
+func TestManager_AllInvalidVerdictDoesNotClear(t *testing.T) {
+	cr := inventoryCR()
+	if err := unstructured.SetNestedField(cr.Object, []any{
+		map[string]any{"name": "cilium", "current": "1.16.1", "latest": "1.17.4"},
+	}, "status", "availableUpdates"); err != nil {
+		t.Fatal(err)
+	}
+	dyn := fakeDyn(cr)
+	m := NewManager(dyn, 0, nil, nil)
+	ctx := context.Background()
+	m.fetchOnce(ctx)
+
+	m.HandleUpdates(ctx, []state.AvailableUpdate{{Current: "1.0.0"}, {Latest: "2.0.0"}})
+	if n := len(patchActions(dyn)); n != 0 {
+		t.Errorf("all-invalid verdict produced %d patches, want 0", n)
 	}
 }
 

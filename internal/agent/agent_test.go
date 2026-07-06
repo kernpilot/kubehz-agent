@@ -260,12 +260,14 @@ func TestStripManagedFields(t *testing.T) {
 	}
 }
 
-// TestAgent_InventoryRidesTheBeat wires the full inventory ROUND TRIP: a
-// lok8s-written ClusterInventory CR exists in the (fake) cluster, its spec
-// must appear verbatim as the heartbeat's `inventory` block, and the
-// availableUpdates the server returns in the heartbeat response must land on
-// the CR's status subresource (with lastReported) — kubectl-visible updates,
-// end to end.
+// TestAgent_InventoryRidesTheBeat wires the full inventory ROUND TRIP through
+// all THREE response states (kubehz-api f628c97): a lok8s-written
+// ClusterInventory CR exists in the (fake) cluster and its spec must appear
+// verbatim as the heartbeat's `inventory` block; a NON-EMPTY availableUpdates
+// response lands on the CR's status subresource (with lastReported); an
+// ABSENT key (index unreachable) leaves that status untouched across further
+// beats; and a PRESENT-but-empty [] (nothing newer) clears it — kubectl-
+// visible updates, end to end.
 func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 	client := fake.NewClientset(testNode("cp-1"))
 
@@ -294,6 +296,9 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 
 	var mu sync.Mutex
 	var payloads []state.Payload
+	// respBody drives the server's availableUpdates verdict per phase:
+	// non-empty → absent key → empty [].
+	respBody := `{"status":"ok","availableUpdates":[{"name":"cilium","current":"1.16.1","latest":"1.17.4"}]}`
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		var p state.Payload
@@ -302,11 +307,12 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 		}
 		mu.Lock()
 		payloads = append(payloads, p)
+		body := respBody
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		// The api computes availableUpdates from the reported inventory and
-		// returns them in the heartbeat response (parallel api change).
-		_, _ = fmt.Fprint(w, `{"status":"ok","availableUpdates":[{"name":"cilium","current":"1.16.1","latest":"1.17.4"}]}`)
+		// returns them in the heartbeat response (kubehz-api f628c97).
+		_, _ = fmt.Fprint(w, body)
 	})
 	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
@@ -339,14 +345,41 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 			inv.Addons[0].ChartVersion == "1.16.1" && inv.Addons[0].Source == "addon"
 	})
 
-	// The response's availableUpdates must land on the CR's status.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	// crUpdates reads the CR's current status.availableUpdates.
+	crUpdates := func() []any {
 		cr, err := dyn.Resource(inventory.GVR).Get(ctx, "cluster", metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("get ClusterInventory: %v", err)
 		}
 		got, _, _ := unstructured.NestedSlice(cr.Object, "status", "availableUpdates")
+		return got
+	}
+	// beatsSeen snapshots how many heartbeats the server has answered.
+	beatsSeen := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(payloads)
+	}
+	// waitBeats blocks until n MORE heartbeats than `from` have been answered.
+	waitBeats := func(from, n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for beatsSeen() < from+n {
+			if time.Now().After(deadline) {
+				t.Fatalf("server never saw %d more heartbeats", n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// Phase 1 — non-empty verdict: the updates must land on the CR's status.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := crUpdates()
+		cr, err := dyn.Resource(inventory.GVR).Get(ctx, "cluster", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get ClusterInventory: %v", err)
+		}
 		lastReported, _, _ := unstructured.NestedString(cr.Object, "status", "lastReported")
 		if len(got) == 1 && lastReported != "" {
 			entry, _ := got[0].(map[string]any)
@@ -360,6 +393,33 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("availableUpdates never reached the CR status (got %v)", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Phase 2 — ABSENT key (index unreachable): further beats must NOT touch
+	// the status; the last known updates survive the outage.
+	mu.Lock()
+	respBody = `{"status":"ok"}`
+	from := len(payloads)
+	mu.Unlock()
+	waitBeats(from, 2)
+	if got := crUpdates(); len(got) != 1 {
+		t.Errorf("an absent availableUpdates key modified the CR status: %v", got)
+	}
+
+	// Phase 3 — PRESENT-but-empty [] (nothing newer): the stale entry must be
+	// cleared from the CR.
+	mu.Lock()
+	respBody = `{"status":"ok","availableUpdates":[]}`
+	mu.Unlock()
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if got := crUpdates(); len(got) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("empty verdict never cleared the CR status (still %v)", crUpdates())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

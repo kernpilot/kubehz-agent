@@ -137,35 +137,51 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 	m.setState(specInventory(u), statusAvailableUpdates(u), true)
 }
 
-// HandleUpdates consumes the availableUpdates the server computed from the
-// reported inventory (publisher.OnAvailableUpdates wires it) and writes them —
-// plus lastReported — to the CR via the STATUS subresource, so `kubectl get
-// clusterinventory cluster -o yaml` shows addon updates with no dashboard.
+// HandleUpdates consumes a server VERDICT on availableUpdates — the caller
+// (publisher.OnAvailableUpdates) invokes it ONLY when the heartbeat response
+// carried the key at all. The key is tristate (kubehz-api f628c97): ABSENT
+// (no inventory reported / addons index unreachable) never reaches here, so
+// an index outage can never wipe the CR's last known status; a PRESENT
+// verdict is written — plus lastReported — via the STATUS subresource, so
+// `kubectl get clusterinventory cluster -o yaml` shows addon updates with no
+// dashboard; and an EMPTY verdict ([] = "index consulted, nothing is newer")
+// CLEARS status.availableUpdates — without that, a user who upgrades their
+// addons would keep stale "update available" notices in the CR forever.
 //
 // A JSON merge patch touching ONLY status.availableUpdates+lastReported: the
 // agent never writes spec (lo-owned) and never touches status.observedAddons
 // (merge semantics leave sibling keys alone). Idempotent — the incoming list
 // is compared against the CR's current status first (refreshed on every poll
-// and every successful write), so a server repeating itself beat after beat
-// costs zero writes. RBAC-denied warns once and the agent keeps beating.
+// and every successful write), so a server repeating itself beat after beat —
+// including an already-clear [] — costs zero writes. RBAC-denied warns once
+// and the agent keeps beating.
 func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUpdate) {
-	updates = capUpdates(updates)
-	if len(updates) == 0 {
-		return // absent/empty response block → no status write, ever
+	capped := capUpdates(updates)
+	if len(capped) == 0 && len(updates) > 0 {
+		// Every entry was invalid (nameless) — a buggy server, not a clear
+		// verdict. Only an EXPLICIT [] may clear the user's status.
+		return
 	}
+	updates = capped
 
 	m.mu.Lock()
 	if !m.present {
 		m.mu.Unlock()
-		m.log.Debug("server sent availableUpdates but no ClusterInventory CR exists; skipping status write")
+		m.log.Debug("server sent an availableUpdates verdict but no ClusterInventory CR exists; skipping status write")
 		return
 	}
 	if equalUpdates(m.statusUpdates, updates) {
 		m.mu.Unlock()
-		return // unchanged — skip the write (idempotence)
+		return // unchanged (incl. already-clear) — skip the write (idempotence)
 	}
 	m.mu.Unlock()
 
+	if updates == nil {
+		// Marshal the clear verdict as an explicit [], NOT null: in a JSON
+		// merge patch null DELETES the field, while [] keeps it present-and-
+		// empty — "checked, nothing newer", distinguishable from never-checked.
+		updates = []state.AvailableUpdate{}
+	}
 	patch, err := json.Marshal(map[string]any{
 		"status": map[string]any{
 			"availableUpdates": updates,

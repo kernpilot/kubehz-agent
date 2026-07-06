@@ -161,16 +161,18 @@ func TestPublish_ParsesAvailableUpdates(t *testing.T) {
 	}
 }
 
-// TestPublish_ResponseParsingFailsSoft: today's API returns a body WITHOUT
-// availableUpdates (or no JSON at all) — the beat must still succeed and the
-// consumer must not fire. Same for an empty updates list and for a body
-// larger than the read bound.
-func TestPublish_ResponseParsingFailsSoft(t *testing.T) {
+// TestPublish_AbsentKeyIsNoVerdict: availableUpdates is TRISTATE (kubehz-api
+// f628c97): the server OMITS the key when the beat carried no inventory or
+// the addons index was unreachable — precisely so the agent does not treat an
+// outage as "no updates" and wipe its last known CR status. An absent/null
+// key must therefore never reach the consumer; legacy/garbage/oversized
+// bodies land in the same no-verdict bucket, and the beat still succeeds.
+func TestPublish_AbsentKeyIsNoVerdict(t *testing.T) {
 	for name, body := range map[string]string{
 		"legacy-shape": `{"status":"ok"}`,
 		"not-json":     `pong`,
 		"empty-body":   ``,
-		"empty-list":   `{"availableUpdates":[]}`,
+		"null-key":     `{"availableUpdates":null}`,
 		"oversized":    `{"availableUpdates":[{"name":"` + strings.Repeat("x", maxResponseBytes) + `"}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -187,9 +189,39 @@ func TestPublish_ResponseParsingFailsSoft(t *testing.T) {
 				t.Fatalf("Publish returned error: %v", err)
 			}
 			if called {
-				t.Error("consumer fired for a body with no usable updates")
+				t.Error("consumer fired without a server verdict")
 			}
 		})
+	}
+}
+
+// TestPublish_EmptyListIsAVerdict: a PRESENT-but-empty [] is the server's
+// "index consulted, nothing is newer" verdict and MUST reach the consumer (as
+// a non-nil empty slice) so stale CR status entries get cleared — swallowing
+// it would leave a user who upgraded their addons staring at "update
+// available" in the CR forever.
+func TestPublish_EmptyListIsAVerdict(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"status":"ok","availableUpdates":[]}`)
+	}))
+	defer srv.Close()
+
+	called := false
+	var got []state.AvailableUpdate
+	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p.OnAvailableUpdates(func(_ context.Context, updates []state.AvailableUpdate) {
+		called = true
+		got = updates
+	})
+
+	if err := p.Publish(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("Publish returned error: %v", err)
+	}
+	if !called {
+		t.Fatal("consumer did not fire for a present-but-empty availableUpdates")
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("consumer got %#v, want a non-nil empty slice", got)
 	}
 }
 

@@ -61,6 +61,15 @@ type Publisher struct {
 // heartbeatResponse is the slice of the response body the agent consumes.
 // Everything else in the body is deliberately ignored (the server owns its
 // response shape; the agent depends only on this one additive key).
+//
+// The key is TRISTATE (kubehz-api f628c97, utils/heartbeat.ts): ABSENT means
+// "no verdict" — the beat carried no inventory, or the addons index was
+// unreachable and the server deliberately omitted the key rather than send a
+// false-empty that would wipe the agent's last known CR status. PRESENT []
+// means "index consulted, nothing is newer" — a real verdict the consumer
+// must act on (clearing stale status entries). Present non-empty = updates
+// exist. json.Unmarshal preserves the distinction: an absent (or null) key
+// leaves the slice nil; [] yields a non-nil empty slice.
 type heartbeatResponse struct {
 	AvailableUpdates []state.AvailableUpdate `json:"availableUpdates"`
 }
@@ -145,9 +154,12 @@ func (p *Publisher) Publish(ctx context.Context, payload *state.Payload) error {
 }
 
 // consumeUpdates parses availableUpdates out of a 2xx body and hands them to
-// the registered consumer. FAIL-SOFT in every direction: no consumer, an
-// unreadable/over-long/non-JSON body (today's API returns a different shape —
-// that must never fail the beat), or an empty list all mean "do nothing".
+// the registered consumer. FAIL-SOFT toward "no verdict": no consumer, an
+// unreadable/over-long/non-JSON body (a legacy API returns a different shape —
+// that must never fail the beat), or an ABSENT/null key all mean "do nothing".
+// A PRESENT key always reaches the consumer — INCLUDING an empty [] (the
+// server's "index consulted, nothing newer" verdict, which the consumer needs
+// to clear stale CR status entries); see heartbeatResponse for the tristate.
 // The beat itself already succeeded; this is a bonus read.
 func (p *Publisher) consumeUpdates(ctx context.Context, body io.Reader) {
 	if p.onUpdates == nil {
@@ -158,7 +170,7 @@ func (p *Publisher) consumeUpdates(ctx context.Context, body io.Reader) {
 		return
 	}
 	var hr heartbeatResponse
-	if json.Unmarshal(raw, &hr) != nil || len(hr.AvailableUpdates) == 0 {
+	if json.Unmarshal(raw, &hr) != nil || hr.AvailableUpdates == nil {
 		return
 	}
 	p.onUpdates(ctx, hr.AvailableUpdates)
