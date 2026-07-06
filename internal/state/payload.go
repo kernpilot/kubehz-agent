@@ -61,12 +61,13 @@ const (
 )
 
 // Action type/status enums — the exact wire values kubehz-api's actions[] zod
-// schema accepts (z.enum(['scale','upgrade']) / z.enum(['pending','in-progress',
-// 'done','failed']), dfa9b7a). Any other value 400s the WHOLE beat, so nothing
-// outside this set may ever be assigned.
+// schema accepts (z.enum(['scale','upgrade','heal']) / z.enum(['pending',
+// 'in-progress','done','failed']), d57c206). Any other value 400s the WHOLE
+// beat, so nothing outside this set may ever be assigned.
 const (
 	ActionScale   = "scale"
 	ActionUpgrade = "upgrade"
+	ActionHeal    = "heal"
 
 	ActionPending    = "pending"
 	ActionInProgress = "in-progress"
@@ -200,11 +201,12 @@ type EventState struct {
 }
 
 // Action is one desired-state progress report, wire-identical to kubehz-api's
-// HeartbeatSchema actions[] entry (dfa9b7a): Type ∈ {scale, upgrade}, Status ∈
-// {pending, in-progress, done, failed}; Target names the acted-on object (a
-// worker-pool / MachineDeployment name for scale, the version target for
-// upgrade); Revision is the desired-state revision the action executed
-// against, so the dashboard can correlate intent → outcome.
+// HeartbeatSchema actions[] entry (d57c206): Type ∈ {scale, upgrade, heal},
+// Status ∈ {pending, in-progress, done, failed}; Target names the acted-on
+// object (a worker-pool / MachineDeployment name for scale AND for per-pool
+// upgrade progress, the remediated Machine's name for heal); Revision is the
+// desired-state revision the action executed against, so the dashboard can
+// correlate intent → outcome.
 type Action struct {
 	Type     string `json:"type"`
 	Target   string `json:"target"`

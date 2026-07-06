@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -65,6 +66,170 @@ func TestClient_ETagConditionalGet(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("calls = %d, want 2", got)
+	}
+}
+
+// The ETag is an OPAQUE token: whatever the server serves — the P5 3-bit
+// format ("7-101"), the old 2-bit one, or any future shape — is cached and
+// echoed VERBATIM in If-None-Match, never parsed. A format change therefore
+// costs exactly one extra 200 (the cached old-format tag doesn't match),
+// after which 304 polling resumes with the new tag.
+func TestClient_ETagIsOpaque(t *testing.T) {
+	// Three deliberately different formats, including the P5 3-bit one and a
+	// shape that would crash any "revision-bits" parser.
+	for _, etag := range []string{`"7-101"`, `"3-10"`, `"utterly/opaque token=42"`} {
+		var mu sync.Mutex
+		var mismatchedINM []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if inm := r.Header.Get("If-None-Match"); inm == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			} else if inm != "" {
+				mu.Lock()
+				mismatchedINM = append(mismatchedINM, inm)
+				mu.Unlock()
+			}
+			w.Header().Set("ETag", etag)
+			_, _ = w.Write([]byte(docBody))
+		}))
+
+		c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+		if _, _, err := c.Fetch(context.Background()); err != nil {
+			t.Fatalf("etag %s: first fetch: %v", etag, err)
+		}
+		_, notModified, err := c.Fetch(context.Background())
+		if err != nil || !notModified {
+			t.Errorf("etag %s: second fetch must 304 via verbatim echo (notModified=%v err=%v)",
+				etag, notModified, err)
+		}
+		mu.Lock()
+		if len(mismatchedINM) != 0 {
+			t.Errorf("etag %s: client mangled the token before echoing: %q", etag, mismatchedINM)
+		}
+		mu.Unlock()
+		srv.Close()
+	}
+}
+
+// A server-deployed ETag format change (2-bit → 3-bit) must cost one full 200
+// and then resume 304s — the client re-caches the new opaque tag.
+func TestClient_ETagFormatChangeRecaches(t *testing.T) {
+	var current atomic.Value
+	current.Store(`"3-10"`) // old 2-bit format cached first
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		etag := current.Load().(string)
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write([]byte(docBody))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	if _, _, err := c.Fetch(context.Background()); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+
+	current.Store(`"3-100"`) // server upgraded to the 3-bit format, same revision
+	doc, notModified, err := c.Fetch(context.Background())
+	if err != nil || notModified || doc == nil {
+		t.Fatalf("format change must yield one full 200: doc=%v notModified=%v err=%v", doc, notModified, err)
+	}
+	_, notModified, err = c.Fetch(context.Background())
+	if err != nil || !notModified {
+		t.Fatalf("after re-cache the steady state must be 304 again: notModified=%v err=%v", notModified, err)
+	}
+}
+
+// The P5 healing block and execution.healing decode wire-identically to
+// kubehz-api's desired doc.
+func TestClient_DecodesHealingBlock(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+		  "revision": 9,
+		  "kubernetesVersion": "v1.35.6",
+		  "workerPools": [],
+		  "execution": {"scaling": false, "upgrades": false, "healing": true},
+		  "healing": {"enabled": true, "maxUnhealthy": 2, "nodeStartupTimeoutSeconds": 600,
+		              "unhealthyAfterSeconds": 300, "cooldownSeconds": 900}
+		}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	doc, _, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if !doc.Execution.Healing {
+		t.Errorf("execution.healing mis-decoded: %+v", doc.Execution)
+	}
+	want := Healing{Enabled: true, MaxUnhealthy: 2, NodeStartupTimeoutSeconds: 600,
+		UnhealthyAfterSeconds: 300, CooldownSeconds: 900}
+	if doc.Healing != want {
+		t.Errorf("healing = %+v, want %+v", doc.Healing, want)
+	}
+}
+
+// A P3/P4 server that serves NO healing block decodes to the zero policy
+// (enabled=false, all zeros) — report-only for healing, no error.
+func TestClient_MissingHealingBlockIsDisabled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(docBody))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	doc, _, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if doc.Healing != (Healing{}) || doc.Execution.Healing {
+		t.Errorf("missing healing block must decode to disabled zero value, got %+v / %+v",
+			doc.Healing, doc.Execution)
+	}
+}
+
+// Healing guardrail numbers are validated at the boundary: negative or absurd
+// values reject the WHOLE document (fail toward report-only) — a broken
+// maxUnhealthy could otherwise disable the storm brake.
+func TestDoc_ValidateHealingBounds(t *testing.T) {
+	valid := func() *Doc {
+		return &Doc{Revision: 1, Healing: Healing{
+			MaxUnhealthy: 1, NodeStartupTimeoutSeconds: 600,
+			UnhealthyAfterSeconds: 300, CooldownSeconds: 900,
+		}}
+	}
+	if err := valid().Validate(); err != nil {
+		t.Fatalf("valid doc rejected: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Doc)
+	}{
+		{"negative maxUnhealthy", func(d *Doc) { d.Healing.MaxUnhealthy = -1 }},
+		{"absurd maxUnhealthy", func(d *Doc) { d.Healing.MaxUnhealthy = 1_000_001 }},
+		{"negative startup timeout", func(d *Doc) { d.Healing.NodeStartupTimeoutSeconds = -1 }},
+		{"absurd startup timeout", func(d *Doc) { d.Healing.NodeStartupTimeoutSeconds = 2_000_000 }},
+		{"negative unhealthyAfter", func(d *Doc) { d.Healing.UnhealthyAfterSeconds = -300 }},
+		{"absurd unhealthyAfter", func(d *Doc) { d.Healing.UnhealthyAfterSeconds = 2_000_000 }},
+		{"negative cooldown", func(d *Doc) { d.Healing.CooldownSeconds = -1 }},
+		{"absurd cooldown", func(d *Doc) { d.Healing.CooldownSeconds = 2_000_000 }},
+	}
+	for _, tc := range cases {
+		d := valid()
+		tc.mutate(d)
+		if err := d.Validate(); err == nil {
+			t.Errorf("%s: want validation error, got nil", tc.name)
+		}
+	}
+
+	// Zero values (P3/P4 server without the block) stay valid.
+	if err := (&Doc{Revision: 1}).Validate(); err != nil {
+		t.Errorf("zero healing block must validate: %v", err)
 	}
 }
 
