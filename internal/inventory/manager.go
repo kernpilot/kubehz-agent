@@ -53,6 +53,13 @@ type Manager struct {
 	// on every poll and after every successful write — the compare-before-
 	// patch baseline that makes HandleUpdates idempotent.
 	statusUpdates []state.AvailableUpdate
+	// statusRecorded: the CR's status.availableUpdates key EXISTS (a verdict
+	// was recorded at some point — possibly the explicit empty []). statusUpdates
+	// alone cannot carry this: a nil baseline means BOTH "fresh CR, never
+	// checked" and "explicitly clear", and only the latter may absorb an
+	// incoming empty verdict. False forces the first verdict — even [] — to
+	// write, so a fresh CR gets its explicit []+lastReported stamp.
+	statusRecorded bool
 	// warnedRBAC: a Forbidden status patch warns ONCE, then stays quiet —
 	// a base-RBAC-not-yet-upgraded cluster must not warn on every beat.
 	warnedRBAC   bool
@@ -122,7 +129,7 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 		// even log-worthy beyond debug. Anything else (RBAC, timeout) logs
 		// once per distinct error.
 		if apierrors.IsNotFound(err) {
-			m.setState(nil, nil, false)
+			m.setState(nil, nil, false, false)
 			return
 		}
 		if msg := err.Error(); msg != m.getLastErr() {
@@ -130,11 +137,12 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 			m.log.Info("cluster inventory unavailable (fail-soft; needs the clusterinventories read RBAC)",
 				"error", msg)
 		}
-		m.setState(nil, nil, false)
+		m.setState(nil, nil, false, false)
 		return
 	}
 	m.setLastErr("")
-	m.setState(specInventory(u), statusAvailableUpdates(u), true)
+	updates, recorded := statusAvailableUpdates(u)
+	m.setState(specInventory(u), updates, recorded, true)
 }
 
 // HandleUpdates consumes a server VERDICT on availableUpdates — the caller
@@ -150,11 +158,17 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 //
 // A JSON merge patch touching ONLY status.availableUpdates+lastReported: the
 // agent never writes spec (lo-owned) and never touches status.observedAddons
-// (merge semantics leave sibling keys alone). Idempotent — the incoming list
-// is compared against the CR's current status first (refreshed on every poll
-// and every successful write), so a server repeating itself beat after beat —
-// including an already-clear [] — costs zero writes. RBAC-denied warns once
-// and the agent keeps beating.
+// (merge semantics leave sibling keys alone). Idempotent — but idempotence is
+// keyed on the CR's status EXISTING, not just comparing equal: on a fresh CR
+// (status.availableUpdates never recorded — nil, never-checked) the FIRST
+// verdict always writes, INCLUDING an empty one, turning never-checked into
+// the explicit "checked, nothing newer" ([]+lastReported). Only once a
+// verdict is recorded does the compare-before-patch baseline (refreshed on
+// every poll and every successful write) apply, so a server repeating itself
+// beat after beat — including a repeat [] over an already-written empty
+// status — costs zero writes. Conflating the nil baseline with [] here is
+// exactly what once left lastReported unwritten forever on up-to-date fresh
+// CRs. RBAC-denied warns once and the agent keeps beating.
 func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUpdate) {
 	capped := capUpdates(updates)
 	if len(capped) == 0 && len(updates) > 0 {
@@ -170,7 +184,7 @@ func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUp
 		m.log.Debug("server sent an availableUpdates verdict but no ClusterInventory CR exists; skipping status write")
 		return
 	}
-	if equalUpdates(m.statusUpdates, updates) {
+	if m.statusRecorded && equalUpdates(m.statusUpdates, updates) {
 		m.mu.Unlock()
 		return // unchanged (incl. already-clear) — skip the write (idempotence)
 	}
@@ -212,7 +226,7 @@ func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUp
 			}
 		case apierrors.IsNotFound(err):
 			// CR deleted between poll and beat; the next poll re-syncs.
-			m.setState(nil, nil, false)
+			m.setState(nil, nil, false, false)
 		default:
 			if msg := err.Error(); msg != m.getLastPatchErr() {
 				m.setLastPatchErr(msg)
@@ -225,17 +239,19 @@ func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUp
 	m.setLastPatchErr("")
 	m.mu.Lock()
 	m.statusUpdates = updates
+	m.statusRecorded = true // the CR now carries a verdict (possibly the explicit [])
 	m.mu.Unlock()
 	m.log.Info("wrote availableUpdates to ClusterInventory status", "updates", len(updates))
 }
 
 // setState stores the latest view and signals the coalescer when the SPEC
 // changed (status is not part of the payload, so it never triggers a beat).
-func (m *Manager) setState(inv *state.Inventory, updates []state.AvailableUpdate, present bool) {
+func (m *Manager) setState(inv *state.Inventory, updates []state.AvailableUpdate, recorded, present bool) {
 	m.mu.Lock()
 	changed := !reflect.DeepEqual(m.inv, inv)
 	m.inv = inv
 	m.statusUpdates = updates
+	m.statusRecorded = recorded
 	m.present = present
 	m.mu.Unlock()
 	if changed && m.notify != nil {

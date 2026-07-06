@@ -85,10 +85,18 @@ func specInventory(u *unstructured.Unstructured) *state.Inventory {
 // statusAvailableUpdates reads the CR's CURRENT status.availableUpdates — the
 // baseline the idempotence check compares against, so neither an agent
 // restart nor a repeat server response ever re-writes an unchanged status.
-func statusAvailableUpdates(u *unstructured.Unstructured) []state.AvailableUpdate {
+//
+// The second return is the FOUND-ness of the key itself: false means the CR
+// has never had a verdict recorded (a fresh CR — nil, never-checked), true
+// means one exists — possibly the explicit empty [] ("checked, nothing
+// newer"). len() alone cannot tell those two apart, and conflating them is
+// exactly what once swallowed the first empty verdict on a fresh CR (no
+// lastReported ever written). A present-but-malformed value (err != nil)
+// reports false so the next verdict repairs it.
+func statusAvailableUpdates(u *unstructured.Unstructured) ([]state.AvailableUpdate, bool) {
 	raw, found, err := unstructured.NestedSlice(u.Object, "status", "availableUpdates")
 	if !found || err != nil {
-		return nil
+		return nil, false
 	}
 	var updates []state.AvailableUpdate
 	for _, item := range raw {
@@ -106,7 +114,7 @@ func statusAvailableUpdates(u *unstructured.Unstructured) []state.AvailableUpdat
 			Latest:  nestedString(entry, "latest"),
 		})
 	}
-	return updates
+	return updates, true
 }
 
 // nestedString reads a top-level string key from an unstructured map ("" when

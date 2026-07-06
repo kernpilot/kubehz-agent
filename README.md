@@ -224,12 +224,15 @@ Boundaries: the spec is never written (lo-owned); the sibling
 `status.observedAddons` is never touched (merge semantics); the write is
 idempotent (compared against the CR's current status — refreshed every poll
 and after every write, so restarts and repeat responses, including an
-already-clear `[]`, cost zero patches); a clear is patched as an explicit
-`[]`, never `null` (merge-patch `null` would delete the field; `[]` keeps
-"checked, nothing newer" distinguishable from never-checked); an RBAC-denied
-patch warns **once** and beating continues; server input is clamped to the
-CRD's own status bounds before patching, and a non-empty verdict whose
-entries are all invalid is refused rather than treated as a clear.
+already-clear `[]`, cost zero patches) — but idempotence is keyed on a status
+**existing**: on a fresh CR with no recorded status the first verdict always
+writes, even `[]`, so `lastReported` gets stamped and never-checked becomes
+checked-and-clear; a clear is patched as an explicit `[]`, never `null`
+(merge-patch `null` would delete the field; `[]` keeps "checked, nothing
+newer" distinguishable from never-checked); an RBAC-denied patch warns
+**once** and beating continues; server input is clamped to the CRD's own
+status bounds before patching, and a non-empty verdict whose entries are all
+invalid is refused rather than treated as a clear.
 
 The server persists `actions` **latest-wins** and treats an absent `actions`
 key as *clear* — so the agent keeps reporting the current revision's actions

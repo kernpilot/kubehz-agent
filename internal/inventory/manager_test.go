@@ -265,15 +265,91 @@ func TestManager_HandleUpdatesNoCR(t *testing.T) {
 		t.Errorf("patched status with no CR present (%d patches)", n)
 	}
 
-	// An empty VERDICT against an already-clear status is idempotent: the CR
-	// carries no availableUpdates, so there is nothing to clear → no patch.
-	dyn2 := fakeDyn(inventoryCR())
+	// An empty VERDICT against an already-clear status (the CR carries an
+	// EXPLICIT [] — a verdict was recorded before) is idempotent → no patch.
+	// NB: an ABSENT status.availableUpdates is NOT "already clear" — that is
+	// the fresh-CR case, which must write; see
+	// TestManager_EmptyVerdictOnFreshCRWritesStatus.
+	cr := inventoryCR()
+	if err := unstructured.SetNestedField(cr.Object, []any{}, "status", "availableUpdates"); err != nil {
+		t.Fatal(err)
+	}
+	dyn2 := fakeDyn(cr)
 	m2 := NewManager(dyn2, 0, nil, nil)
 	m2.fetchOnce(ctx)
 	m2.HandleUpdates(ctx, nil)
 	m2.HandleUpdates(ctx, []state.AvailableUpdate{})
 	if n := len(patchActions(dyn2)); n != 0 {
 		t.Errorf("empty verdict on an already-clear status produced %d patches, want 0", n)
+	}
+}
+
+// TestManager_EmptyVerdictOnFreshCRWritesStatus is the fresh-CR contract,
+// pinned by the live pilot dogfood (~14 swallowed beats): a CR that has NEVER
+// had a status recorded (no status.availableUpdates key — never-checked) plus
+// a server [] verdict ("index consulted, nothing newer") MUST produce exactly
+// one status write — the explicit [] plus lastReported — because never-checked
+// and checked-and-clear are DIFFERENT tristate states. The old
+// equalUpdates(nil, nil) short-circuit conflated them, so an up-to-date
+// cluster's fresh CR never got lastReported at all. Repeats and restarts over
+// the now-written status stay zero-patch, and no verdict means no write.
+func TestManager_EmptyVerdictOnFreshCRWritesStatus(t *testing.T) {
+	dyn := fakeDyn(inventoryCR()) // fresh: no status at all
+	m := NewManager(dyn, 0, nil, nil)
+	m.now = func() time.Time { return t0 }
+	ctx := context.Background()
+	m.fetchOnce(ctx)
+
+	// Absent key (publisher never calls HandleUpdates): found-ness alone must
+	// not trigger a write — only a verdict does.
+	if n := len(patchActions(dyn)); n != 0 {
+		t.Fatalf("fresh CR with no verdict produced %d patches, want 0", n)
+	}
+
+	m.HandleUpdates(ctx, []state.AvailableUpdate{})
+
+	pas := patchActions(dyn)
+	if len(pas) != 1 {
+		t.Fatalf("empty verdict on a fresh CR produced %d patches, want exactly 1", len(pas))
+	}
+	var body map[string]map[string]any
+	if err := json.Unmarshal(pas[0].GetPatch(), &body); err != nil {
+		t.Fatalf("patch body not JSON: %v", err)
+	}
+	written, ok := body["status"]["availableUpdates"].([]any)
+	if !ok || len(written) != 0 {
+		t.Errorf("fresh-CR clear must patch an EXPLICIT empty array, got: %s", pas[0].GetPatch())
+	}
+	if got := body["status"]["lastReported"]; got != t0.Format(time.RFC3339) {
+		t.Errorf("lastReported = %v, want %s", got, t0.Format(time.RFC3339))
+	}
+
+	// The CR now carries the checked-and-clear state, kubectl-visible.
+	got, err := dyn.Resource(GVR).Get(ctx, CRName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, found, _ := unstructured.NestedSlice(got.Object, "status", "availableUpdates")
+	if !found || len(remaining) != 0 {
+		t.Errorf("status.availableUpdates = %v (found=%t), want present-and-empty", remaining, found)
+	}
+	if reported, _, _ := unstructured.NestedString(got.Object, "status", "lastReported"); reported != t0.Format(time.RFC3339) {
+		t.Errorf("status.lastReported = %q, want %s", reported, t0.Format(time.RFC3339))
+	}
+
+	// Repeat [] → idempotent, no second patch.
+	m.HandleUpdates(ctx, []state.AvailableUpdate{})
+	if n := len(patchActions(dyn)); n != 1 {
+		t.Errorf("repeated empty verdict re-patched (%d patches)", n)
+	}
+
+	// Restarted agent over the now-written status: the recorded-ness baseline
+	// comes from the CR read, so [] still costs zero writes.
+	m2 := NewManager(dyn, 0, nil, nil)
+	m2.fetchOnce(ctx)
+	m2.HandleUpdates(ctx, []state.AvailableUpdate{})
+	if n := len(patchActions(dyn)); n != 1 {
+		t.Errorf("restarted agent re-cleared an already-clear status (%d patches)", n)
 	}
 }
 
