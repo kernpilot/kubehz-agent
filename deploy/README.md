@@ -1,7 +1,8 @@
 # Deploying kubehz-agent (live view + desired state)
 
 ```bash
-# Registered tier — observe + report ONLY (no write RBAC anywhere):
+# Registered tier — observe + report only (no ACTING RBAC; the single write
+# is the ClusterInventory status mirror, see below):
 kubectl apply -k deploy/
 
 # Managed tier — adds the acting permission for server-gated worker scaling:
@@ -10,9 +11,20 @@ kubectl apply -k deploy/managed/
 
 ## The base/managed RBAC split
 
-The base is strictly read-only. `deploy/managed/` is the base **plus**
-`rbac-managed.yaml`, which grants exactly three things to the
-`kubehz-live-agent` ServiceAccount:
+The base carries **no acting permission**: read-only on nodes/pods/events and
+the lok8s `ClusterInventory` (`clusterinventories.lok8s.dev`), plus one
+narrowly-scoped write — `patch` on `clusterinventories/status`. That write is
+a **visibility feature, not acting** (which is why it lives in the base, so
+registered-tier users get it too): the agent mirrors the server-computed
+addon `availableUpdates` onto the status of the cluster's own reporting
+object, making updates `kubectl`-visible without a dashboard
+(`kubectl get clusterinventory cluster -o yaml`). Nothing reconciles that
+status — no machine, pod, or credential can be moved through it — and the
+status subresource cannot touch the lo-owned spec. Dropping the rule only
+loses the kubectl mirror (the agent warns once and keeps beating).
+
+`deploy/managed/` is the base **plus** `rbac-managed.yaml`, which grants
+exactly three things to the `kubehz-live-agent` ServiceAccount:
 
 1. **MachineDeployment patch** (namespaced Role, kube-system):
    `get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
@@ -55,7 +67,7 @@ Two kubehz agents can run in the same cluster:
 |---|---|---|
 | workload | CronJob `kubehz-heartbeat` (lok8s-managed) | Deployment `kubehz-live-agent` |
 | SA / RBAC / ConfigMap prefix | `kubehz-agent*` | `kubehz-live-agent*` |
-| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events `get,list,watch` + scoped Secret `get` |
+| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events/clusterinventories `get,list,watch` + clusterinventories/status `patch` + scoped Secret `get` |
 
 The name split is deliberate and load-bearing: the two RBAC sets are
 **different**, so reusing the `kubehz-agent*` names would overwrite the

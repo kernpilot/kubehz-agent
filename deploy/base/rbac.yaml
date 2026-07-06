@@ -10,15 +10,20 @@
 # this kustomization never writes. See deploy/README.md.
 #
 # The agent runs SharedInformers on nodes/pods/events, which require CLUSTER-WIDE
-# list/watch on those three resources. That is the entire blast radius: read-only
-# on nodes/pods/events, plus a get on ITS OWN token Secret (scoped by name). No
-# writes anywhere; no logs/exec/secret-reads beyond the one agent Secret — those
+# list/watch on those three resources. That is the blast radius: read-only on
+# nodes/pods/events plus the lok8s ClusterInventory (below), a get on ITS OWN
+# token Secret (scoped by name), and ONE narrowly-scoped write — the
+# ClusterInventory STATUS patch, a visibility feature explained at the rule. No
+# other writes; no logs/exec/secret-reads beyond the one agent Secret — those
 # are deliberately absent so the pod cannot read workload contents or credentials.
 #
-# THIS FILE STAYS READ-ONLY. The managed-tier ACTING permission (patch on
-# machinedeployments.cluster.k8s.io, for P3 worker scaling) is deliberately NOT
-# here — it lives in the opt-in overlay deploy/managed/rbac-managed.yaml so a
-# registered-tier apply never grants an unused write.
+# THIS FILE STAYS FREE OF ACTING PERMISSIONS. The managed-tier ACTING grants
+# (patch on machinedeployments.cluster.k8s.io, machine delete, …) are
+# deliberately NOT here — they live in the opt-in overlay
+# deploy/managed/rbac-managed.yaml so a registered-tier apply never grants an
+# unused infrastructure write. The one write below is NOT acting: it touches
+# only the status of the cluster's own reporting object and can move no
+# machine, pod, or credential.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -36,6 +41,29 @@ rules:
       - pods
       - events
     verbs: [get, list, watch]
+  # ClusterInventory (lok8s.dev, cluster-scoped singleton "cluster"): the
+  # deployment inventory the USER'S OWN `lo` CLI wrote into their own cluster
+  # (versions/addon names/categories/spec hash — the CRD schema prunes
+  # anything else). The agent reads its spec into the heartbeat's inventory
+  # block so the platform can compute addon updates. Registered-tier-safe:
+  # pure metadata the user's tooling already published cluster-locally.
+  - apiGroups: [lok8s.dev]
+    resources: [clusterinventories]
+    verbs: [get, list, watch]
+  # ClusterInventory STATUS patch — a VISIBILITY feature, not an acting
+  # permission, which is why it belongs in the base and not the managed
+  # overlay: the agent writes the server-computed availableUpdates (+
+  # lastReported) back onto the cluster's OWN reporting object, so
+  # `kubectl get clusterinventory cluster -o yaml` shows addon updates even
+  # for registered-tier users who never open the dashboard. It acts on no
+  # infrastructure: the status subresource of this one CR is dashboard-class
+  # data living in the user's cluster — nothing reconciles it, no machine,
+  # pod, or credential can be moved through it. Spec stays lo-owned (patch on
+  # the status SUBRESOURCE cannot write spec). Drop this rule and only the
+  # kubectl-visible mirror is lost (the agent warns once and keeps beating).
+  - apiGroups: [lok8s.dev]
+    resources: [clusterinventories/status]
+    verbs: [patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
