@@ -326,43 +326,6 @@ func TestReconcile_ListFailureIsTransient(t *testing.T) {
 	}
 }
 
-// Authorized-but-unbuilt upgrades are reported unsupported (failed), and only
-// when there is an actual pending version difference.
-func TestReconcile_UpgradeReportedUnsupported(t *testing.T) {
-	v := "v1.36.1"
-	doc := &desired.Doc{
-		Revision:          5,
-		KubernetesVersion: &v,
-		Execution:         desired.Execution{Upgrades: true},
-	}
-
-	dyn := fakeDyn()
-	store := actions.New(nil)
-	exec := New(dyn, store, Options{Namespace: ns, MaxReplicas: 50, ObservedVersion: func() string { return "v1.35.5" }})
-	exec.Reconcile(context.Background(), doc)
-
-	a := findAction(t, store, v)
-	if a.Type != state.ActionUpgrade || a.Status != state.ActionFailed || !strings.Contains(a.Detail, "not supported") {
-		t.Errorf("action = %+v, want unsupported upgrade report", a)
-	}
-
-	// Already at target (modulo the v prefix) → nothing to report.
-	store2 := actions.New(nil)
-	exec2 := New(dyn, store2, Options{Namespace: ns, MaxReplicas: 50, ObservedVersion: func() string { return "1.36.1" }})
-	exec2.Reconcile(context.Background(), doc)
-	if got := store2.Snapshot(); got != nil {
-		t.Errorf("in-sync version reported: %+v", got)
-	}
-
-	// Unknown observed version → do not guess, do not report.
-	store3 := actions.New(nil)
-	exec3 := New(dyn, store3, Options{Namespace: ns, MaxReplicas: 50})
-	exec3.Reconcile(context.Background(), doc)
-	if got := store3.Snapshot(); got != nil {
-		t.Errorf("unknown observed version reported: %+v", got)
-	}
-}
-
 // A new revision's pass replaces the previous revision's reports (latest-wins,
 // mirroring the server).
 func TestReconcile_NewRevisionReplacesReports(t *testing.T) {

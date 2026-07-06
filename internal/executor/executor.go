@@ -1,11 +1,12 @@
 // Package executor is the ACTING side of the desired-state loop
 // (managed-platform-spec §1.3.3): P3 worker scaling (MachineDeployment
-// spec.replicas merge patches) and P5 self-healing (deleting unhealthy worker
-// Machines, see heal.go) — so that the cluster's OWN machine-controller
-// (which already holds the cluster's own hcloud credentials) does all
-// provisioning/deprovisioning. The agent builds no provisioner and carries no
-// cloud credential; its entire acting surface is patches/deletes on the
-// machine-controller's namespaced custom resources.
+// spec.replicas merge patches), P5 self-healing (deleting unhealthy worker
+// Machines, see heal.go), and P6 worker upgrades (rolling each pool MD's
+// spec.template.spec.versions.kubelet, see upgrade.go) — so that the
+// cluster's OWN machine-controller (which already holds the cluster's own
+// hcloud credentials) does all provisioning/deprovisioning. The agent builds
+// no provisioner and carries no cloud credential; its entire acting surface
+// is patches/deletes on the machine-controller's namespaced custom resources.
 //
 // Safety posture (every rule enforced here, in one place):
 //
@@ -36,12 +37,14 @@
 //     discipline, sized to P3.
 //   - Idempotent: a pool already at desiredReplicas reports done without
 //     patching, so restarts/re-polls reconverge with zero cluster writes.
-//   - MD edits are replica edits ONLY: no MD creates, no MD deletes, no
-//     machineType changes. An authorized-but-unbuilt capability
-//     (execution.upgrades with a pending version) is reported as an
-//     unsupported/failed action rather than improvised.
+//   - MD edits touch exactly TWO fields: spec.replicas (scaling) and
+//     spec.template.spec.versions.kubelet (upgrades). No MD creates, no MD
+//     deletes, no machineType changes — anything else authorized-but-unbuilt
+//     is reported as unsupported/failed rather than improvised.
 //   - The P5 healer's guardrails (CP refusal, storm brake, cooldown,
-//     concurrency budget, autoscaler skip) are documented in heal.go.
+//     concurrency budget, autoscaler skip) are documented in heal.go; the
+//     P6 roll discipline (CP-version pre-flight, one pool at a time) in
+//     upgrade.go.
 package executor
 
 import (
@@ -136,6 +139,11 @@ type Executor struct {
 	// design: the docs' guardrails plus baseline make persistence unnecessary
 	// and a PV/CRD would be state the user has to clean up).
 	lastHeal map[string]time.Time
+	// rollFrom remembers each pool's pre-roll kubelet version so P6 progress
+	// details can say "vFROM → vTO (n/m)" across passes. In-memory; after a
+	// restart mid-roll it is re-derived from the machines still on the old
+	// version (see deriveFromVersion).
+	rollFrom map[string]string
 }
 
 // Options configures New. Namespace and MaxReplicas are required by the
@@ -174,6 +182,7 @@ func New(dyn dynamic.Interface, store *actions.Store, opts Options) *Executor {
 		now:             opts.Now,
 		baseline:        opts.Now(),
 		lastHeal:        make(map[string]time.Time),
+		rollFrom:        make(map[string]string),
 	}
 }
 
@@ -200,44 +209,20 @@ func (e *Executor) Reconcile(ctx context.Context, doc *desired.Doc) (retry bool)
 
 	e.store.Begin(doc.Revision)
 
-	if doc.Execution.Upgrades {
-		e.reportUpgradeUnsupported(doc)
-	}
+	// Order matters: scale first (capacity before disruption), then roll
+	// versions, then heal — the healer's in-flight budget already counts any
+	// machines the first two set deleting.
 	if doc.Execution.Scaling {
 		retry = e.scalePools(ctx, doc)
+	}
+	if doc.Execution.Upgrades {
+		retry = e.upgradePools(ctx, doc) || retry
 	}
 	if healing {
 		e.healPass(ctx, doc)
 		retry = true // continuous loop: re-evaluate health every poll tick
 	}
 	return retry
-}
-
-// reportUpgradeUnsupported reports an authorized upgrade this agent version
-// cannot execute ("report anything else as unsupported" — never improvise).
-// Nothing is reported when there is no pending upgrade (version null/empty,
-// already at target, or the observed version is unknown).
-func (e *Executor) reportUpgradeUnsupported(doc *desired.Doc) {
-	if doc.KubernetesVersion == nil {
-		return
-	}
-	want := strings.TrimSpace(*doc.KubernetesVersion)
-	if want == "" {
-		return
-	}
-	observed := e.observedVersion()
-	if observed == "" || sameVersion(observed, want) {
-		return
-	}
-	e.store.Upsert(state.Action{
-		Type:     state.ActionUpgrade,
-		Target:   want,
-		Status:   state.ActionFailed,
-		Detail:   "upgrade execution is not supported by this agent version (P3 executes replica scaling only); upgrade via lo provision / kubeone apply",
-		Revision: doc.Revision,
-	})
-	e.log.Warn("desired kubernetes version differs but upgrades are unsupported",
-		"observed", observed, "desired", want, "revision", doc.Revision)
 }
 
 // scalePools processes the desired pools sequentially (name order, one action
