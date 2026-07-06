@@ -61,6 +61,10 @@ const (
 	// versions/hash/timestamps<=64 (MaxVersionLen), kind/provider/category/
 	// source<=63 (MaxStatusLen).
 	MaxAddons = 256
+	// MaxAvailableUpdates mirrors the ClusterInventory CRD's
+	// status.availableUpdates maxItems: the CR write would be rejected past
+	// it, so the agent clamps what the server sends before patching.
+	MaxAvailableUpdates = 256
 )
 
 // AgentMode distinguishes the two agents that speak this contract.
@@ -280,6 +284,19 @@ type Addon struct {
 	AppVersion   string `json:"appVersion,omitempty"`
 	Category     string `json:"category,omitempty"`
 	Source       string `json:"source,omitempty"`
+}
+
+// AvailableUpdate is one newer-version-known-upstream line. It appears in TWO
+// places with the SAME shape, deliberately: the heartbeat RESPONSE body
+// (`availableUpdates: [{name, current, latest}]`, computed by kubehz-api from
+// the reported inventory — the api side is being built in parallel to this
+// exact contract) and the ClusterInventory CR's status.availableUpdates (the
+// CRD schema, where the agent writes it back so `kubectl get clusterinventory
+// cluster -o yaml` shows updates without any dashboard).
+type AvailableUpdate struct {
+	Name    string `json:"name"`
+	Current string `json:"current,omitempty"`
+	Latest  string `json:"latest,omitempty"`
 }
 
 // Pool is an observed worker MachineDeployment (forward-compat, spec §2/§3).

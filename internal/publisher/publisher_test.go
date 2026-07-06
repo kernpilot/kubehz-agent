@@ -3,8 +3,10 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kernpilot/kubehz-agent/internal/state"
@@ -124,4 +126,84 @@ func asAuthError(err error, target **AuthError) bool {
 		*target = ae
 	}
 	return ok
+}
+
+// TestPublish_ParsesAvailableUpdates: a 200 body carrying availableUpdates
+// reaches the registered consumer with the exact parsed entries; extra keys
+// in the response are ignored.
+func TestPublish_ParsesAvailableUpdates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"status":"ok","availableUpdates":[`+
+			`{"name":"cilium","current":"1.16.1","latest":"1.17.4"},`+
+			`{"name":"rook-ceph","current":"1.20.2","latest":"1.20.4"}]}`)
+	}))
+	defer srv.Close()
+
+	var got []state.AvailableUpdate
+	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p.OnAvailableUpdates(func(_ context.Context, updates []state.AvailableUpdate) { got = updates })
+
+	if err := p.Publish(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("Publish returned error: %v", err)
+	}
+	want := []state.AvailableUpdate{
+		{Name: "cilium", Current: "1.16.1", Latest: "1.17.4"},
+		{Name: "rook-ceph", Current: "1.20.2", Latest: "1.20.4"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("consumer got %d updates, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("update[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestPublish_ResponseParsingFailsSoft: today's API returns a body WITHOUT
+// availableUpdates (or no JSON at all) — the beat must still succeed and the
+// consumer must not fire. Same for an empty updates list and for a body
+// larger than the read bound.
+func TestPublish_ResponseParsingFailsSoft(t *testing.T) {
+	for name, body := range map[string]string{
+		"legacy-shape": `{"status":"ok"}`,
+		"not-json":     `pong`,
+		"empty-body":   ``,
+		"empty-list":   `{"availableUpdates":[]}`,
+		"oversized":    `{"availableUpdates":[{"name":"` + strings.Repeat("x", maxResponseBytes) + `"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = fmt.Fprint(w, body)
+			}))
+			defer srv.Close()
+
+			called := false
+			p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+			p.OnAvailableUpdates(func(context.Context, []state.AvailableUpdate) { called = true })
+
+			if err := p.Publish(context.Background(), samplePayload()); err != nil {
+				t.Fatalf("Publish returned error: %v", err)
+			}
+			if called {
+				t.Error("consumer fired for a body with no usable updates")
+			}
+		})
+	}
+}
+
+// TestPublish_NoConsumerNoRead: without a registered consumer the response
+// body path stays exactly as before (drained + discarded) — no behavior
+// change for the pre-inventory wiring.
+func TestPublish_NoConsumerNoRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"availableUpdates":[{"name":"cilium"}]}`)
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	if err := p.Publish(context.Background(), samplePayload()); err != nil {
+		t.Fatalf("Publish returned error: %v", err)
+	}
 }

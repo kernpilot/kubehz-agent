@@ -37,6 +37,12 @@ func (e *AuthError) Error() string {
 	return fmt.Sprintf("agent token rejected by server (HTTP %d) — token unknown, revoked, or bound to another cluster", e.Status)
 }
 
+// maxResponseBytes bounds how much of a heartbeat response body is ever read:
+// the only thing the agent consumes is availableUpdates (≤256 entries of three
+// short strings — well under 128 KiB), so anything larger is a misbehaving
+// server and gets truncated into a failed parse, not a memory balloon.
+const maxResponseBytes = 128 << 10
+
 // Publisher performs a single authenticated POST of a payload. Timing (debounce,
 // min-gap, backoff) lives in the Coalescer/Sender; the Publisher is one shot.
 type Publisher struct {
@@ -44,6 +50,19 @@ type Publisher struct {
 	url       string
 	token     string
 	userAgent string
+
+	// onUpdates consumes the availableUpdates the server computes from the
+	// reported inventory and returns in the 200 body (nil = the body is
+	// discarded, the pre-inventory behaviour). Set once via
+	// OnAvailableUpdates before the Sender starts.
+	onUpdates func(context.Context, []state.AvailableUpdate)
+}
+
+// heartbeatResponse is the slice of the response body the agent consumes.
+// Everything else in the body is deliberately ignored (the server owns its
+// response shape; the agent depends only on this one additive key).
+type heartbeatResponse struct {
+	AvailableUpdates []state.AvailableUpdate `json:"availableUpdates"`
 }
 
 // DefaultHTTPClient is the hardened client every outbound kubehz-api call
@@ -79,6 +98,13 @@ func New(apiURL, clusterID, token, agentVersion string, httpClient *http.Client)
 // URL is the full endpoint (exposed for logging without leaking the token).
 func (p *Publisher) URL() string { return p.url }
 
+// OnAvailableUpdates registers the consumer for the availableUpdates the
+// server returns in a 2xx heartbeat response. NOT safe to call once the
+// Sender is running — wire it during startup, before the first Enqueue.
+func (p *Publisher) OnAvailableUpdates(fn func(ctx context.Context, updates []state.AvailableUpdate)) {
+	p.onUpdates = fn
+}
+
 // Publish marshals and POSTs the payload once. It returns:
 //   - nil on 2xx;
 //   - *AuthError on 401/403 (identity problem);
@@ -109,10 +135,31 @@ func (p *Publisher) Publish(ctx context.Context, payload *state.Payload) error {
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		p.consumeUpdates(ctx, resp.Body)
 		return nil
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return &AuthError{Status: resp.StatusCode}
 	default:
 		return fmt.Errorf("heartbeat rejected: HTTP %d", resp.StatusCode)
 	}
+}
+
+// consumeUpdates parses availableUpdates out of a 2xx body and hands them to
+// the registered consumer. FAIL-SOFT in every direction: no consumer, an
+// unreadable/over-long/non-JSON body (today's API returns a different shape —
+// that must never fail the beat), or an empty list all mean "do nothing".
+// The beat itself already succeeded; this is a bonus read.
+func (p *Publisher) consumeUpdates(ctx context.Context, body io.Reader) {
+	if p.onUpdates == nil {
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes))
+	if err != nil {
+		return
+	}
+	var hr heartbeatResponse
+	if json.Unmarshal(raw, &hr) != nil || len(hr.AvailableUpdates) == 0 {
+		return
+	}
+	p.onUpdates(ctx, hr.AvailableUpdates)
 }
