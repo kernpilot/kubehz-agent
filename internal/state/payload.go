@@ -41,12 +41,34 @@ const (
 	// otherwise-unbounded payload dimension (a many-tenant cluster can carry
 	// thousands of namespaces).
 	MaxNamespaces = 500
+	// MaxActions mirrors HB_MAX_ACTIONS (kubehz-api dfa9b7a): the P3
+	// desired-state action reports are capped at 20 per beat.
+	MaxActions = 20
+	// MaxDetailLen: an action detail shares the event-note cap (HB_MAX_NOTE_LEN).
+	MaxDetailLen = MaxNoteLen
+	// MaxRevision mirrors HB_MAX_COUNT — the server bounds every count-like
+	// integer, including the acted desired-state revision.
+	MaxRevision = 10_000_000
 )
 
 // AgentMode distinguishes the two agents that speak this contract.
 const (
 	ModeOperator = "operator" // this long-running informer agent (managed tier)
 	ModeCronjob  = "cronjob"  // the lightweight bash heartbeat (registered tier)
+)
+
+// Action type/status enums — the exact wire values kubehz-api's actions[] zod
+// schema accepts (z.enum(['scale','upgrade']) / z.enum(['pending','in-progress',
+// 'done','failed']), dfa9b7a). Any other value 400s the WHOLE beat, so nothing
+// outside this set may ever be assigned.
+const (
+	ActionScale   = "scale"
+	ActionUpgrade = "upgrade"
+
+	ActionPending    = "pending"
+	ActionInProgress = "in-progress"
+	ActionDone       = "done"
+	ActionFailed     = "failed"
 )
 
 // Payload is the full live-view snapshot. It is built fresh from the informer
@@ -64,10 +86,21 @@ type Payload struct {
 	Workloads  Workloads    `json:"workloads"`
 	Events     []EventState `json:"events,omitempty"`
 
+	// Actions is the P3 desired-state progress report (the pull-loop ack the
+	// API ingests since dfa9b7a): what the agent DID with the desired doc it
+	// pulled from GET /clusters/{id}/desired. The server persists it
+	// latest-wins — a beat WITHOUT actions CLEARS them — so the agent keeps
+	// reporting the current revision's actions on every beat while they are
+	// relevant (the actions.Store owns that lifecycle). omitempty is
+	// load-bearing: an empty store must serialize as an ABSENT key, which is
+	// exactly the server's "clear" signal.
+	Actions []Action `json:"actions,omitempty"`
+
 	// Pools and Desired are DESIGNED, forward-compat fields (spec §2/§3): the
-	// observed MachineDeployment pools and the desired-state pull-loop ack.
-	// The scaffold's informer scope is nodes/pods/events, so they stay empty
-	// until the P3+ MachineDeployment informer / desired pull loop land.
+	// observed MachineDeployment pools and the desired{revision,state} ack.
+	// The current HeartbeatSchema accepts-and-strips them (only actions[] is
+	// ingested), so the agent leaves them empty rather than inventing contract
+	// values the server would later ingest with different semantics.
 	Pools   []Pool      `json:"pools,omitempty"`
 	Desired *DesiredAck `json:"desired,omitempty"`
 
@@ -155,6 +188,20 @@ type EventState struct {
 	Note      string `json:"note,omitempty"`
 }
 
+// Action is one desired-state progress report, wire-identical to kubehz-api's
+// HeartbeatSchema actions[] entry (dfa9b7a): Type ∈ {scale, upgrade}, Status ∈
+// {pending, in-progress, done, failed}; Target names the acted-on object (a
+// worker-pool / MachineDeployment name for scale, the version target for
+// upgrade); Revision is the desired-state revision the action executed
+// against, so the dashboard can correlate intent → outcome.
+type Action struct {
+	Type     string `json:"type"`
+	Target   string `json:"target"`
+	Status   string `json:"status"`
+	Detail   string `json:"detail,omitempty"`
+	Revision int    `json:"revision"`
+}
+
 // Pool is an observed worker MachineDeployment (forward-compat, spec §2/§3).
 type Pool struct {
 	Name        string `json:"name"`
@@ -212,6 +259,38 @@ func ApplyCaps(p *Payload) {
 		p.Events[i].Kind = clamp(p.Events[i].Kind, MaxStatusLen)
 		p.Events[i].Namespace = clamp(p.Events[i].Namespace, MaxNameLen)
 		p.Events[i].Note = clamp(p.Events[i].Note, MaxNoteLen)
+	}
+
+	// Actions: the server requires target to be 1..253 chars, so an entry with
+	// an EMPTY target would 400 the whole beat — drop such entries (defense in
+	// depth; the executor never produces them) instead of shipping a poisoned
+	// payload. Then cap the list and clamp every string/int to the schema
+	// bounds. An emptied list becomes nil so omitempty drops the key (= the
+	// server's "clear actions" signal).
+	kept := p.Actions[:0]
+	for _, a := range p.Actions {
+		if a.Target != "" {
+			kept = append(kept, a)
+		}
+	}
+	p.Actions = kept
+	if len(p.Actions) > MaxActions {
+		p.Actions = p.Actions[:MaxActions]
+	}
+	for i := range p.Actions {
+		p.Actions[i].Type = clamp(p.Actions[i].Type, MaxStatusLen)
+		p.Actions[i].Target = clamp(p.Actions[i].Target, MaxNameLen)
+		p.Actions[i].Status = clamp(p.Actions[i].Status, MaxStatusLen)
+		p.Actions[i].Detail = clamp(p.Actions[i].Detail, MaxDetailLen)
+		if p.Actions[i].Revision < 0 {
+			p.Actions[i].Revision = 0
+		}
+		if p.Actions[i].Revision > MaxRevision {
+			p.Actions[i].Revision = MaxRevision
+		}
+	}
+	if len(p.Actions) == 0 {
+		p.Actions = nil
 	}
 
 	// Keep the first MaxNamespaces in lexicographic order: deterministic, so

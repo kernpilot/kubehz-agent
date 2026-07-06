@@ -94,6 +94,79 @@ func TestApplyCaps_BoundsByNamespace(t *testing.T) {
 	}
 }
 
+// Actions must be capped to the server's HB_MAX_ACTIONS, every field clamped,
+// and an empty-target entry dropped — one such entry would 400 the WHOLE beat
+// (the server requires target 1..253).
+func TestApplyCaps_BoundsActions(t *testing.T) {
+	p := &Payload{}
+	for i := 0; i < MaxActions+5; i++ {
+		p.Actions = append(p.Actions, Action{
+			Type:     ActionScale,
+			Target:   strings.Repeat("p", MaxNameLen+7),
+			Status:   ActionDone,
+			Detail:   strings.Repeat("d", MaxDetailLen+50),
+			Revision: MaxRevision + 10,
+		})
+	}
+	// Poisoned entries: empty target (server min 1) and a negative revision.
+	p.Actions[0].Target = ""
+	p.Actions[1].Revision = -3
+
+	ApplyCaps(p)
+
+	if len(p.Actions) != MaxActions {
+		t.Fatalf("actions not capped: %d, want %d", len(p.Actions), MaxActions)
+	}
+	for _, a := range p.Actions {
+		if a.Target == "" {
+			t.Errorf("empty-target action survived (would 400 the beat)")
+		}
+		if len(a.Target) > MaxNameLen || len(a.Detail) > MaxDetailLen {
+			t.Errorf("action strings not clamped: %+v", a)
+		}
+		if a.Revision < 0 || a.Revision > MaxRevision {
+			t.Errorf("revision out of server bounds: %d", a.Revision)
+		}
+	}
+
+	// An all-invalid list must become nil so omitempty drops the key — the
+	// server's "clear actions" signal, not a literal empty array.
+	empty := &Payload{Actions: []Action{{Type: ActionScale, Target: "", Status: ActionDone}}}
+	ApplyCaps(empty)
+	if empty.Actions != nil {
+		t.Errorf("emptied actions should be nil for omitempty, got %#v", empty.Actions)
+	}
+}
+
+// Actions serialize under the exact wire names + enum values the server's zod
+// schema expects; absent actions must omit the key entirely (the clear signal).
+func TestPayload_ActionsWireShape(t *testing.T) {
+	p := &Payload{
+		Actions: []Action{{
+			Type: ActionScale, Target: "pool-a", Status: ActionInProgress,
+			Detail: "replicas 2 to 3", Revision: 7,
+		}},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`"actions":[{`, `"type":"scale"`, `"target":"pool-a"`,
+		`"status":"in-progress"`, `"detail":"replicas 2 to 3"`, `"revision":7`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("actions JSON missing %s\ngot: %s", want, s)
+		}
+	}
+
+	bare, _ := json.Marshal(&Payload{})
+	if strings.Contains(string(bare), "actions") {
+		t.Errorf("empty payload must OMIT actions (server clear signal): %s", bare)
+	}
+}
+
 func TestApplyCaps_Idempotent(t *testing.T) {
 	p := &Payload{ClusterID: "kubehz.in.net", Nodes: []NodeState{{Name: "n1"}}}
 	ApplyCaps(p)
