@@ -52,18 +52,22 @@ const (
 	// MaxRevision mirrors HB_MAX_COUNT — the server bounds every count-like
 	// integer, including the acted desired-state revision.
 	MaxRevision = 10_000_000
-	// MaxAddons mirrors the ClusterInventory CRD's spec.addons maxItems
-	// (lok8s operator/crds/clusterinventory.yaml). The inventory block is READ
-	// off that CR, whose schema the apiserver already enforced on write, so
-	// these caps can never truncate real data — they exist so a hand-rolled or
-	// corrupt CR still cannot bloat the beat. The per-field caps conveniently
-	// coincide with the heartbeat's own: name<=253 (MaxNameLen),
-	// versions/hash/timestamps<=64 (MaxVersionLen), kind/provider/category/
-	// source<=63 (MaxStatusLen).
-	MaxAddons = 256
+	// MaxAddons mirrors HB_MAX_INVENTORY_ADDONS (kubehz-api f628c97,
+	// validation.ts): the server's zod schema HARD-caps inventory.addons at
+	// 100 — one entry more 400s the WHOLE beat, exactly like an empty action
+	// target. The ClusterInventory CRD itself allows up to 256 addons
+	// (operator/crds/clusterinventory.yaml maxItems), so the WIRE cap is the
+	// tighter fence and ApplyCaps truncates to it: on a >100-addon cluster a
+	// clipped inventory beats a rejected heartbeat. Per-field caps coincide
+	// with the heartbeat's own: name<=253 (MaxNameLen), versions/hash/
+	// timestamps<=64 (MaxVersionLen), kind/provider/category/source<=63
+	// (MaxStatusLen).
+	MaxAddons = 100
 	// MaxAvailableUpdates mirrors the ClusterInventory CRD's
-	// status.availableUpdates maxItems: the CR write would be rejected past
-	// it, so the agent clamps what the server sends before patching.
+	// status.availableUpdates maxItems (256): the CR write would be rejected
+	// past it, so the agent clamps what the server sends before patching.
+	// (In practice the server answers at most MaxAddons updates — it diffs
+	// only the addons it accepted.)
 	MaxAvailableUpdates = 256
 )
 
@@ -132,10 +136,10 @@ type Payload struct {
 	// Absent (omitempty) when the CRD/CR does not exist — a cluster not
 	// deployed by lok8s sends no block at all.
 	//
-	// The kubehz-api ingestion of this block (+ the availableUpdates response,
-	// see AvailableUpdate) is being built in parallel; until it lands, the
-	// non-strict HeartbeatSchema accepts-and-strips the key, exactly like the
-	// other additive schema-2 fields.
+	// The kubehz-api side is SHIPPED (f628c97): the block is validated +
+	// capped (addons hard-capped at MaxAddons — see that constant) and
+	// persisted latest-wins like actions; the response returns the diffed
+	// availableUpdates (see AvailableUpdate for the tristate semantics).
 	Inventory *Inventory `json:"inventory,omitempty"`
 
 	// Pools and Desired are DESIGNED, forward-compat fields (spec §2/§3): the
@@ -289,10 +293,13 @@ type Addon struct {
 // AvailableUpdate is one newer-version-known-upstream line. It appears in TWO
 // places with the SAME shape, deliberately: the heartbeat RESPONSE body
 // (`availableUpdates: [{name, current, latest}]`, computed by kubehz-api from
-// the reported inventory — the api side is being built in parallel to this
-// exact contract) and the ClusterInventory CR's status.availableUpdates (the
-// CRD schema, where the agent writes it back so `kubectl get clusterinventory
-// cluster -o yaml` shows updates without any dashboard).
+// the reported inventory — SHIPPED, f628c97) and the ClusterInventory CR's
+// status.availableUpdates (the CRD schema, where the agent writes it back so
+// `kubectl get clusterinventory cluster -o yaml` shows updates without any
+// dashboard). The response key is TRISTATE — absent = no verdict (index
+// unreachable / no inventory reported), [] = nothing newer (clears stale CR
+// status), non-empty = updates — see publisher.heartbeatResponse and
+// inventory.Manager.HandleUpdates for the enforcement.
 type AvailableUpdate struct {
 	Name    string `json:"name"`
 	Current string `json:"current,omitempty"`
