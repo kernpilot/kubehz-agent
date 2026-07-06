@@ -12,6 +12,14 @@ on:
   pull_request:
     branches: [main]
 
+# One run per ref: a newer push supersedes an in-flight older one, so two
+# overlapping main builds can never finish out of order and leave the moving
+# `main` image tag pointing at the older commit. Tag (release) runs are never
+# cancelled mid-publish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 permissions:
   contents: read
 

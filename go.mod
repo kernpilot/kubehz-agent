@@ -2,6 +2,11 @@ module github.com/kernpilot/kubehz-agent
 
 go 1.25.0
 
+// Keep in lockstep with the Dockerfile base and CI GO_VERSION: go1.26.4 fixes
+// GO-2026-5037/5038/5039 (stdlib), so an older local toolchain would build a
+// vulnerable binary and fail govulncheck.
+toolchain go1.26.4
+
 require (
 	k8s.io/api v0.35.6
 	k8s.io/apimachinery v0.35.6
