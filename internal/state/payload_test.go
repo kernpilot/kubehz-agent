@@ -138,6 +138,82 @@ func TestApplyCaps_BoundsActions(t *testing.T) {
 	}
 }
 
+func TestApplyCaps_BoundsMachineIssues(t *testing.T) {
+	p := &Payload{}
+	for i := 0; i < MaxMachineIssues+5; i++ {
+		p.MachineIssues = append(p.MachineIssues, MachineIssue{
+			Pool:    strings.Repeat("p", MaxStatusLen+7),
+			Machine: strings.Repeat("m", MaxNameLen+7),
+			Reason:  strings.Repeat("r", MaxStatusLen+7),
+			Message: strings.Repeat("x", MaxNoteLen+50),
+			Since:   strings.Repeat("t", MaxVersionLen+7),
+		})
+	}
+	// Poisoned entries: the server's zod requires pool and reason min(1).
+	p.MachineIssues[0].Pool = ""
+	p.MachineIssues[1].Reason = ""
+
+	ApplyCaps(p)
+
+	if len(p.MachineIssues) != MaxMachineIssues {
+		t.Fatalf("machineIssues not capped: %d, want %d", len(p.MachineIssues), MaxMachineIssues)
+	}
+	for _, mi := range p.MachineIssues {
+		if mi.Pool == "" || mi.Reason == "" {
+			t.Errorf("empty pool/reason survived (would 400 the beat): %+v", mi)
+		}
+		if len(mi.Pool) > MaxStatusLen || len(mi.Machine) > MaxNameLen ||
+			len(mi.Reason) > MaxStatusLen || len(mi.Message) > MaxNoteLen ||
+			len(mi.Since) > MaxVersionLen {
+			t.Errorf("machineIssue strings not clamped: %+v", mi)
+		}
+	}
+
+	// An all-invalid list must become nil so omitempty drops the key — the
+	// server's "clear machineIssues" signal, not a literal empty array.
+	empty := &Payload{MachineIssues: []MachineIssue{{Pool: "", Reason: "x"}}}
+	ApplyCaps(empty)
+	if empty.MachineIssues != nil {
+		t.Errorf("emptied machineIssues should be nil for omitempty, got %#v", empty.MachineIssues)
+	}
+}
+
+// machineIssues serialize under the exact wire names the server's zod schema
+// expects; an EMPTY machine must omit the key (zod machine is optional min(1)
+// — an empty string would 400), and absent machineIssues omit the key entirely.
+func TestPayload_MachineIssuesWireShape(t *testing.T) {
+	p := &Payload{
+		MachineIssues: []MachineIssue{{
+			Pool:    "pool-a",
+			Reason:  "ReconcilingError",
+			Message: "unsupported location for server type",
+			Since:   "2026-07-06T12:00:00Z",
+		}},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`"machineIssues":[`, `"pool":"pool-a"`, `"reason":"ReconcilingError"`,
+		`"message":"unsupported location for server type"`, `"since":"2026-07-06T12:00:00Z"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("machineIssues JSON missing %s\ngot: %s", want, s)
+		}
+	}
+	if strings.Contains(s, `"machine"`) {
+		t.Errorf("empty machine key must be omitted (zod min(1)): %s", s)
+	}
+
+	none := &Payload{}
+	b, _ = json.Marshal(none)
+	if strings.Contains(string(b), "machineIssues") {
+		t.Errorf("absent machineIssues must omit the key: %s", b)
+	}
+}
+
 // Actions serialize under the exact wire names + enum values the server's zod
 // schema expects; absent actions must omit the key entirely (the clear signal).
 func TestPayload_ActionsWireShape(t *testing.T) {

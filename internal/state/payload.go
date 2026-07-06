@@ -44,6 +44,9 @@ const (
 	// MaxActions mirrors HB_MAX_ACTIONS (kubehz-api dfa9b7a): the P3
 	// desired-state action reports are capped at 20 per beat.
 	MaxActions = 20
+	// MaxMachineIssues mirrors HB_MAX_MACHINE_ISSUES (kubehz-api d57c206):
+	// machine-controller provisioning failures are capped at 20 per beat.
+	MaxMachineIssues = 20
 	// MaxDetailLen: an action detail shares the event-note cap (HB_MAX_NOTE_LEN).
 	MaxDetailLen = MaxNoteLen
 	// MaxRevision mirrors HB_MAX_COUNT — the server bounds every count-like
@@ -95,6 +98,14 @@ type Payload struct {
 	// load-bearing: an empty store must serialize as an ABSENT key, which is
 	// exactly the server's "clear" signal.
 	Actions []Action `json:"actions,omitempty"`
+
+	// MachineIssues surfaces machine-controller provisioning failures read off
+	// Machine objects (kubehz-api d57c206) — e.g. hcloud rejecting a
+	// webhook-accepted server type ("unsupported location for server type") —
+	// so a pool that NEVER converges is visible even though its nodes never
+	// join. Latest-wins server-side, exactly like actions: omitempty is
+	// load-bearing (an empty list must serialize as an ABSENT key = clear).
+	MachineIssues []MachineIssue `json:"machineIssues,omitempty"`
 
 	// Pools and Desired are DESIGNED, forward-compat fields (spec §2/§3): the
 	// observed MachineDeployment pools and the desired{revision,state} ack.
@@ -202,6 +213,21 @@ type Action struct {
 	Revision int    `json:"revision"`
 }
 
+// MachineIssue is one machine-controller failure line, wire-identical to
+// kubehz-api's HeartbeatSchema machineIssues[] entry (d57c206): Pool is the
+// owning MachineDeployment (required, ≤63); Machine the failing Machine's name
+// when one exists (optional — a rejected create may have none, and zod's
+// min(1) means an EMPTY machine would 400, so omitempty is load-bearing);
+// Reason a short machine-readable cause (required, ≤63); Message the human
+// detail (≤256); Since the agent-observed first-seen timestamp (RFC3339, ≤64).
+type MachineIssue struct {
+	Pool    string `json:"pool"`
+	Machine string `json:"machine,omitempty"`
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+	Since   string `json:"since"`
+}
+
 // Pool is an observed worker MachineDeployment (forward-compat, spec §2/§3).
 type Pool struct {
 	Name        string `json:"name"`
@@ -291,6 +317,32 @@ func ApplyCaps(p *Payload) {
 	}
 	if len(p.Actions) == 0 {
 		p.Actions = nil
+	}
+
+	// MachineIssues: the server requires pool and reason to be non-empty (zod
+	// min(1)), so an entry missing either would 400 the whole beat — drop such
+	// entries (defense in depth; the collector never produces them). Then cap
+	// the list and clamp every string to the schema bounds; an emptied list
+	// becomes nil so omitempty drops the key (= the server's "clear" signal).
+	keptIssues := p.MachineIssues[:0]
+	for _, mi := range p.MachineIssues {
+		if mi.Pool != "" && mi.Reason != "" {
+			keptIssues = append(keptIssues, mi)
+		}
+	}
+	p.MachineIssues = keptIssues
+	if len(p.MachineIssues) > MaxMachineIssues {
+		p.MachineIssues = p.MachineIssues[:MaxMachineIssues]
+	}
+	for i := range p.MachineIssues {
+		p.MachineIssues[i].Pool = clamp(p.MachineIssues[i].Pool, MaxStatusLen)
+		p.MachineIssues[i].Machine = clamp(p.MachineIssues[i].Machine, MaxNameLen)
+		p.MachineIssues[i].Reason = clamp(p.MachineIssues[i].Reason, MaxStatusLen)
+		p.MachineIssues[i].Message = clamp(p.MachineIssues[i].Message, MaxNoteLen)
+		p.MachineIssues[i].Since = clamp(p.MachineIssues[i].Since, MaxVersionLen)
+	}
+	if len(p.MachineIssues) == 0 {
+		p.MachineIssues = nil
 	}
 
 	// Keep the first MaxNamespaces in lexicographic order: deterministic, so

@@ -22,6 +22,7 @@ import (
 
 	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
+	"github.com/kernpilot/kubehz-agent/internal/machines"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
 
@@ -110,7 +111,10 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 	client := fake.NewClientset(testNode("cp-1"))
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{executor.MachineDeploymentGVR: "MachineDeploymentList"},
+		map[schema.GroupVersionResource]string{
+			executor.MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:           "MachineList",
+		},
 		&unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "cluster.k8s.io/v1alpha1",
 			"kind":       "MachineDeployment",

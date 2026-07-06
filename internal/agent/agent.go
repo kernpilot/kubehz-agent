@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -33,6 +34,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/desired"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
+	"github.com/kernpilot/kubehz-agent/internal/machineissues"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
@@ -150,12 +152,27 @@ func (a *Agent) Run(ctx context.Context) error {
 	// server-gated), and the actions store threads outcomes into every beat.
 	// The store's notify rides the same change channel as the informers, so a
 	// done/failed action reaches the dashboard on the next debounced push.
-	actionStore := actions.New(func() {
+	notifyChange := func() {
 		select {
 		case changes <- struct{}{}:
 		default:
 		}
-	})
+	}
+	actionStore := actions.New(notifyChange)
+
+	// machineIssues collector: PURE OBSERVATION, deliberately ungated by the
+	// execution flags — it lists Machines/MachineDeployments and reads the
+	// Warning-event cache to surface machine-controller provisioning failures
+	// on every beat. Fail-soft: without the managed overlay's machines read
+	// RBAC (or without the CRD at all) it reports nothing and never blocks.
+	issueStore := machineissues.NewStore(notifyChange)
+	if a.dyn != nil {
+		issueCollector := machineissues.New(a.dyn, a.cfg.MDNamespace,
+			func() ([]*corev1.Event, error) { return eventInf.Lister().List(labels.Everything()) },
+			issueStore, a.cfg.FullInterval, a.log)
+		go issueCollector.Run(ctx)
+	}
+
 	if a.dyn != nil {
 		exec := executor.New(a.dyn, a.cfg.MDNamespace, a.cfg.MaxReplicas, actionStore, a.getVersion, a.log)
 		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
@@ -184,10 +201,12 @@ func (a *Agent) Run(ctx context.Context) error {
 			AgentVersion:     buildinfo.Version,
 			ReportNamespaces: a.cfg.ReportNamespaces,
 		})
-		// Thread the CURRENT desired-state action reports into every beat:
-		// the server persists them latest-wins and treats an absent actions[]
-		// as "clear", so the snapshot must ride along while it is non-empty.
+		// Thread the CURRENT desired-state action reports and machine issues
+		// into every beat: the server persists both latest-wins and treats an
+		// absent key as "clear", so the snapshots must ride along while they
+		// are non-empty.
 		payload.Actions = actionStore.Snapshot()
+		payload.MachineIssues = issueStore.Snapshot()
 		state.ApplyCaps(payload)
 		sender.Enqueue(payload)
 		a.log.Debug("queued live-view push",
@@ -196,6 +215,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			"pods", payload.Workloads.Pods.Total,
 			"warnings", len(payload.Events),
 			"actions", len(payload.Actions),
+			"machineIssues", len(payload.MachineIssues),
 		)
 	})
 	return ctx.Err()
