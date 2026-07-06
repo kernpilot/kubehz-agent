@@ -14,6 +14,11 @@
 # on nodes/pods/events, plus a get on ITS OWN token Secret (scoped by name). No
 # writes anywhere; no logs/exec/secret-reads beyond the one agent Secret — those
 # are deliberately absent so the pod cannot read workload contents or credentials.
+#
+# THIS FILE STAYS READ-ONLY. The managed-tier ACTING permission (patch on
+# machinedeployments.cluster.k8s.io, for P3 worker scaling) is deliberately NOT
+# here — it lives in the opt-in overlay deploy/managed/rbac-managed.yaml so a
+# registered-tier apply never grants an unused write.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

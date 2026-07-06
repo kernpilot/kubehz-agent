@@ -1,0 +1,46 @@
+# MANAGED-TIER ACTING RBAC — OPT-IN OVERLAY. Do NOT apply this on a
+# registered-tier (report-only) cluster: it is the permission that lets the
+# agent EDIT MachineDeployment replica counts (worker scaling, P3). Without
+# it the agent still runs fine — the desired-state loop stays report-only and
+# any server-authorized scale attempt fails closed with a Forbidden that is
+# reported (never retried into existence).
+#
+# Scope, deliberately minimal:
+#   - a NAMESPACED Role in kube-system (KubeOne's machine-controller serves
+#     MachineDeployments only there — spec §3's RBAC delta), NOT a
+#     ClusterRole: if you move the pools (KUBEHZ_MD_NAMESPACE), move this
+#     Role's namespace with them;
+#   - ONE resource (machinedeployments.cluster.k8s.io — the legacy
+#     machine-api group KubeOne uses, NOT cluster.x-k8s.io), read verbs +
+#     patch. No update (patch is what the executor sends), no create, no
+#     delete, no machines/machinesets — replica edits are the entire P3
+#     blast radius.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubehz-live-agent-machinedeployments
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  - apiGroups: [cluster.k8s.io]
+    resources: [machinedeployments]
+    verbs: [get, list, watch, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehz-live-agent-machinedeployments
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubehz-live-agent-machinedeployments
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-live-agent
+    namespace: kubehz-system

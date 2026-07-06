@@ -21,3 +21,15 @@ data:
   # Privacy: keep per-namespace pod counts and event namespaces/messages OUT of
   # the payload by default (spec §1.2.5). Set to "true" to opt in.
   KUBEHZ_REPORT_NAMESPACES: "false"
+  # ── P3 desired-state loop (worker scaling) ─────────────────────────────────
+  # NOTE: none of these ENABLE acting. Execution is authorized exclusively by
+  # the server's /desired execution{} flags (tier × access × kill switch) plus
+  # the opt-in RBAC overlay (deploy/managed) — these are only guard-rails.
+  # Pull cadence in whole seconds (integer; + up to 10% jitter).
+  KUBEHZ_DESIRED_POLL_SECONDS: "60"
+  # Where machine-controller serves MachineDeployments (KubeOne default). If
+  # you change it, move deploy/managed/rbac-managed.yaml's Role accordingly.
+  KUBEHZ_MD_NAMESPACE: "kube-system"
+  # Per-pool replica CEILING: a desiredReplicas outside 0..this is REFUSED and
+  # reported failed — never rewritten to the bound and applied.
+  KUBEHZ_MAX_REPLICAS: "50"

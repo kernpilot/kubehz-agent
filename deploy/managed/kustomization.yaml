@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# MANAGED-TIER overlay = the read-only base PLUS the acting RBAC (worker
+# scaling, P3). The split is deliberate:
+#
+#   kubectl apply -k deploy/          # registered tier: observe + report ONLY
+#   kubectl apply -k deploy/managed/  # managed tier: + MachineDeployment
+#                                     #   replica patch (kube-system Role)
+#
+# Registered-tier users should apply the BASE, not this overlay — the extra
+# permission buys them nothing (acting is server-gated off for their tier)
+# and least privilege says an unused write permission should not exist.
+resources:
+  - ../base
+  - rbac-managed.yaml

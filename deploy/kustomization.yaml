@@ -1,26 +1,17 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Managed-tier live-view agent (P2). All resources are named kubehz-live-agent*
-# so this stack COEXISTS with the registered-tier bash heartbeat CronJob, which
-# owns the kubehz-agent* SA/RBAC/ConfigMap names (different rules — reusing its
-# names would clobber them). See deploy/README.md.
-#
-# Shared, NOT owned here:
-#   - Namespace kubehz-system (created if absent; no PSS enforce labels — the
-#     namespace is shared with the CronJob agent).
-#   - Secret kubehz-agent (ns kubehz-system, keys agent-token/claim-code),
-#     bootstrapped by the existing lok8s heartbeat plumbing (create-if-absent,
-#     never rotated). The Deployment only mounts it read-only.
+# REGISTERED-TIER entry point: observe + report ONLY (the read-only base,
+# nothing else). `kubectl apply -k deploy/` keeps working as before the
+# base/managed split. For a MANAGED cluster apply deploy/managed/ instead —
+# it is the same base plus the opt-in MachineDeployment-patch RBAC (worker
+# scaling, P3). See deploy/README.md for the split rationale.
 resources:
-  - namespace.yaml
-  - serviceaccount.yaml
-  - rbac.yaml
-  - configmap.yaml
-  - deployment.yaml
+  - base
 
 # To retarget/repin the image (e.g. the public GHCR ref once the package is
-# public, or a release digest), override here instead of editing deployment.yaml:
+# public, or a release digest), override here instead of editing
+# base/deployment.yaml (works the same in deploy/managed/kustomization.yaml):
 #
 # images:
 #   - name: docker.kubehz.in.net/kubehz-builds/kubehz-agent

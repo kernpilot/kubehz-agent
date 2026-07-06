@@ -1,8 +1,31 @@
-# Deploying kubehz-agent (live-view, managed tier)
+# Deploying kubehz-agent (live view + desired state)
 
 ```bash
+# Registered tier — observe + report ONLY (no write RBAC anywhere):
 kubectl apply -k deploy/
+
+# Managed tier — adds the acting permission for server-gated worker scaling:
+kubectl apply -k deploy/managed/
 ```
+
+## The base/managed RBAC split (P3)
+
+The base is strictly read-only. `deploy/managed/` is the base **plus**
+`rbac-managed.yaml`: a **namespaced Role in kube-system** granting
+`get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
+machine-controller API group — **not** `cluster.x-k8s.io`), bound to the
+`kubehz-live-agent` ServiceAccount. That patch permission is the entire P3
+acting blast radius: replica edits on worker MachineDeployments, executed
+only when the platform's `/desired` document authorizes scaling.
+
+**Registered-tier users should apply the base, not the overlay** — acting is
+server-gated off for their tier, so the extra permission buys nothing and
+least privilege says an unused write should not exist. Without the overlay a
+(mis)authorized scale attempt fails closed as a reported Forbidden action.
+
+If you relocate the pools (`KUBEHZ_MD_NAMESPACE`), move the Role's
+`namespace` in `rbac-managed.yaml` accordingly — it is deliberately a Role,
+not a ClusterRole.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)
 
