@@ -135,7 +135,11 @@ jobs:
         with:
           image: "ghcr.io/kernpilot/kubehz-agent@${{ steps.build.outputs.digest }}"
           format: spdx-json
+          # artifact-name only names the uploaded workflow artifact; output-file
+          # writes the SBOM to the workspace so `cosign attest --predicate` (next
+          # step) can actually read it.
           artifact-name: kubehz-agent.spdx.json
+          output-file: kubehz-agent.spdx.json
 
       - name: Attest the SBOM
         env:
