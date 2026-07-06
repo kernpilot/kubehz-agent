@@ -1,10 +1,14 @@
+# Named kubehz-live-agent-config (NOT kubehz-agent-config): the bash heartbeat
+# CronJob owns kubehz-agent-config, and applying this file over it would clobber
+# the substituted values feeding the live CronJob. Same placeholder tokens, so
+# the same lok8s substitution plumbing can feed both agents.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kubehz-agent-config
+  name: kubehz-live-agent-config
   namespace: kubehz-system
   labels:
-    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/name: kubehz-live-agent
     app.kubernetes.io/part-of: kubehz
 data:
   # Substituted at deploy time by lok8s (libs/kubehz/deploy) — same tokens the

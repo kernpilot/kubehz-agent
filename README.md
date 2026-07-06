@@ -69,7 +69,7 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/publisher` | `Publisher` (POST+Bearer), `Backoff`, `Coalescer` (debounce), `Sender` (retry) |
 | `internal/agent` | wiring: informers → coalescer → sender |
 | `internal/buildinfo` | build-stamped version |
-| `deploy/` | namespace, SA, RBAC, ConfigMap, Deployment, kustomization |
+| `deploy/` | namespace, SA, RBAC, ConfigMap, Deployment, kustomization — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
 
 The debounce policy is a **pure function** (`publisher.decide`) — no timers in the
 tested code path — so the whole cadence (debounce / min-gap / periodic) is
@@ -160,7 +160,9 @@ go vet ./... && gofmt -l .
 # container (pinned distroless/static, non-root, read-only rootfs)
 docker build -t kubehz-agent:dev --build-arg VERSION=dev .
 
-# deploy (after the kubehz-agent Secret is bootstrapped by the lok8s plumbing)
+# deploy (after the kubehz-agent Secret is bootstrapped by the lok8s plumbing);
+# coexists with the bash CronJob agent — see deploy/README.md for the naming
+# contract and the image digest-pinning rules.
 kubectl apply -k deploy/
 ```
 
@@ -174,8 +176,9 @@ guessed (see `AGENTS.md`).
   `CGO_ENABLED=0` binary; runs non-root (65532), read-only rootfs, all caps
   dropped, seccomp `RuntimeDefault`.
 - **CI:** `gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`; multi-arch
-  build pushed to public **GHCR** (customer-pullable) + internal **Harbor** mirror,
-  **cosign**-signed (keyless OIDC) with an attested **SBOM** and SLSA provenance.
+  build pushed to **GHCR** (the canonical customer image — the package must be
+  set public for anonymous pulls) + internal **Harbor** mirror, **cosign**-signed
+  (keyless OIDC) with an attested **SBOM** and SLSA provenance.
 - **The token `A` is never logged or printed.** `Config.String()` redacts it; the
   claim-code `C` is never mounted or read by this agent.
 

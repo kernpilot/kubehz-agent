@@ -1,5 +1,14 @@
 # Managed-tier least-privilege RBAC for the live-view agent.
 #
+# NAMING — every object here is kubehz-live-agent*, NOT kubehz-agent*. The
+# registered-tier bash heartbeat CronJob (deployed by lok8s) owns the
+# kubehz-agent-named SA/ClusterRole/ClusterRoleBinding/Roles with DIFFERENT
+# rules (componentstatuses, namespaces, CSRs, /readyz, /version, kube-system pod
+# list, Secret create). Reusing those names would clobber its RBAC and break its
+# component-health heartbeat. The two agents coexist; the ONLY shared objects
+# are the kubehz-system Namespace and the kubehz-agent Secret (identity), which
+# this kustomization never writes. See deploy/README.md.
+#
 # The agent runs SharedInformers on nodes/pods/events, which require CLUSTER-WIDE
 # list/watch on those three resources. That is the entire blast radius: read-only
 # on nodes/pods/events, plus a get on ITS OWN token Secret (scoped by name). No
@@ -8,9 +17,9 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kubehz-agent
+  name: kubehz-live-agent
   labels:
-    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/name: kubehz-live-agent
     app.kubernetes.io/part-of: kubehz
 rules:
   # Live view: node inventory/roles/version/capacity, pod-phase summary, and
@@ -26,17 +35,17 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kubehz-agent
+  name: kubehz-live-agent
   labels:
-    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/name: kubehz-live-agent
     app.kubernetes.io/part-of: kubehz
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kubehz-agent
+  name: kubehz-live-agent
 subjects:
   - kind: ServiceAccount
-    name: kubehz-agent
+    name: kubehz-live-agent
     namespace: kubehz-system
 ---
 # Token Secret read — the FALLBACK path only. The Deployment mounts the Secret as
@@ -45,13 +54,15 @@ subjects:
 # the single kubehz-agent Secret by resourceNames and grants ONLY get — the agent
 # can never read any other Secret, and never create/update/delete this one (the
 # never-rotate invariant: the bash CronJob owns bootstrap; the Go agent consumes).
+# NOTE: resourceNames stays `kubehz-agent` — that is the SHARED identity Secret's
+# name, not this agent's resource prefix.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: kubehz-agent-secret
+  name: kubehz-live-agent-secret
   namespace: kubehz-system
   labels:
-    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/name: kubehz-live-agent
     app.kubernetes.io/part-of: kubehz
 rules:
   - apiGroups: [""]
@@ -62,16 +73,16 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: kubehz-agent-secret
+  name: kubehz-live-agent-secret
   namespace: kubehz-system
   labels:
-    app.kubernetes.io/name: kubehz-agent
+    app.kubernetes.io/name: kubehz-live-agent
     app.kubernetes.io/part-of: kubehz
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: kubehz-agent-secret
+  name: kubehz-live-agent-secret
 subjects:
   - kind: ServiceAccount
-    name: kubehz-agent
+    name: kubehz-live-agent
     namespace: kubehz-system

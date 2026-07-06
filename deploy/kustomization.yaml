@@ -1,13 +1,28 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Managed-tier live-view agent (P2). The Secret `kubehz-agent` (ns
-# kubehz-system, keys agent-token/claim-code) is bootstrapped by the existing
-# lok8s heartbeat plumbing (create-if-absent, never rotated) and is NOT owned by
-# this kustomization — the Deployment only mounts it read-only.
+# Managed-tier live-view agent (P2). All resources are named kubehz-live-agent*
+# so this stack COEXISTS with the registered-tier bash heartbeat CronJob, which
+# owns the kubehz-agent* SA/RBAC/ConfigMap names (different rules — reusing its
+# names would clobber them). See deploy/README.md.
+#
+# Shared, NOT owned here:
+#   - Namespace kubehz-system (created if absent; no PSS enforce labels — the
+#     namespace is shared with the CronJob agent).
+#   - Secret kubehz-agent (ns kubehz-system, keys agent-token/claim-code),
+#     bootstrapped by the existing lok8s heartbeat plumbing (create-if-absent,
+#     never rotated). The Deployment only mounts it read-only.
 resources:
   - namespace.yaml
   - serviceaccount.yaml
   - rbac.yaml
   - configmap.yaml
   - deployment.yaml
+
+# To retarget/repin the image (e.g. the public GHCR ref once the package is
+# public, or a release digest), override here instead of editing deployment.yaml:
+#
+# images:
+#   - name: docker.kubehz.in.net/kubehz-builds/kubehz-agent
+#     newName: ghcr.io/kernpilot/kubehz-agent
+#     digest: sha256:<release digest>

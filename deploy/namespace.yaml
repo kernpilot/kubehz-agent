@@ -1,11 +1,17 @@
+# kubehz-system is SHARED with the registered-tier bash heartbeat CronJob (the
+# lok8s-managed agent) and the kubehz-agent Secret. Only the part-of label is
+# set here so applying this manifest never fights over labels another
+# kustomization owns.
+#
+# Deliberately NO pod-security.kubernetes.io/enforce label: this namespace is
+# shared, and enforcing `restricted` here would block the coexisting CronJob's
+# pods (they predate the restricted profile's seccomp requirement). The live
+# agent's own pod spec is restricted-compliant regardless (non-root, no
+# privilege escalation, seccomp RuntimeDefault, all caps dropped) — see
+# deployment.yaml.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kubehz-system
   labels:
-    app.kubernetes.io/name: kubehz-agent
     app.kubernetes.io/part-of: kubehz
-    # Enforce the restricted Pod Security Standard on the agent's own namespace:
-    # the agent runs non-root, no privilege escalation, seccomp RuntimeDefault.
-    pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/enforce-version: latest
