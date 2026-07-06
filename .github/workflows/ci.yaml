@@ -2,7 +2,7 @@ name: CI
 
 # Verified action + tool versions (2026-07-05): actions/checkout v7,
 # actions/setup-go v6, golangci-lint-action v9, docker/* (buildx v4, qemu v4,
-# login v4, metadata v6, build-push v7), cosign-installer v4, sbom-action v0.24,
+# login v4, metadata v6, build-push v7), cosign-installer v4.1.2, sbom-action v0.24,
 # govulncheck v1.5.0. For production, pin each action by commit SHA.
 
 on:
@@ -119,7 +119,9 @@ jobs:
       #    also generated + attested. NOTE: these run against the PUBLIC GHCR
       #    image so downstream users can `cosign verify` what runs on their nodes.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4
+        # cosign-installer publishes no moving `v4` major alias (unlike docker/*);
+        # pin the exact latest v4 release (verified via GitHub API 2026-07-06).
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Sign the image (keyless)
         env:
