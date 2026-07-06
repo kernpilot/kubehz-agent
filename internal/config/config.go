@@ -40,6 +40,13 @@ const (
 	// (an integer, not a Go duration — the name says the unit). The effective
 	// wait adds up to 10% jitter to desynchronize a fleet.
 	EnvDesiredPollSeconds = "KUBEHZ_DESIRED_POLL_SECONDS"
+	// EnvMDNamespace is where the executor looks for MachineDeployments.
+	// KubeOne's machine-controller serves them in kube-system by default.
+	EnvMDNamespace = "KUBEHZ_MD_NAMESPACE"
+	// EnvMaxReplicas is the agent-side per-pool replica CEILING (a guard-rail,
+	// not an enable switch): a desiredReplicas outside 0..max is REFUSED and
+	// reported failed — never rewritten to the bound and applied.
+	EnvMaxReplicas = "KUBEHZ_MAX_REPLICAS"
 )
 
 // Defaults. The push cadence follows managed-platform-spec §2: a full snapshot
@@ -55,12 +62,27 @@ const (
 	// DefaultDesiredPoll: ~60s matches the server's ETag-cheap 304 path; the
 	// desired-state loop needs no sub-minute latency (spec §3).
 	DefaultDesiredPoll = 60 * time.Second
+	// DefaultMDNamespace is KubeOne's machine-controller home for
+	// MachineDeployments.
+	DefaultMDNamespace = "kube-system"
+	// DefaultMaxReplicas is the agent-side scaling ceiling. Deliberately BELOW
+	// the API's own per-pool bound (kubehz-api allows 0..100): the agent's
+	// guard-rail is the tighter fence, and an operator running larger pools
+	// raises it consciously.
+	DefaultMaxReplicas = 50
+	// MaxMaxReplicas bounds the override itself — a ceiling of a million
+	// nodes is a typo, not a fleet.
+	MaxMaxReplicas = 10_000
 )
 
 // agentTokenRE is the format of secret A (§1.7.1): khz_agt_<hex(32B)> — 64 hex
 // chars. Validating the shape here fails fast on a misconfigured mount rather
 // than shipping a guaranteed-401 bearer.
 var agentTokenRE = regexp.MustCompile(`^khz_agt_[0-9a-f]{64}$`)
+
+// namespaceRE is the DNS-1123 label shape a Kubernetes namespace must have.
+// KUBEHZ_MD_NAMESPACE feeds API request paths, so it is validated up front.
+var namespaceRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 // clusterIDRE constrains CLUSTER_ID to a DNS-name-like shape (the cluster
 // domain, e.g. "kubehz.in.net"). The value is embedded in the heartbeat URL
@@ -90,9 +112,16 @@ type Config struct {
 	// DesiredPoll is the desired-state pull cadence (P3). NOTE: there is
 	// deliberately NO config that can turn acting ON — execution is entirely
 	// server-gated (the /desired execution{} flags); the agent only exposes
-	// guard-rails (poll cadence here; namespace/replica bounds with the
-	// executor), never an enable override.
+	// guard-rails (poll cadence here; MDNamespace/MaxReplicas below), never
+	// an enable override.
 	DesiredPoll time.Duration
+
+	// MDNamespace is where the scaling executor looks for MachineDeployments
+	// (KubeOne default: kube-system).
+	MDNamespace string
+	// MaxReplicas is the agent-side per-pool ceiling: desiredReplicas outside
+	// 0..MaxReplicas is refused (reported failed), never clamped-and-applied.
+	MaxReplicas int
 
 	// ReportNamespaces gates the privacy-sensitive fields (per-namespace pod
 	// counts, event namespaces + messages). Default FALSE — spec §2's
@@ -111,9 +140,10 @@ func (c *Config) String() string {
 		tok = "khz_agt_***redacted***"
 	}
 	return fmt.Sprintf(
-		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s}",
+		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s mdNamespace=%q maxReplicas=%d}",
 		c.ClusterID, c.APIURL, tok, c.Namespace, c.SecretName,
-		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces, c.DesiredPoll,
+		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces,
+		c.DesiredPoll, c.MDNamespace, c.MaxReplicas,
 	)
 }
 
@@ -128,7 +158,12 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		Debounce:         DefaultDebounce,
 		MinGap:           DefaultMinGap,
 		DesiredPoll:      DefaultDesiredPoll,
+		MDNamespace:      lookupDefault(getenv, EnvMDNamespace, DefaultMDNamespace),
+		MaxReplicas:      DefaultMaxReplicas,
 		ReportNamespaces: false,
+	}
+	if !namespaceRE.MatchString(c.MDNamespace) {
+		return nil, fmt.Errorf("%s must be a DNS-1123 label (got %q)", EnvMDNamespace, c.MDNamespace)
 	}
 
 	c.ClusterID = strings.TrimSpace(lookupDefault(getenv, EnvClusterID, ""))
@@ -172,6 +207,15 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		return nil, err
 	} else if ok {
 		c.DesiredPoll = time.Duration(secs) * time.Second
+	}
+
+	if maxR, ok, err := lookupPositiveInt(getenv, EnvMaxReplicas); err != nil {
+		return nil, err
+	} else if ok {
+		if maxR > MaxMaxReplicas {
+			return nil, fmt.Errorf("%s must be at most %d (got %d)", EnvMaxReplicas, MaxMaxReplicas, maxR)
+		}
+		c.MaxReplicas = maxR
 	}
 
 	return c, nil

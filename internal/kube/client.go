@@ -1,8 +1,10 @@
-// Package kube wires the in-cluster Kubernetes client. It is deliberately thin:
-// the agent needs only a typed clientset (for informers + discovery) and a
-// one-shot Secret read as the token fallback. No controller-runtime, no dynamic
-// client — the smaller the dependency surface that runs on a customer's nodes,
-// the smaller the audit + CVE surface.
+// Package kube wires the in-cluster Kubernetes clients. It is deliberately
+// thin: the agent needs a typed clientset (for informers + discovery), a
+// one-shot Secret read as the token fallback, and — since P3 — a dynamic
+// client for EXACTLY ONE custom GVR (machinedeployments.cluster.k8s.io, the
+// scaling executor's target; see internal/executor). No controller-runtime,
+// no generated CRD clients — the smaller the dependency surface that runs on
+// a customer's nodes, the smaller the audit + CVE surface.
 package kube
 
 import (
@@ -11,13 +13,14 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
-// NewInClusterClientset builds a typed clientset from the pod's mounted
+// inClusterConfig builds the shared rest.Config from the pod's mounted
 // ServiceAccount. userAgent identifies the agent in the apiserver audit log.
-func NewInClusterClientset(userAgent string) (kubernetes.Interface, error) {
+func inClusterConfig(userAgent string) (*rest.Config, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("in-cluster config: %w", err)
@@ -29,11 +32,36 @@ func NewInClusterClientset(userAgent string) (kubernetes.Interface, error) {
 		cfg.QPS = 20
 		cfg.Burst = 30
 	}
+	return cfg, nil
+}
+
+// NewInClusterClientset builds the typed clientset (informers + discovery).
+func NewInClusterClientset(userAgent string) (kubernetes.Interface, error) {
+	cfg, err := inClusterConfig(userAgent)
+	if err != nil {
+		return nil, err
+	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build clientset: %w", err)
 	}
 	return cs, nil
+}
+
+// NewInClusterDynamicClient builds the dynamic client the scaling executor
+// uses for machinedeployments.cluster.k8s.io. Whether any of its calls are
+// PERMITTED is governed by RBAC: the base deploy grants nothing on that
+// group — only the opt-in managed overlay (deploy/managed) does.
+func NewInClusterDynamicClient(userAgent string) (dynamic.Interface, error) {
+	cfg, err := inClusterConfig(userAgent)
+	if err != nil {
+		return nil, err
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("build dynamic client: %w", err)
+	}
+	return dyn, nil
 }
 
 // ServerVersion returns the cluster's server gitVersion (e.g. "v1.35.5") from

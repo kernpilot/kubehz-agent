@@ -204,6 +204,49 @@ func TestLoad_DesiredPollSeconds(t *testing.T) {
 	}
 }
 
+// The executor guard-rails: MD namespace (DNS label) and the replica ceiling
+// (positive, bounded). There is deliberately NO env that enables execution.
+func TestLoad_ExecutorGuardRails(t *testing.T) {
+	c, err := Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MDNamespace != DefaultMDNamespace {
+		t.Errorf("MDNamespace default = %q, want %q", c.MDNamespace, DefaultMDNamespace)
+	}
+	if c.MaxReplicas != DefaultMaxReplicas {
+		t.Errorf("MaxReplicas default = %d, want %d", c.MaxReplicas, DefaultMaxReplicas)
+	}
+
+	c, err = Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x",
+		EnvMDNamespace: "machines", EnvMaxReplicas: "100",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MDNamespace != "machines" || c.MaxReplicas != 100 {
+		t.Errorf("overrides not applied: %s", c)
+	}
+
+	for _, bad := range []string{"Kube-System", "kube_system", "-x", "a/b"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: "d", EnvAPIURL: "https://x", EnvMDNamespace: bad,
+		}), noFile); err == nil {
+			t.Errorf("expected rejection for %s=%q", EnvMDNamespace, bad)
+		}
+	}
+	for _, bad := range []string{"0", "-1", "abc", "1000000"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: "d", EnvAPIURL: "https://x", EnvMaxReplicas: bad,
+		}), noFile); err == nil {
+			t.Errorf("expected rejection for %s=%q", EnvMaxReplicas, bad)
+		}
+	}
+}
+
 func TestLoad_RejectsNonPositiveDuration(t *testing.T) {
 	_, err := Load(fakeEnv(map[string]string{
 		EnvClusterID: "d", EnvAPIURL: "https://x", EnvMinGap: "0s",
