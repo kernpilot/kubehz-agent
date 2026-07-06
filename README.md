@@ -10,7 +10,9 @@ scaling locally** — all **outbound only**, authenticated with the same
 in-cluster agent-token the bash heartbeat uses.
 
 > Status: **P2 live view + P3 worker scaling + P5 self-healing + P6 worker
-> upgrades**, plus `machineIssues[]` failure surfacing. Every acting
+> upgrades**, plus `machineIssues[]` failure surfacing and the lok8s
+> `ClusterInventory` loop (inventory on the beat, addon `availableUpdates`
+> written back to the CR status — visible via plain kubectl). Every acting
 > capability is **server-gated** (the `/desired` `execution{}` flags computed
 > from tier × access × platform kill switch) with hard, unit-tested
 > guardrails; anything authorized-but-unbuilt is reported as an unsupported
@@ -38,12 +40,16 @@ recur — and the mapping is unit-tested as a regression guard.
   (`khz_agt_<hex64>`) from the in-cluster Secret `kubehz-agent` and sends
   `Authorization: Bearer A` to the existing heartbeat endpoint — the server's
   authenticated-heartbeat ratchet applies unchanged. (§1.7)
-- **Least privilege.** Read-only on nodes/pods/events; a single name-scoped `get`
-  on its own token Secret. No logs/exec, no other secret reads. Every write —
+- **Least privilege.** Read-only on nodes/pods/events and the lok8s
+  `ClusterInventory`; a single name-scoped `get` on its own token Secret. No
+  logs/exec, no other secret reads. Every **acting** write —
   MachineDeployment patch (replicas / kubelet version) and Machine **delete**
   (self-healing, the sharpest permission the agent holds — loudly documented
   in `deploy/managed/rbac-managed.yaml`, removable independently) — is an
   opt-in RBAC overlay (`deploy/managed/`), absent from the base entirely.
+  The base's one write, `patch` on `clusterinventories/status`, is a
+  visibility mirror on the cluster's own reporting object (see the inventory
+  section), not an acting permission.
 - **Fail toward report-only.** A partial read degrades that section to empty
   rather than aborting; a rejected push is retried with backoff; acting is
   server-gated and every guard refuses rather than improvises; the agent never
@@ -85,8 +91,9 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/config` | env + mounted-token loading, https/format validation, redaction |
 | `internal/kube` | in-cluster clientset + dynamic client (one GVR), discovery server-version, Secret-read fallback |
 | `internal/collector` | **typed** node/pod/event → payload mapping (the correctness core) |
-| `internal/state` | schema-2 payload types incl. `actions[]`/`machineIssues[]` + `ApplyCaps` (server-bound enforcement) |
-| `internal/publisher` | `Publisher` (POST+Bearer), `Backoff`, `Coalescer` (debounce), `Sender` (retry) |
+| `internal/state` | schema-2 payload types incl. `actions[]`/`machineIssues[]`/`inventory` + `ApplyCaps` (server-bound enforcement) |
+| `internal/publisher` | `Publisher` (POST+Bearer, response `availableUpdates` parse), `Backoff`, `Coalescer` (debounce), `Sender` (retry) |
+| `internal/inventory` | ClusterInventory (lok8s.dev) manager: periodic spec read → `inventory` block; idempotent `availableUpdates` status write-back |
 | `internal/desired` | the pull loop: contract types (incl. the P5 `healing` policy), ETag-aware client, Poller |
 | `internal/machines` | grounded machine-controller API surface: GVRs, exact field paths, Machine→pool resolution |
 | `internal/machineissues` | ungated, fail-soft `machineIssues[]` collector (terminal errors, retry-loop events, join timeouts) |
@@ -147,7 +154,17 @@ extended.
       "reason": "ReconcilingError",
       "message": "failed to create server: unsupported location for server type",
       "since": "2026-07-06T11:48:00Z" }
-  ]
+  ],
+  "inventory": {                                     // ClusterInventory.spec, verbatim
+    "lok8sVersion": "1.4.2", "kind": "kubeone", "provider": "hetzner",
+    "kubernetesVersion": "v1.35.5",
+    "specHash": "sha256-hex of cluster.lok8s.yaml",
+    "renderedAt": "2026-07-06T10:00:00Z",
+    "addons": [
+      { "name": "cilium", "chartVersion": "1.16.1", "appVersion": "1.16.1",
+        "category": "networking", "source": "addon" }
+    ]
+  }
   // forward-compat, populated in later phases: "pools":[…], "desired":{…}
 }
 ```
@@ -171,6 +188,38 @@ field), and an agent-synthesized `NodeJoinTimeout` for machines with no node
 read RBAC (or without the CRD) the block is simply absent. `since` is the
 agent-observed first-seen time, stable across passes.
 
+**`inventory`** mirrors the **spec** of the lok8s `ClusterInventory` CR
+(`clusterinventories.lok8s.dev/v1alpha1`, the cluster-scoped singleton named
+`cluster` that the user's own `lo` CLI server-side-applies at the end of
+`provision`/bootstrap), field names verbatim. The agent GETs it periodically
+at the full-beat cadence (it only changes on lo deploys — an informer on a
+possibly-absent CRD would error-loop on every never-lok8s-deployed cluster)
+and fails soft: no CRD/CR/RBAC → no `inventory` key at all, zero noise.
+**Data inventory / privacy class:** the block is metadata the *user's own
+tooling already wrote into their own cluster* — lok8s/driver/k8s versions, a
+spec hash, and addon names + pinned chart versions/categories. The CRD schema
+itself prunes anything beyond those fields (no chart values, env overrides,
+credentials, or rendered manifests can exist in the CR), so it is the same
+privacy class as the version fields and is **not** gated by
+`KUBEHZ_REPORT_NAMESPACES`.
+
+**The write-back — addon updates via plain kubectl.** The heartbeat
+*response* carries `availableUpdates: [{name, current, latest}]`, computed by
+the platform from the reported inventory. When non-empty and the CR exists,
+the agent writes it — plus `lastReported` (RFC3339) — to the CR via the
+**status subresource** (JSON merge patch, field manager `kubehz-agent`), so:
+
+```bash
+kubectl get clusterinventory cluster -o yaml   # status.availableUpdates — no dashboard needed
+```
+
+Boundaries: the spec is never written (lo-owned); the sibling
+`status.observedAddons` is never touched (merge semantics); the write is
+idempotent (compared against the CR's current status — refreshed every poll
+and after every write, so restarts and repeat responses cost zero patches);
+an RBAC-denied patch warns **once** and beating continues; server input is
+clamped to the CRD's own status bounds before patching.
+
 The server persists `actions` **latest-wins** and treats an absent `actions`
 key as *clear* — so the agent keeps reporting the current revision's actions
 on every beat while they are relevant, and stops (clearing them) when acting
@@ -184,13 +233,21 @@ included **only** when `KUBEHZ_REPORT_NAMESPACES=true`. The default is phase-onl
 counts and reason/kind-only events — workload *visibility* without workload
 *contents* (§1.2.5, §2).
 
-The kubehz-api side of this contract is **shipped**: schema-2 ingestion
-(nodes/workloads/events/observed version, `connected` tightening from
-`agent.mode`), the `actions[]`/`machineIssues[]` persistence, and
-`GET /clusters/{id}/desired` incl. the P5 `healing` block + `heal` action
-enum (kubehz-api d57c206). The `pools[]`/`desired{}` blocks remain
-accepted-but-stripped; the agent leaves them empty until the API ingests
-them.
+The kubehz-api side of this contract is **shipped** for everything except
+the inventory loop: schema-2 ingestion (nodes/workloads/events/observed
+version, `connected` tightening from `agent.mode`), the
+`actions[]`/`machineIssues[]` persistence, and `GET /clusters/{id}/desired`
+incl. the P5 `healing` block + `heal` action enum (kubehz-api d57c206). The
+`pools[]`/`desired{}` blocks remain accepted-but-stripped; the agent leaves
+them empty until the API ingests them. The **inventory** half — request
+`inventory` ingestion + the `availableUpdates` response — is being built **in
+parallel** to this exact contract (block = the ClusterInventory CR spec,
+response = `availableUpdates: [{name, current, latest}]`, both grounded on
+lok8s `operator/crds/clusterinventory.yaml`); until it lands, the non-strict
+`HeartbeatSchema` accepts-and-strips the block and returns no updates, and
+the agent simply never patches the CR status. Should the API land a
+different response shape, `internal/publisher`'s `heartbeatResponse` is the
+single place to adjust.
 
 ## Desired state & acting — the honest model
 
