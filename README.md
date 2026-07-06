@@ -9,11 +9,12 @@ the platform's desired-state document to execute **server-authorized worker
 scaling locally** — all **outbound only**, authenticated with the same
 in-cluster agent-token the bash heartbeat uses.
 
-> Status: **P2 live view + P3 worker scaling**. The live view is wired
-> end-to-end (informers → debounce → authenticated POST); the desired-state
-> loop executes **replica scaling only** (server-gated). Upgrades and
-> self-heal are later phases — an authorized-but-unbuilt upgrade is reported
-> as an unsupported action, never improvised.
+> Status: **P2 live view + P3 worker scaling + P5 self-healing + P6 worker
+> upgrades**, plus `machineIssues[]` failure surfacing. Every acting
+> capability is **server-gated** (the `/desired` `execution{}` flags computed
+> from tier × access × platform kill switch) with hard, unit-tested
+> guardrails; anything authorized-but-unbuilt is reported as an unsupported
+> action, never improvised. Control-plane upgrades stay user-driven.
 
 It complements, and does not replace, the lightweight bash **heartbeat CronJob**
 (registered tier). The Go rewrite exists because node facts must be **correct**:
@@ -38,9 +39,11 @@ recur — and the mapping is unit-tested as a regression guard.
   `Authorization: Bearer A` to the existing heartbeat endpoint — the server's
   authenticated-heartbeat ratchet applies unchanged. (§1.7)
 - **Least privilege.** Read-only on nodes/pods/events; a single name-scoped `get`
-  on its own token Secret. No logs/exec, no other secret reads. The ONE write —
-  MachineDeployment replica patch — is an opt-in RBAC overlay
-  (`deploy/managed/`), absent from the base entirely.
+  on its own token Secret. No logs/exec, no other secret reads. Every write —
+  MachineDeployment patch (replicas / kubelet version) and Machine **delete**
+  (self-healing, the sharpest permission the agent holds — loudly documented
+  in `deploy/managed/rbac-managed.yaml`, removable independently) — is an
+  opt-in RBAC overlay (`deploy/managed/`), absent from the base entirely.
 - **Fail toward report-only.** A partial read degrades that section to empty
   rather than aborting; a rejected push is retried with backoff; acting is
   server-gated and every guard refuses rather than improvises; the agent never
@@ -82,11 +85,13 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/config` | env + mounted-token loading, https/format validation, redaction |
 | `internal/kube` | in-cluster clientset + dynamic client (one GVR), discovery server-version, Secret-read fallback |
 | `internal/collector` | **typed** node/pod/event → payload mapping (the correctness core) |
-| `internal/state` | schema-2 payload types incl. `actions[]` + `ApplyCaps` (server-bound enforcement) |
+| `internal/state` | schema-2 payload types incl. `actions[]`/`machineIssues[]` + `ApplyCaps` (server-bound enforcement) |
 | `internal/publisher` | `Publisher` (POST+Bearer), `Backoff`, `Coalescer` (debounce), `Sender` (retry) |
-| `internal/desired` | the P3 pull loop: contract types, ETag-aware client, Poller |
-| `internal/executor` | the P3 acting side: MachineDeployment replica patches + every safety rail |
-| `internal/actions` | in-memory action-report store (latest-revision-wins, diff-aware notify) |
+| `internal/desired` | the pull loop: contract types (incl. the P5 `healing` policy), ETag-aware client, Poller |
+| `internal/machines` | grounded machine-controller API surface: GVRs, exact field paths, Machine→pool resolution |
+| `internal/machineissues` | ungated, fail-soft `machineIssues[]` collector (terminal errors, retry-loop events, join timeouts) |
+| `internal/executor` | the acting side: P3 replica patches, P5 heal deletes, P6 kubelet rolls + every safety rail |
+| `internal/actions` | in-memory action-report store (latest-revision-wins, diff-aware notify, stale-heal prune) |
 | `internal/agent` | wiring: informers → coalescer → sender; poller → executor → actions → beats |
 | `internal/buildinfo` | build-stamped version |
 | `deploy/` | base (read-only) + `managed/` overlay (acting RBAC) — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
@@ -127,14 +132,44 @@ extended.
   "events": [                                        // recent Warnings (capped 20)
     { "reason": "BackOff", "kind": "Pod", "count": 3, "lastSeen": "…" }
   ],
-  "actions": [                                       // P3 desired-state progress (capped 20)
+  "actions": [                                       // desired-state progress (capped 20)
     { "type": "scale", "target": "pool-a", "status": "done",
       "detail": "replicas 2 to 3; machine-controller reconciles the machines with the cluster's own credentials",
-      "revision": 7 }
+      "revision": 7 },
+    { "type": "upgrade", "target": "pool-a", "status": "in-progress",
+      "detail": "v1.34.9 → v1.35.6 (1/3)", "revision": 7 },     // P6: target = POOL name
+    { "type": "heal", "target": "pool-a-5b6c7-xk2lp", "status": "done",
+      "detail": "deleted Machine (node w-3 NotReady for 6m0s (unhealthyAfter 5m0s)); machine-controller/MachineSet recreates it with the cluster's own credentials",
+      "revision": 7 }                                            // P5: target = MACHINE name
+  ],
+  "machineIssues": [                                 // machine-controller failures (capped 20)
+    { "pool": "pool-b", "machine": "pool-b-abc12-x9k2p",
+      "reason": "ReconcilingError",
+      "message": "failed to create server: unsupported location for server type",
+      "since": "2026-07-06T11:48:00Z" }
   ]
   // forward-compat, populated in later phases: "pools":[…], "desired":{…}
 }
 ```
+
+**Action targets are opaque identifiers.** For `heal` the target is the
+**Machine** name (stable pre-join — a machine whose node never appeared has
+no node name at all); the node name, when known, rides in `detail`. For
+per-pool `upgrade` progress the target is the **pool** name. Dashboards
+should render targets verbatim, never parse them.
+
+**`machineIssues[]`** is pure observation, deliberately **ungated** by the
+execution flags: a pool that never converges is otherwise invisible (its
+machines never become nodes). Three grounded sources, read off the Machine
+objects machine-controller maintains: **terminal** `status.errorReason`/
+`errorMessage` ("manual intervention required": InvalidConfiguration,
+CreateError, …), **retry-loop** Warning events on Machines (reason
+`ReconcilingError` — where "webhook accepted it, hcloud rejects every
+create: *unsupported location for server type*" lives; it is never a status
+field), and an agent-synthesized `NodeJoinTimeout` for machines with no node
+10 minutes after creation. Fail-soft: without the managed overlay's machines
+read RBAC (or without the CRD) the block is simply absent. `since` is the
+agent-observed first-seen time, stable across passes.
 
 The server persists `actions` **latest-wins** and treats an absent `actions`
 key as *clear* — so the agent keeps reporting the current revision's actions
@@ -151,59 +186,85 @@ counts and reason/kind-only events — workload *visibility* without workload
 
 The kubehz-api side of this contract is **shipped**: schema-2 ingestion
 (nodes/workloads/events/observed version, `connected` tightening from
-`agent.mode`) and the `actions[]` persistence + `GET /clusters/{id}/desired`
-landed with the P3 desired-state foundation. The `pools[]`/`desired{}` blocks
-remain accepted-but-stripped; the agent leaves them empty until the API
-ingests them.
+`agent.mode`), the `actions[]`/`machineIssues[]` persistence, and
+`GET /clusters/{id}/desired` incl. the P5 `healing` block + `heal` action
+enum (kubehz-api d57c206). The `pools[]`/`desired{}` blocks remain
+accepted-but-stripped; the agent leaves them empty until the API ingests
+them.
 
-## Desired state & acting (P3) — the honest model
+## Desired state & acting — the honest model
 
-The agent executes exactly one capability: **worker-pool replica scaling**.
-How it works, truthfully:
+The agent executes exactly three capabilities: **worker-pool replica scaling**
+(P3), **worker self-healing** (P5), and **worker kubelet upgrades** (P6).
+How they work, truthfully:
 
 1. **The platform never pushes.** The agent polls
-   `GET /api/clusters/{id}/desired` (bearer `A`, strong ETag
-   `"<revision>-<flags>"`, `If-None-Match` → cheap `304`) every
-   `KUBEHZ_DESIRED_POLL_SECONDS` (default 60, + up to 10% jitter). The
-   document carries `workerPools[{name, machineType, desiredReplicas}]` and a
-   **server-computed** `execution{scaling, upgrades}` block (tenant tier ×
-   cluster access × platform kill switch).
+   `GET /api/clusters/{id}/desired` (bearer `A`, strong ETag, `If-None-Match`
+   → cheap `304`) every `KUBEHZ_DESIRED_POLL_SECONDS` (default 60, + up to
+   10% jitter). The document carries
+   `workerPools[{name, machineType, desiredReplicas}]`, a **server-computed**
+   `execution{scaling, upgrades, healing}` block (tenant tier × cluster
+   access × platform kill switch), and the **server-owned**
+   `healing{enabled, maxUnhealthy, nodeStartupTimeoutSeconds,
+   unhealthyAfterSeconds, cooldownSeconds}` policy. The ETag is treated as an
+   **opaque token** (cached, echoed verbatim, never parsed) — a server-side
+   format change costs one extra `200`, nothing else.
 2. **Acting is server-gated with no local enable.** There is *no* agent-side
-   configuration that can turn execution on; when the server says
-   `scaling: false` (or any 4xx), the agent acts on nothing and clears its
-   reports. A tier downgrade reaches the agent on its next poll (the flags
-   are part of the ETag). 401/403 honor the full retry backoff, exactly like
-   the heartbeat sender.
-3. **The executor edits one field of one resource.** For each desired pool it
+   configuration that can turn any execution on; when the server says
+   `false` (or any 4xx), the agent acts on nothing and clears its reports. A
+   tier downgrade or kill-switch flip reaches the agent on its next poll
+   (the flags are part of the ETag). 401/403 honor the full retry backoff,
+   exactly like the heartbeat sender.
+3. **Scaling (P3): one field of one resource.** For each desired pool it
    merge-patches `spec.replicas` on the MachineDeployment **of the same
    name** in `KUBEHZ_MD_NAMESPACE` (default `kube-system`) — GVR
    `machinedeployments.cluster.k8s.io/v1alpha1`, KubeOne's machine-controller
    group (**not** `cluster.x-k8s.io`). The pool↔MD **name equality is the
-   mapping contract** (the lok8s/KubeOne provisioning path creates both from
-   the same spec); an unmatched pool is skipped and reported `failed`.
-4. **The cluster's own machinery does the provisioning.** The patch wakes the
-   in-cluster machine-controller, which creates/deletes Hetzner servers with
-   the credentials **it already holds**. The agent contains no hcloud token,
-   no SSH key, no provisioner — revoking the platform's access is
+   mapping contract**; an unmatched pool is skipped and reported `failed`.
+4. **Self-healing (P5): delete the Machine, let the cluster rebuild it.** A
+   worker node continuously NotReady/Unknown for `unhealthyAfterSeconds`, or
+   a machine whose node never appeared within `nodeStartupTimeoutSeconds`,
+   gets its backing **Machine deleted** — machine-controller/MachineSet
+   recreates it. Guardrails (hard, refusal-biased, all unit-tested):
+   **never control-plane** (node role labels, machine labels, and the same
+   CP-MD heuristic scaling uses); a **storm brake** — more unhealthy than
+   `maxUnhealthy` deletes *nothing* and reports every candidate `failed`
+   ("unhealthy count N exceeds maxUnhealthy M — refusing (possible outage)");
+   at most `maxUnhealthy` disruptions in flight (any already-deleting machine
+   counts); per-pool `cooldownSeconds` with the agent's start time as
+   baseline (**restart = fresh cooldown** — a crash-looping agent can never
+   become a machine-delete loop); autoscaler-owned pools and unowned machines
+   are refused. Healing re-evaluates every poll tick; detection windows are
+   floored at 60 s agent-side.
+5. **Upgrades (P6): roll workers toward the declared version.** When the
+   desired `kubernetesVersion` differs from a pool MD's declared kubelet, the
+   executor patches `spec.template.spec.versions.kubelet` (the exact
+   machine-controller field path) and machine-controller performs the rolling
+   machine replacement. **Pre-flight:** the *observed* control-plane version
+   must be at/above the target minor — else `failed` "control plane not yet
+   at target" (upgrade the CP first via `lo provision` / `kubeone apply`;
+   an unknown observed version refuses, never guesses). **One pool rolls at
+   a time**; progress reports per pool as `"vFROM → vTO (n/m)"` (n = machines
+   at target with a joined node); autoscaler pools report unsupported;
+   halt-on-failure. Workers only — the agent never upgrades a control plane.
+6. **The cluster's own machinery does the provisioning.** Every write wakes
+   the in-cluster machine-controller, which creates/deletes Hetzner servers
+   with the credentials **it already holds**. The agent contains no hcloud
+   token, no SSH key, no provisioner — revoking the platform's access is
    `kubectl delete ns kubehz-system` and nothing else changes.
-5. **Guard-rails refuse, never improvise** (all unit-tested):
-   `desiredReplicas` outside `0..KUBEHZ_MAX_REPLICAS` (default 50) is refused
-   — never clamped-and-applied; control-plane-looking MDs (node-role labels or
-   `control-plane`/`master`/segment-`cp` names) are refused;
-   cluster-autoscaler-owned MDs (node-group annotations, either API-group
-   spelling) are refused; pools execute sequentially with
-   halt-on-first-transient-failure; already-at-desired is a no-op `done`;
-   **no creates, no deletes, no machineType/version edits** — a pending
-   upgrade with `execution.upgrades: true` is reported as an unsupported
-   `failed` action.
-6. **Progress is reported, in memory only.** Every outcome
+7. **Progress is reported, in memory only.** Every outcome
    (`pending → in-progress → done/failed`, with the acted `revision`) rides
-   the heartbeat's `actions[]`. Restart = re-poll + reconverge; because the
-   executor is idempotent, that costs zero cluster writes.
+   the heartbeat's `actions[]`; stale heal reports for self-recovered nodes
+   are pruned. Restart = re-poll + reconverge; because the executors are
+   idempotent, that costs zero cluster writes.
 
-The acting RBAC (`patch` on machinedeployments, kube-system-scoped Role) is
-an **opt-in overlay** — `kubectl apply -k deploy/managed/` — absent from the
-registered-tier base. See [deploy/README.md](deploy/README.md).
+The acting RBAC — `patch` on machinedeployments (replicas + kubelet version)
+and read + **delete** on machines, kube-system-scoped Roles — is an **opt-in
+overlay**: `kubectl apply -k deploy/managed/`, absent from the
+registered-tier base. The machines **delete** verb exists solely for P5 and
+is loudly documented in `deploy/managed/rbac-managed.yaml`; drop that one
+verb and healing fails closed (reported `Forbidden`) while everything else
+keeps working. See [deploy/README.md](deploy/README.md).
 
 ## Configuration
 
@@ -244,7 +305,8 @@ docker build -t kubehz-agent:dev --build-arg VERSION=dev .
 # coexists with the bash CronJob agent — see deploy/README.md for the naming
 # contract and the image digest-pinning rules.
 kubectl apply -k deploy/          # registered tier: observe + report only
-kubectl apply -k deploy/managed/  # managed tier: + worker-scaling RBAC
+kubectl apply -k deploy/managed/  # managed tier: + acting RBAC (scale/upgrade
+                                  #   patch, machineIssues read, heal delete)
 ```
 
 Toolchain: **Go 1.26** · **client-go v0.35.6** (matches the pilot's Kubernetes
@@ -273,9 +335,6 @@ guessed (see `AGENTS.md`).
   replicas/ready per pool) once the API ingests it — closes the
   desired→observed convergence loop in the dashboard; apps deployments
   summary; CSR cert-expiry (spec §2).
-- **P6 upgrades / P5 self-heal:** worker-version rolls (`versions.kubelet`)
-  and machine remediation — each with its own executor guard-rails + RBAC
-  delta (spec §3–§4). Until then upgrades report as unsupported.
 - **Field-level deltas:** the current push is a change-triggered *full* snapshot
   (latest-wins, matching the server JSONB). Delta encoding is a future
   optimization if payload size ever matters.
