@@ -75,7 +75,7 @@ func (s *desiredServer) handler() http.HandlerFunc {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		fmt.Fprintf(w, `{"revision":%d,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],"execution":{"scaling":%t,"upgrades":false}}`, rev, scaling)
+		_, _ = fmt.Fprintf(w, `{"revision":%d,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],"execution":{"scaling":%t,"upgrades":false}}`, rev, scaling)
 	}
 }
 

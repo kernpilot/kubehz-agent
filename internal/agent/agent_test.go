@@ -141,7 +141,7 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		fmt.Fprint(w, `{"revision":7,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],"execution":{"scaling":true,"upgrades":false}}`)
+		_, _ = fmt.Fprint(w, `{"revision":7,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],"execution":{"scaling":true,"upgrades":false}}`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
