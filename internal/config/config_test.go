@@ -172,6 +172,38 @@ func TestLoad_CadenceOverrides(t *testing.T) {
 	}
 }
 
+// KUBEHZ_DESIRED_POLL_SECONDS is an INTEGER of seconds (the unit is in the
+// name), defaulting to 60s; zero/negative/non-numeric must fail fast.
+func TestLoad_DesiredPollSeconds(t *testing.T) {
+	c, err := Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DesiredPoll != DefaultDesiredPoll {
+		t.Errorf("DesiredPoll default = %s, want %s", c.DesiredPoll, DefaultDesiredPoll)
+	}
+
+	c, err = Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x", EnvDesiredPollSeconds: "90",
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DesiredPoll != 90*time.Second {
+		t.Errorf("DesiredPoll = %s, want 90s", c.DesiredPoll)
+	}
+
+	for _, bad := range []string{"0", "-5", "60s", "abc"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: "d", EnvAPIURL: "https://x", EnvDesiredPollSeconds: bad,
+		}), noFile); err == nil {
+			t.Errorf("expected rejection for %s=%q", EnvDesiredPollSeconds, bad)
+		}
+	}
+}
+
 func TestLoad_RejectsNonPositiveDuration(t *testing.T) {
 	_, err := Load(fakeEnv(map[string]string{
 		EnvClusterID: "d", EnvAPIURL: "https://x", EnvMinGap: "0s",

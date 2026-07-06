@@ -36,6 +36,10 @@ const (
 	EnvReportNamespaces = "KUBEHZ_REPORT_NAMESPACES"
 	EnvNamespace        = "KUBEHZ_NAMESPACE" // for the Secret API fallback
 	EnvSecretName       = "KUBEHZ_SECRET_NAME"
+	// EnvDesiredPollSeconds is the desired-state pull cadence in WHOLE SECONDS
+	// (an integer, not a Go duration — the name says the unit). The effective
+	// wait adds up to 10% jitter to desynchronize a fleet.
+	EnvDesiredPollSeconds = "KUBEHZ_DESIRED_POLL_SECONDS"
 )
 
 // Defaults. The push cadence follows managed-platform-spec §2: a full snapshot
@@ -48,6 +52,9 @@ const (
 	DefaultFullInterval = 60 * time.Second
 	DefaultDebounce     = 10 * time.Second
 	DefaultMinGap       = 15 * time.Second
+	// DefaultDesiredPoll: ~60s matches the server's ETag-cheap 304 path; the
+	// desired-state loop needs no sub-minute latency (spec §3).
+	DefaultDesiredPoll = 60 * time.Second
 )
 
 // agentTokenRE is the format of secret A (§1.7.1): khz_agt_<hex(32B)> — 64 hex
@@ -80,6 +87,13 @@ type Config struct {
 	Debounce     time.Duration
 	MinGap       time.Duration
 
+	// DesiredPoll is the desired-state pull cadence (P3). NOTE: there is
+	// deliberately NO config that can turn acting ON — execution is entirely
+	// server-gated (the /desired execution{} flags); the agent only exposes
+	// guard-rails (poll cadence here; namespace/replica bounds with the
+	// executor), never an enable override.
+	DesiredPoll time.Duration
+
 	// ReportNamespaces gates the privacy-sensitive fields (per-namespace pod
 	// counts, event namespaces + messages). Default FALSE — spec §2's
 	// "workload visibility without workload contents". A deployer opts in.
@@ -97,9 +111,9 @@ func (c *Config) String() string {
 		tok = "khz_agt_***redacted***"
 	}
 	return fmt.Sprintf(
-		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t}",
+		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s}",
 		c.ClusterID, c.APIURL, tok, c.Namespace, c.SecretName,
-		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces,
+		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces, c.DesiredPoll,
 	)
 }
 
@@ -113,6 +127,7 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		FullInterval:     DefaultFullInterval,
 		Debounce:         DefaultDebounce,
 		MinGap:           DefaultMinGap,
+		DesiredPoll:      DefaultDesiredPoll,
 		ReportNamespaces: false,
 	}
 
@@ -153,7 +168,32 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		c.ReportNamespaces = b
 	}
 
+	if secs, ok, err := lookupPositiveInt(getenv, EnvDesiredPollSeconds); err != nil {
+		return nil, err
+	} else if ok {
+		c.DesiredPoll = time.Duration(secs) * time.Second
+	}
+
 	return c, nil
+}
+
+// lookupPositiveInt parses an env var as a positive integer. Returns
+// (0, false, nil) when unset/blank. A zero, negative, or non-numeric value is
+// a hard error — a mistyped cadence must fail fast, not silently poll at a
+// surprising rate.
+func lookupPositiveInt(getenv func(string) (string, bool), key string) (int, bool, error) {
+	v, ok := getenv(key)
+	if !ok || strings.TrimSpace(v) == "" {
+		return 0, false, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, false, fmt.Errorf("%s is not a valid integer: %w", key, err)
+	}
+	if n <= 0 {
+		return 0, false, fmt.Errorf("%s must be positive (got %d)", key, n)
+	}
+	return n, true, nil
 }
 
 func resolveToken(getenv func(string) (string, bool), readFile func(string) ([]byte, error)) (string, error) {
