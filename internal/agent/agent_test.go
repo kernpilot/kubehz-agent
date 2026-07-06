@@ -260,9 +260,12 @@ func TestStripManagedFields(t *testing.T) {
 	}
 }
 
-// TestAgent_InventoryRidesTheBeat wires the full inventory read path: a
-// lok8s-written ClusterInventory CR exists in the (fake) cluster, and its
-// spec must appear verbatim as the heartbeat's `inventory` block.
+// TestAgent_InventoryRidesTheBeat wires the full inventory ROUND TRIP: a
+// lok8s-written ClusterInventory CR exists in the (fake) cluster, its spec
+// must appear verbatim as the heartbeat's `inventory` block, and the
+// availableUpdates the server returns in the heartbeat response must land on
+// the CR's status subresource (with lastReported) — kubectl-visible updates,
+// end to end.
 func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 	client := fake.NewClientset(testNode("cp-1"))
 
@@ -300,7 +303,10 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 		mu.Lock()
 		payloads = append(payloads, p)
 		mu.Unlock()
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		// The api computes availableUpdates from the reported inventory and
+		// returns them in the heartbeat response (parallel api change).
+		_, _ = fmt.Fprint(w, `{"status":"ok","availableUpdates":[{"name":"cilium","current":"1.16.1","latest":"1.17.4"}]}`)
 	})
 	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
@@ -332,6 +338,31 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 			len(inv.Addons) == 1 && inv.Addons[0].Name == "cilium" &&
 			inv.Addons[0].ChartVersion == "1.16.1" && inv.Addons[0].Source == "addon"
 	})
+
+	// The response's availableUpdates must land on the CR's status.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cr, err := dyn.Resource(inventory.GVR).Get(ctx, "cluster", metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get ClusterInventory: %v", err)
+		}
+		got, _, _ := unstructured.NestedSlice(cr.Object, "status", "availableUpdates")
+		lastReported, _, _ := unstructured.NestedString(cr.Object, "status", "lastReported")
+		if len(got) == 1 && lastReported != "" {
+			entry, _ := got[0].(map[string]any)
+			if entry["name"] != "cilium" || entry["current"] != "1.16.1" || entry["latest"] != "1.17.4" {
+				t.Errorf("status.availableUpdates mismapped: %v", entry)
+			}
+			if _, err := time.Parse(time.RFC3339, lastReported); err != nil {
+				t.Errorf("status.lastReported %q is not RFC3339: %v", lastReported, err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("availableUpdates never reached the CR status (got %v)", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	cancel()
 	select {

@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"reflect"
 	"sync"
@@ -9,14 +10,23 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
 
-// getTimeout bounds each apiserver GET so a wedged connection can never stall
-// the poll loop.
-const getTimeout = 15 * time.Second
+const (
+	// getTimeout bounds each apiserver GET so a wedged connection can never
+	// stall the poll loop; patchTimeout does the same for the status write
+	// (which runs on the Sender goroutine — it must never wedge the beat loop).
+	getTimeout   = 15 * time.Second
+	patchTimeout = 15 * time.Second
+	// fieldManager identifies this agent's status writes in managedFields —
+	// its own manager, distinct from `lo` (which owns spec and never writes
+	// status) and from any other in-cluster observer.
+	fieldManager = "kubehz-agent"
+)
 
 // Manager owns the agent's view of the ClusterInventory CR: a periodic GET
 // (full-beat cadence — the CR changes only on lo deploys) feeding Snapshot(),
@@ -38,6 +48,15 @@ type Manager struct {
 	inv     *state.Inventory // last read spec; nil = CR absent/unreadable
 	present bool             // the CR currently exists (gates status writes)
 	lastErr string           // last GET failure (log-throttling)
+
+	// statusUpdates is the CR's current status.availableUpdates — refreshed
+	// on every poll and after every successful write — the compare-before-
+	// patch baseline that makes HandleUpdates idempotent.
+	statusUpdates []state.AvailableUpdate
+	// warnedRBAC: a Forbidden status patch warns ONCE, then stays quiet —
+	// a base-RBAC-not-yet-upgraded cluster must not warn on every beat.
+	warnedRBAC   bool
+	lastPatchErr string // last non-RBAC patch failure (log-throttling)
 }
 
 // NewManager builds a Manager polling at interval (the full-beat cadence;
@@ -103,7 +122,7 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 		// even log-worthy beyond debug. Anything else (RBAC, timeout) logs
 		// once per distinct error.
 		if apierrors.IsNotFound(err) {
-			m.setInventory(nil, false)
+			m.setState(nil, nil, false)
 			return
 		}
 		if msg := err.Error(); msg != m.getLastErr() {
@@ -111,23 +130,148 @@ func (m *Manager) fetchOnce(ctx context.Context) {
 			m.log.Info("cluster inventory unavailable (fail-soft; needs the clusterinventories read RBAC)",
 				"error", msg)
 		}
-		m.setInventory(nil, false)
+		m.setState(nil, nil, false)
 		return
 	}
 	m.setLastErr("")
-	m.setInventory(specInventory(u), true)
+	m.setState(specInventory(u), statusAvailableUpdates(u), true)
 }
 
-// setInventory stores the latest view and signals the coalescer on change.
-func (m *Manager) setInventory(inv *state.Inventory, present bool) {
+// HandleUpdates consumes the availableUpdates the server computed from the
+// reported inventory (publisher.OnAvailableUpdates wires it) and writes them —
+// plus lastReported — to the CR via the STATUS subresource, so `kubectl get
+// clusterinventory cluster -o yaml` shows addon updates with no dashboard.
+//
+// A JSON merge patch touching ONLY status.availableUpdates+lastReported: the
+// agent never writes spec (lo-owned) and never touches status.observedAddons
+// (merge semantics leave sibling keys alone). Idempotent — the incoming list
+// is compared against the CR's current status first (refreshed on every poll
+// and every successful write), so a server repeating itself beat after beat
+// costs zero writes. RBAC-denied warns once and the agent keeps beating.
+func (m *Manager) HandleUpdates(ctx context.Context, updates []state.AvailableUpdate) {
+	updates = capUpdates(updates)
+	if len(updates) == 0 {
+		return // absent/empty response block → no status write, ever
+	}
+
+	m.mu.Lock()
+	if !m.present {
+		m.mu.Unlock()
+		m.log.Debug("server sent availableUpdates but no ClusterInventory CR exists; skipping status write")
+		return
+	}
+	if equalUpdates(m.statusUpdates, updates) {
+		m.mu.Unlock()
+		return // unchanged — skip the write (idempotence)
+	}
+	m.mu.Unlock()
+
+	patch, err := json.Marshal(map[string]any{
+		"status": map[string]any{
+			"availableUpdates": updates,
+			"lastReported":     m.now().UTC().Format(time.RFC3339),
+		},
+	})
+	if err != nil { // unreachable for these types; fail-soft regardless
+		return
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, patchTimeout)
+	_, err = m.dyn.Resource(GVR).Patch(pctx, CRName, types.MergePatchType, patch,
+		metav1.PatchOptions{FieldManager: fieldManager}, "status")
+	cancel()
+
+	if err != nil {
+		switch {
+		case apierrors.IsForbidden(err):
+			m.mu.Lock()
+			warned := m.warnedRBAC
+			m.warnedRBAC = true
+			m.mu.Unlock()
+			if !warned {
+				// Warn ONCE: updates stay visible on the dashboard; only the
+				// kubectl-visible mirror is missing. Beating continues.
+				m.log.Warn("cannot write ClusterInventory status (clusterinventories/status patch RBAC missing) — apply the current deploy/base RBAC for kubectl-visible addon updates",
+					"error", err.Error())
+			}
+		case apierrors.IsNotFound(err):
+			// CR deleted between poll and beat; the next poll re-syncs.
+			m.setState(nil, nil, false)
+		default:
+			if msg := err.Error(); msg != m.getLastPatchErr() {
+				m.setLastPatchErr(msg)
+				m.log.Warn("ClusterInventory status write failed; will retry on a later beat", "error", msg)
+			}
+		}
+		return
+	}
+
+	m.setLastPatchErr("")
+	m.mu.Lock()
+	m.statusUpdates = updates
+	m.mu.Unlock()
+	m.log.Info("wrote availableUpdates to ClusterInventory status", "updates", len(updates))
+}
+
+// setState stores the latest view and signals the coalescer when the SPEC
+// changed (status is not part of the payload, so it never triggers a beat).
+func (m *Manager) setState(inv *state.Inventory, updates []state.AvailableUpdate, present bool) {
 	m.mu.Lock()
 	changed := !reflect.DeepEqual(m.inv, inv)
 	m.inv = inv
+	m.statusUpdates = updates
 	m.present = present
 	m.mu.Unlock()
 	if changed && m.notify != nil {
 		m.notify()
 	}
+}
+
+// capUpdates clamps the server-supplied list to the ClusterInventory CRD's
+// status.availableUpdates bounds (maxItems 256; name<=253, versions<=64;
+// name required) so a buggy/hostile response can never produce a status
+// write the apiserver would reject — or bloat the user's CR.
+func capUpdates(updates []state.AvailableUpdate) []state.AvailableUpdate {
+	var kept []state.AvailableUpdate
+	for _, u := range updates {
+		if u.Name == "" {
+			continue
+		}
+		if len(kept) == state.MaxAvailableUpdates {
+			break
+		}
+		u.Name = clampString(u.Name, state.MaxNameLen)
+		u.Current = clampString(u.Current, state.MaxVersionLen)
+		u.Latest = clampString(u.Latest, state.MaxVersionLen)
+		kept = append(kept, u)
+	}
+	return kept
+}
+
+// equalUpdates compares two update lists entry by entry (order-sensitive: the
+// server owns the ordering; a reorder is a legitimate change).
+func equalUpdates(a, b []state.AvailableUpdate) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// clampString truncates s to at most n runes (rune-safe).
+func clampString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 func (m *Manager) getLastErr() string {
@@ -139,5 +283,17 @@ func (m *Manager) getLastErr() string {
 func (m *Manager) setLastErr(msg string) {
 	m.mu.Lock()
 	m.lastErr = msg
+	m.mu.Unlock()
+}
+
+func (m *Manager) getLastPatchErr() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastPatchErr
+}
+
+func (m *Manager) setLastPatchErr(msg string) {
+	m.mu.Lock()
+	m.lastPatchErr = msg
 	m.mu.Unlock()
 }

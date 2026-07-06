@@ -82,6 +82,33 @@ func specInventory(u *unstructured.Unstructured) *state.Inventory {
 	return inv
 }
 
+// statusAvailableUpdates reads the CR's CURRENT status.availableUpdates — the
+// baseline the idempotence check compares against, so neither an agent
+// restart nor a repeat server response ever re-writes an unchanged status.
+func statusAvailableUpdates(u *unstructured.Unstructured) []state.AvailableUpdate {
+	raw, found, err := unstructured.NestedSlice(u.Object, "status", "availableUpdates")
+	if !found || err != nil {
+		return nil
+	}
+	var updates []state.AvailableUpdate
+	for _, item := range raw {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := nestedString(entry, "name")
+		if name == "" {
+			continue
+		}
+		updates = append(updates, state.AvailableUpdate{
+			Name:    name,
+			Current: nestedString(entry, "current"),
+			Latest:  nestedString(entry, "latest"),
+		})
+	}
+	return updates
+}
+
 // nestedString reads a top-level string key from an unstructured map ("" when
 // absent or not a string).
 func nestedString(m map[string]any, key string) string {

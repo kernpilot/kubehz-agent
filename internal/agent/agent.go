@@ -147,6 +147,23 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	pub := publisher.New(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+
+	// ClusterInventory (lok8s.dev) manager: a light periodic GET at the
+	// full-beat cadence threads the lo-written deployment inventory (spec)
+	// into every beat. PURE OBSERVATION, ungated like machineIssues — and
+	// fail-soft: on a cluster that was never lok8s-deployed (no CRD/CR) the
+	// snapshot stays nil and the payload simply carries no inventory block.
+	// The write-back half: availableUpdates the server computes from that
+	// inventory ride the heartbeat RESPONSE and land on the CR's STATUS
+	// subresource (kubectl-visible, idempotent, spec never touched) — wired
+	// here, BEFORE the sender starts, so the handler is set once up front.
+	var invManager *inventory.Manager
+	if a.dyn != nil {
+		invManager = inventory.NewManager(a.dyn, a.cfg.FullInterval, notifyChange, a.log)
+		pub.OnAvailableUpdates(invManager.HandleUpdates)
+		go invManager.Run(ctx)
+	}
+
 	sender := publisher.NewSender(pub, backoffBase, backoffMax, a.log)
 	go sender.Run(ctx)
 
@@ -158,17 +175,6 @@ func (a *Agent) Run(ctx context.Context) error {
 		"minGap", a.cfg.MinGap.String(),
 		"reportNamespaces", a.cfg.ReportNamespaces,
 	)
-
-	// ClusterInventory (lok8s.dev) manager: a light periodic GET at the
-	// full-beat cadence threads the lo-written deployment inventory (spec)
-	// into every beat. PURE OBSERVATION, ungated like machineIssues — and
-	// fail-soft: on a cluster that was never lok8s-deployed (no CRD/CR) the
-	// snapshot stays nil and the payload simply carries no inventory block.
-	var invManager *inventory.Manager
-	if a.dyn != nil {
-		invManager = inventory.NewManager(a.dyn, a.cfg.FullInterval, notifyChange, a.log)
-		go invManager.Run(ctx)
-	}
 
 	// P3 desired-state loop: Poller pulls the platform's intent, the Executor
 	// acts LOCALLY (MachineDeployment replica patches; execution is entirely
