@@ -205,9 +205,16 @@ privacy class as the version fields and is **not** gated by
 
 **The write-back — addon updates via plain kubectl.** The heartbeat
 *response* carries `availableUpdates: [{name, current, latest}]`, computed by
-the platform from the reported inventory. When non-empty and the CR exists,
-the agent writes it — plus `lastReported` (RFC3339) — to the CR via the
-**status subresource** (JSON merge patch, field manager `kubehz-agent`), so:
+the platform from the reported inventory against the published lok8s addons
+index. The key is **tristate** (kubehz-api f628c97): **absent** = no verdict
+(the beat carried no inventory, or the index was unreachable — the server
+omits the key precisely so an outage never wipes the agent's last known
+status); **present `[]`** = index consulted, nothing is newer — the agent
+**clears** `status.availableUpdates` (without this, a user who upgrades
+their addons would keep stale "update available" notices forever);
+**non-empty** = written as-is. Every verdict lands — with `lastReported`
+(RFC3339) — on the CR via the **status subresource** (JSON merge patch,
+field manager `kubehz-agent`), so:
 
 ```bash
 kubectl get clusterinventory cluster -o yaml   # status.availableUpdates — no dashboard needed
@@ -216,9 +223,13 @@ kubectl get clusterinventory cluster -o yaml   # status.availableUpdates — no 
 Boundaries: the spec is never written (lo-owned); the sibling
 `status.observedAddons` is never touched (merge semantics); the write is
 idempotent (compared against the CR's current status — refreshed every poll
-and after every write, so restarts and repeat responses cost zero patches);
-an RBAC-denied patch warns **once** and beating continues; server input is
-clamped to the CRD's own status bounds before patching.
+and after every write, so restarts and repeat responses, including an
+already-clear `[]`, cost zero patches); a clear is patched as an explicit
+`[]`, never `null` (merge-patch `null` would delete the field; `[]` keeps
+"checked, nothing newer" distinguishable from never-checked); an RBAC-denied
+patch warns **once** and beating continues; server input is clamped to the
+CRD's own status bounds before patching, and a non-empty verdict whose
+entries are all invalid is refused rather than treated as a clear.
 
 The server persists `actions` **latest-wins** and treats an absent `actions`
 key as *clear* — so the agent keeps reporting the current revision's actions
@@ -233,21 +244,19 @@ included **only** when `KUBEHZ_REPORT_NAMESPACES=true`. The default is phase-onl
 counts and reason/kind-only events — workload *visibility* without workload
 *contents* (§1.2.5, §2).
 
-The kubehz-api side of this contract is **shipped** for everything except
-the inventory loop: schema-2 ingestion (nodes/workloads/events/observed
-version, `connected` tightening from `agent.mode`), the
-`actions[]`/`machineIssues[]` persistence, and `GET /clusters/{id}/desired`
-incl. the P5 `healing` block + `heal` action enum (kubehz-api d57c206). The
+The kubehz-api side of this contract is **shipped**: schema-2 ingestion
+(nodes/workloads/events/observed version, `connected` tightening from
+`agent.mode`), the `actions[]`/`machineIssues[]` persistence,
+`GET /clusters/{id}/desired` incl. the P5 `healing` block + `heal` action
+enum (kubehz-api d57c206), and the **inventory loop** (kubehz-api f628c97):
+`inventory` ingestion (validated + capped — note the addons **hard cap of
+100**, `HB_MAX_INVENTORY_ADDONS`, which is why `state.MaxAddons` is 100 and
+not the CRD's 256: one entry more would 400 the whole beat) plus the
+tristate `availableUpdates` response described above, surfaced on
+`GET /clusters/{id}` as `inventory` + `addonUpdates`. The
 `pools[]`/`desired{}` blocks remain accepted-but-stripped; the agent leaves
-them empty until the API ingests them. The **inventory** half — request
-`inventory` ingestion + the `availableUpdates` response — is being built **in
-parallel** to this exact contract (block = the ClusterInventory CR spec,
-response = `availableUpdates: [{name, current, latest}]`, both grounded on
-lok8s `operator/crds/clusterinventory.yaml`); until it lands, the non-strict
-`HeartbeatSchema` accepts-and-strips the block and returns no updates, and
-the agent simply never patches the CR status. Should the API land a
-different response shape, `internal/publisher`'s `heartbeatResponse` is the
-single place to adjust.
+them empty until the API ingests them. Should the response shape ever move,
+`internal/publisher`'s `heartbeatResponse` is the single place to adjust.
 
 ## Desired state & acting — the honest model
 
