@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -61,6 +62,35 @@ func TestApplyCaps_TruncatesArraysAndStrings(t *testing.T) {
 			t.Errorf("event note not clamped: %d", len(e.Note))
 			break
 		}
+	}
+}
+
+// The opt-in byNamespace map is the one otherwise-unbounded payload dimension;
+// it must be capped deterministically (lexicographic keep-set, stable across
+// consecutive snapshots).
+func TestApplyCaps_BoundsByNamespace(t *testing.T) {
+	p := &Payload{}
+	p.Workloads.Pods.ByNamespace = map[string]int{}
+	for i := 0; i < MaxNamespaces+25; i++ {
+		p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", i)] = i
+	}
+	ApplyCaps(p)
+	if got := len(p.Workloads.Pods.ByNamespace); got != MaxNamespaces {
+		t.Fatalf("byNamespace not capped: %d, want %d", got, MaxNamespaces)
+	}
+	// Lexicographic keep-set: the lowest keys survive, the overflow is dropped.
+	if _, ok := p.Workloads.Pods.ByNamespace["ns-0000"]; !ok {
+		t.Errorf("lowest key evicted — cap is not deterministic")
+	}
+	if _, ok := p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", MaxNamespaces)]; ok {
+		t.Errorf("overflow key survived the cap")
+	}
+	// A within-limit map passes through untouched.
+	small := &Payload{}
+	small.Workloads.Pods.ByNamespace = map[string]int{"default": 3}
+	ApplyCaps(small)
+	if small.Workloads.Pods.ByNamespace["default"] != 3 || len(small.Workloads.Pods.ByNamespace) != 1 {
+		t.Errorf("within-limit map modified: %+v", small.Workloads.Pods.ByNamespace)
 	}
 }
 

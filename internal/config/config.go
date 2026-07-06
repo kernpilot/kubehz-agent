@@ -55,6 +55,13 @@ const (
 // than shipping a guaranteed-401 bearer.
 var agentTokenRE = regexp.MustCompile(`^khz_agt_[0-9a-f]{64}$`)
 
+// clusterIDRE constrains CLUSTER_ID to a DNS-name-like shape (the cluster
+// domain, e.g. "kubehz.in.net"). The value is embedded in the heartbeat URL
+// path, so anything with separators/whitespace ('/', '?', '#', spaces, …) is
+// rejected up front — a typo'd CLUSTER_ID must fail fast, not silently POST to
+// a mangled path. The publisher additionally path-escapes it (defense in depth).
+var clusterIDRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$`)
+
 // Config is the fully-resolved agent configuration.
 type Config struct {
 	ClusterID string // cluster domain, e.g. "kubehz.in.net"
@@ -112,6 +119,10 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 	c.ClusterID = strings.TrimSpace(lookupDefault(getenv, EnvClusterID, ""))
 	if c.ClusterID == "" {
 		return nil, fmt.Errorf("%s is required", EnvClusterID)
+	}
+	if !clusterIDRE.MatchString(c.ClusterID) {
+		return nil, fmt.Errorf("%s must be a DNS-style name (letters, digits, '.', '-', '_'; max 253 chars; got %q)",
+			EnvClusterID, c.ClusterID)
 	}
 
 	rawURL := strings.TrimSpace(lookupDefault(getenv, EnvAPIURL, ""))

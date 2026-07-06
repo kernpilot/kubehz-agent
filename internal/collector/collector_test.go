@@ -1,7 +1,9 @@
 package collector
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,5 +78,15 @@ func TestBuildPayload_PartialReadFailSoft(t *testing.T) {
 	}
 	if p.Workloads.Pods.Total != 1 {
 		t.Errorf("pods should still be summarized: %+v", p.Workloads.Pods)
+	}
+	// The degraded section must be [] on the wire, never null — the server's
+	// array validation rejects null, which would 400 the very snapshot the
+	// fail-soft path exists to save.
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"nodes":[]`) {
+		t.Errorf("degraded nodes must serialize as [], got: %s", b)
 	}
 }

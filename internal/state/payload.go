@@ -20,6 +20,8 @@
 //     is never 400'd for an oversized payload.
 package state
 
+import "sort"
+
 // SchemaVersion marks this as the operator-mode live-view payload. Schema-1
 // (the bash CronJob) omits the field; the server treats its absence as v1.
 const SchemaVersion = 2
@@ -35,6 +37,10 @@ const (
 	MaxTypeLen    = 64
 	MaxVersionLen = 64
 	MaxNoteLen    = 256
+	// MaxNamespaces bounds the opt-in byNamespace pod-count map — the one
+	// otherwise-unbounded payload dimension (a many-tenant cluster can carry
+	// thousands of namespaces).
+	MaxNamespaces = 500
 )
 
 // AgentMode distinguishes the two agents that speak this contract.
@@ -206,6 +212,22 @@ func ApplyCaps(p *Payload) {
 		p.Events[i].Kind = clamp(p.Events[i].Kind, MaxStatusLen)
 		p.Events[i].Namespace = clamp(p.Events[i].Namespace, MaxNameLen)
 		p.Events[i].Note = clamp(p.Events[i].Note, MaxNoteLen)
+	}
+
+	// Keep the first MaxNamespaces in lexicographic order: deterministic, so
+	// consecutive snapshots of an over-limit cluster agree on which entries
+	// survive instead of flapping with map iteration order.
+	if len(p.Workloads.Pods.ByNamespace) > MaxNamespaces {
+		keys := make([]string, 0, len(p.Workloads.Pods.ByNamespace))
+		for k := range p.Workloads.Pods.ByNamespace {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		trimmed := make(map[string]int, MaxNamespaces)
+		for _, k := range keys[:MaxNamespaces] {
+			trimmed[k] = p.Workloads.Pods.ByNamespace[k]
+		}
+		p.Workloads.Pods.ByNamespace = trimmed
 	}
 }
 

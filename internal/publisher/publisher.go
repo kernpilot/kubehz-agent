@@ -9,10 +9,12 @@ package publisher
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -45,14 +47,22 @@ type Publisher struct {
 }
 
 // New builds a Publisher targeting apiURL for clusterID with bearer token A.
-// httpClient may be nil (a sane default with a request timeout is used).
+// httpClient may be nil (a sane default with a request timeout and a TLS 1.2
+// floor is used). clusterID is path-escaped: config validates its shape, but
+// the URL must stay well-formed even if a caller skips that validation.
 func New(apiURL, clusterID, token, agentVersion string, httpClient *http.Client) *Publisher {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		// Clone the default transport (keeps proxy support, HTTP/2, dial and
+		// idle-conn tuning) and pin the TLS floor explicitly. Go's client
+		// default already is 1.2, but for a credential-bearing request in a
+		// security-audited binary the floor should be declared, not implied.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		httpClient = &http.Client{Timeout: 15 * time.Second, Transport: tr}
 	}
 	return &Publisher{
 		client:    httpClient,
-		url:       strings.TrimRight(apiURL, "/") + fmt.Sprintf(heartbeatPath, clusterID),
+		url:       strings.TrimRight(apiURL, "/") + fmt.Sprintf(heartbeatPath, url.PathEscape(clusterID)),
 		token:     token,
 		userAgent: "kubehz-agent/" + agentVersion,
 	}

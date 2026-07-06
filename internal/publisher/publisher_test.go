@@ -106,6 +106,17 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	}
 }
 
+// TestNew_PathEscapesClusterID: config rejects malformed cluster IDs, but the
+// publisher must keep the URL well-formed regardless — a separator-bearing ID
+// must not be able to change the request path.
+func TestNew_PathEscapesClusterID(t *testing.T) {
+	p := New("https://api.kubehz.cloud", "a/b?c#d e", testToken, "0.1.0", nil)
+	want := "https://api.kubehz.cloud/api/clusters/a%2Fb%3Fc%23d%20e/heartbeat"
+	if p.URL() != want {
+		t.Errorf("URL() = %q, want %q", p.URL(), want)
+	}
+}
+
 // asAuthError is errors.As without importing errors in every call site.
 func asAuthError(err error, target **AuthError) bool {
 	ae, ok := err.(*AuthError)

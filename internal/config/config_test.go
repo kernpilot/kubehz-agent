@@ -58,6 +58,25 @@ func TestLoad_MissingRequired(t *testing.T) {
 	}
 }
 
+// CLUSTER_ID lands in the heartbeat URL path — anything that could alter the
+// path (separators, whitespace) must be rejected at load time.
+func TestLoad_ValidatesClusterID(t *testing.T) {
+	for _, ok := range []string{"kubehz.in.net", "dev-1.local", "a", "K8S_lab.example-1.com"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: ok, EnvAPIURL: "https://x",
+		}), noFile); err != nil {
+			t.Errorf("valid cluster ID %q rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"a/b", "a b", "a?b", "../up", "#frag", "-lead", "trail-", ".dot", "a%2Fb"} {
+		if _, err := Load(fakeEnv(map[string]string{
+			EnvClusterID: bad, EnvAPIURL: "https://x",
+		}), noFile); err == nil {
+			t.Errorf("expected rejection for cluster ID %q", bad)
+		}
+	}
+}
+
 func TestLoad_RejectsPlainHTTP(t *testing.T) {
 	_, err := Load(fakeEnv(map[string]string{
 		EnvClusterID: "d", EnvAPIURL: "http://api.kubehz.cloud",

@@ -2,6 +2,7 @@ package publisher
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -99,15 +100,26 @@ func (s *Sender) Run(ctx context.Context) {
 			}
 
 			wait := backoff.Next()
-			if authErr, ok := err.(*AuthError); ok {
+			var authErr *AuthError
+			if errors.As(err, &authErr) {
 				// Identity problem: surface loudly but keep retrying (recovery
 				// is a redeploy/rotation, outside the agent's authority).
 				s.log.Error("heartbeat auth rejected; will keep retrying",
 					"error", authErr.Error(), "retryIn", wait.String(), "attempt", backoff.Attempt())
-			} else {
-				s.log.Warn("heartbeat push failed; backing off",
-					"error", err.Error(), "retryIn", wait.String(), "attempt", backoff.Attempt())
+				// An auth failure is NOT cured by fresher data, so a newer
+				// enqueue must not preempt the wait — otherwise a revoked token
+				// would be retried at the enqueue cadence forever instead of
+				// backing off to the cap. The retry still sends the LATEST
+				// payload (take() below), so nothing stale is ever delivered.
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.afterFunc(wait):
+				}
+				continue
 			}
+			s.log.Warn("heartbeat push failed; backing off",
+				"error", err.Error(), "retryIn", wait.String(), "attempt", backoff.Attempt())
 
 			select {
 			case <-ctx.Done():

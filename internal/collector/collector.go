@@ -46,6 +46,10 @@ func BuildPayload(src Source, m Meta) *state.Payload {
 		Timestamp:  now().UTC().Format(time.RFC3339),
 		Agent:      state.AgentMeta{Version: m.AgentVersion, Mode: state.ModeOperator},
 		Kubernetes: state.KubeInfo{Version: m.ServerVersion},
+		// nodes has no omitempty on the wire; it must degrade to [] — never
+		// null — or the fail-soft snapshot would be rejected by the server's
+		// array validation, defeating the point of degrading.
+		Nodes: []state.NodeState{},
 	}
 
 	if nodes, err := src.Nodes(); err == nil {

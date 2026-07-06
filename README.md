@@ -40,7 +40,7 @@ recur — and the mapping is unit-tested as a regression guard.
 ```
                 in-cluster (user's cluster)                     kubehz platform
  ┌──────────────────────────────────────────────────┐        ┌──────────────────┐
- │  SharedInformerFactory (nodes, pods, events)      │        │                  │
+ │  SharedInformers (nodes, pods, events⚠only)       │        │                  │
  │        │ add/update/delete                        │        │                  │
  │        ▼                                           │        │                  │
  │  changeHandler ──signal──▶ Coalescer              │        │                  │
@@ -191,10 +191,6 @@ guessed (see `AGENTS.md`).
 - **Field-level deltas:** the current push is a change-triggered *full* snapshot
   (latest-wins, matching the server JSONB). Delta encoding is a future
   optimization if payload size ever matters.
-- **Server-side Warning filter:** the events informer currently watches all
-  events and filters `Warning` in code. A `type=Warning` field selector on a
-  dedicated filtered factory would shrink the cache and the change-signal noise
-  on busy clusters.
 
 ## License
 

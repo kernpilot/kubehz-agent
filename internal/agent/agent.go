@@ -13,6 +13,10 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -70,20 +74,37 @@ func (a *Agent) Run(ctx context.Context) error {
 	factory := informers.NewSharedInformerFactory(a.client, resyncPeriod)
 	nodeInf := factory.Core().V1().Nodes()
 	podInf := factory.Core().V1().Pods()
-	eventInf := factory.Core().V1().Events()
+
+	// Events get their own factory so a server-side field selector can restrict
+	// the list+watch to type=Warning — the only kind the payload reports. On a
+	// busy cluster the full event stream dwarfs everything else; filtering at
+	// the apiserver keeps the cache small and stops Normal-event churn from
+	// waking the coalescer for pushes that would change nothing.
+	eventFactory := informers.NewSharedInformerFactoryWithOptions(a.client, resyncPeriod,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("type", corev1.EventTypeWarning).String()
+		}))
+	eventInf := eventFactory.Core().V1().Events()
 
 	changes := make(chan struct{}, 1)
 	handler := changeHandler(changes)
 	for _, inf := range []cache.SharedIndexInformer{
 		nodeInf.Informer(), podInf.Informer(), eventInf.Informer(),
 	} {
+		// managedFields are pure apply-tracking bookkeeping — often kilobytes
+		// per object — and nothing in the payload reads them. Dropping them
+		// before objects enter the cache bounds memory on pod-dense clusters.
+		if err := inf.SetTransform(stripManagedFields); err != nil {
+			return fmt.Errorf("set informer transform: %w", err)
+		}
 		if _, err := inf.AddEventHandler(handler); err != nil {
 			return fmt.Errorf("register informer handler: %w", err)
 		}
 	}
 
-	a.log.Info("starting informers", "resources", "nodes,pods,events")
+	a.log.Info("starting informers", "resources", "nodes,pods,events(type=Warning)")
 	factory.Start(ctx.Done())
+	eventFactory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(),
 		nodeInf.Informer().HasSynced,
 		podInf.Informer().HasSynced,
@@ -162,6 +183,23 @@ func (a *Agent) refreshVersionLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// stripManagedFields drops ObjectMeta.managedFields before an object enters an
+// informer cache. It mutates the freshly-decoded object (safe: transforms run
+// pre-store, before anyone else can see it) and never fails — on an unexpected
+// shape the object is stored unchanged (fail toward report-only).
+func stripManagedFields(obj any) (any, error) {
+	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		if inner, err := stripManagedFields(d.Obj); err == nil {
+			d.Obj = inner
+		}
+		return d, nil
+	}
+	if m, err := meta.Accessor(obj); err == nil && len(m.GetManagedFields()) > 0 {
+		m.SetManagedFields(nil)
+	}
+	return obj, nil
 }
 
 // changeHandler signals the Coalescer (non-blocking) on any add/update/delete
