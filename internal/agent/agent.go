@@ -1,9 +1,13 @@
 // Package agent wires the pieces together: in-cluster informers on
 // nodes/pods/events feed a debounced Coalescer, which builds a schema-2 payload
-// and hands it to the outbound Sender. There is NO inbound listener and NO
-// analytics anywhere in this program — the only network egress is the
-// authenticated heartbeat POST (the privacy guarantee, enforced by
-// construction: there simply is no other outbound code path).
+// and hands it to the outbound Sender; alongside it, the desired-state Poller
+// pulls the platform's intent and the Executor acts on it locally (P3),
+// reporting outcomes through the actions store into the same heartbeat.
+// There is NO inbound listener and NO analytics anywhere in this program —
+// the only network egress is the authenticated heartbeat POST plus the
+// authenticated desired-state GET, both connections OPENED BY the agent
+// (the privacy guarantee, enforced by construction: there simply is no other
+// outbound code path and no inbound one at all).
 package agent
 
 import (
@@ -17,13 +21,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
+	"github.com/kernpilot/kubehz-agent/internal/actions"
 	"github.com/kernpilot/kubehz-agent/internal/buildinfo"
 	"github.com/kernpilot/kubehz-agent/internal/collector"
 	"github.com/kernpilot/kubehz-agent/internal/config"
+	"github.com/kernpilot/kubehz-agent/internal/desired"
+	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
 	"github.com/kernpilot/kubehz-agent/internal/state"
@@ -42,22 +50,26 @@ const (
 	backoffMax  = 5 * time.Minute
 )
 
-// Agent is the long-running managed-tier live-view agent.
+// Agent is the long-running managed-tier live-view + desired-state agent.
 type Agent struct {
 	cfg    *config.Config
 	client kubernetes.Interface
-	log    *slog.Logger
+	// dyn drives the P3 scaling executor. May be nil: the desired-state loop
+	// is then disabled and the agent is a pure live-view reporter.
+	dyn dynamic.Interface
+	log *slog.Logger
 
 	mu            sync.RWMutex
 	serverVersion string
 }
 
-// New builds an Agent. logger may be nil (uses slog.Default).
-func New(cfg *config.Config, client kubernetes.Interface, logger *slog.Logger) *Agent {
+// New builds an Agent. dyn may be nil (disables the desired-state pull loop —
+// pure report-only); logger may be nil (uses slog.Default).
+func New(cfg *config.Config, client kubernetes.Interface, dyn dynamic.Interface, logger *slog.Logger) *Agent {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Agent{cfg: cfg, client: client, log: logger}
+	return &Agent{cfg: cfg, client: client, dyn: dyn, log: logger}
 }
 
 // Run blocks until ctx is cancelled, driving the informer→debounce→publish loop.
@@ -133,6 +145,32 @@ func (a *Agent) Run(ctx context.Context) error {
 		"reportNamespaces", a.cfg.ReportNamespaces,
 	)
 
+	// P3 desired-state loop: Poller pulls the platform's intent, the Executor
+	// acts LOCALLY (MachineDeployment replica patches; execution is entirely
+	// server-gated), and the actions store threads outcomes into every beat.
+	// The store's notify rides the same change channel as the informers, so a
+	// done/failed action reaches the dashboard on the next debounced push.
+	actionStore := actions.New(func() {
+		select {
+		case changes <- struct{}{}:
+		default:
+		}
+	})
+	if a.dyn != nil {
+		exec := executor.New(a.dyn, a.cfg.MDNamespace, a.cfg.MaxReplicas, actionStore, a.getVersion, a.log)
+		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
+		go poller.Run(ctx)
+		a.log.Info("desired-state pull loop started",
+			"endpoint", dclient.URL(),
+			"interval", a.cfg.DesiredPoll.String(),
+			"mdNamespace", a.cfg.MDNamespace,
+			"maxReplicas", a.cfg.MaxReplicas,
+		)
+	} else {
+		a.log.Warn("desired-state loop disabled (no dynamic client) — running report-only")
+	}
+
 	coalescer := publisher.NewCoalescer(publisher.Cadence{
 		FullInterval: a.cfg.FullInterval,
 		Debounce:     a.cfg.Debounce,
@@ -146,6 +184,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			AgentVersion:     buildinfo.Version,
 			ReportNamespaces: a.cfg.ReportNamespaces,
 		})
+		// Thread the CURRENT desired-state action reports into every beat:
+		// the server persists them latest-wins and treats an absent actions[]
+		// as "clear", so the snapshot must ride along while it is non-empty.
+		payload.Actions = actionStore.Snapshot()
 		state.ApplyCaps(payload)
 		sender.Enqueue(payload)
 		a.log.Debug("queued live-view push",
@@ -153,6 +195,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			"nodes", len(payload.Nodes),
 			"pods", payload.Workloads.Pods.Total,
 			"warnings", len(payload.Events),
+			"actions", len(payload.Actions),
 		)
 	})
 	return ctx.Err()

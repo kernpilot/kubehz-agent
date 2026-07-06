@@ -1,11 +1,15 @@
-// Command kubehz-agent is the managed-tier, informer-based live-view agent for
+// Command kubehz-agent is the managed-tier live-view + desired-state agent for
 // kubehz. It runs as a long-running Deployment in the user's own cluster, reads
-// nodes/pods/warning-events via typed client-go informers, and POSTs a debounced
+// nodes/pods/warning-events via typed client-go informers, POSTs a debounced
 // schema-2 snapshot to kubehz-api authenticated with the in-cluster agent-token
-// (the same P0 identity the bash heartbeat uses).
+// (the same P0 identity the bash heartbeat uses), and pulls the desired-state
+// document to act LOCALLY on server-authorized worker scaling (P3) — the
+// cluster's own machine-controller does the provisioning; the agent holds no
+// cloud credential.
 //
 // It is OUTBOUND-ONLY: no inbound listener, no port, no analytics. The only
-// egress is the authenticated heartbeat POST.
+// egress is the authenticated heartbeat POST and the authenticated
+// desired-state GET — both opened by the agent.
 package main
 
 import (
@@ -43,6 +47,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Dynamic client for the P3 scaling executor (machinedeployments on
+	// cluster.k8s.io). Building it needs no extra permission — whether its
+	// calls are ALLOWED is decided by RBAC (the opt-in deploy/managed overlay)
+	// and by the server's execution flags; without either, the loop stays
+	// report-only.
+	dyn, err := kube.NewInClusterDynamicClient("kubehz-agent/" + buildinfo.Version)
+	if err != nil {
+		log.Error("kubernetes dynamic client error", "error", err.Error())
+		os.Exit(1)
+	}
+
 	// Token fallback: when not mounted as a file/env, read it once from the
 	// in-cluster Secret (requires the scoped Secret get RBAC). Validated so a
 	// misconfigured mount fails fast rather than shipping a 401-guaranteed beat.
@@ -68,7 +83,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := agent.New(cfg, client, log).Run(ctx); err != nil && ctx.Err() == nil {
+	if err := agent.New(cfg, client, dyn, log).Run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("agent stopped with error", "error", err.Error())
 		os.Exit(1)
 	}
