@@ -2,10 +2,14 @@ module github.com/kernpilot/kubehz-agent
 
 go 1.25.0
 
-// Keep in lockstep with the Dockerfile base and CI GO_VERSION: go1.26.4 fixes
-// GO-2026-5037/5038/5039 (stdlib), so an older local toolchain would build a
-// vulnerable binary and fail govulncheck.
-toolchain go1.26.4
+// Keep in lockstep with the Dockerfile base and the workflows' GO_VERSION.
+// go1.26.6 fixes FIVE reachable stdlib advisories that govulncheck reports
+// against 1.26.4 — GO-2026-6218 (net/url), GO-2026-6090 + GO-2026-5856
+// (crypto/tls), GO-2026-5972 (encoding/asn1), GO-2026-5026 (net/http) — all
+// reachable through the heartbeat's single https client. 1.26.7 is the current
+// patch in that line. An older local toolchain builds a vulnerable binary and
+// fails govulncheck.
+toolchain go1.26.7
 
 require (
 	k8s.io/api v0.35.6
@@ -38,7 +42,7 @@ require (
 	golang.org/x/oauth2 v0.30.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect

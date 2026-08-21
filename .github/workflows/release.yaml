@@ -54,7 +54,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.26.4"
+  GO_VERSION: "1.26.7"
   # The canonical, anonymously-pullable customer image (spec §1.5). Harbor is
   # only ever a mirror of what this produces.
   IMAGE: ghcr.io/kernpilot/kubehz-agent
