@@ -19,8 +19,17 @@ Security applies to every change — features, fixes, refactors, tests.
 - **No telemetry.** There is deliberately no analytics/phone-home code path. Do
   not add one — the privacy guarantee is enforced by construction.
 - **Plain HTTP is a red flag.** The API URL must be https (loopback excepted).
-- **Least privilege.** Read-only RBAC on nodes/pods/events + a name-scoped get on
-  the agent's own Secret. Any new capability must justify its RBAC delta.
+- **Least privilege.** The BASE (`deploy/base/rbac.yaml`) is: read-only on
+  nodes/pods/events and `clusterinventories.lok8s.dev`, a name-scoped `get` on
+  the agent's own Secret, and exactly ONE write — `patch` on
+  `clusterinventories/status`, the addon-update mirror on the cluster's own
+  reporting object. That write is a visibility feature: it can move no machine,
+  pod, or credential. Every ACTING grant — MachineDeployment `patch`, Machine
+  `delete` (P5), pods `delete` (the eviction unwedge) — lives in the opt-in
+  overlay `deploy/managed/` and is absent from the base. Any new capability must
+  justify its RBAC delta, and README.md + `deploy/README.md` must say so.
+  (This bullet used to name only nodes/pods/events + the Secret, which had gone
+  stale against the shipped `deploy/` tree.)
 
 ## Correctness bar (why this agent is in Go)
 
