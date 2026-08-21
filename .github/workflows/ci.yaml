@@ -81,18 +81,17 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
-      # ── Internal mirror: Harbor (docker.kubehz.in.net) for our own dogfooding
-      #    pulls. Requires the HARBOR_USERNAME / HARBOR_PASSWORD repo secrets.
-      - name: Log in to Harbor
-        uses: docker/login-action@v4
-        with:
-          registry: docker.kubehz.in.net
-          username: ${{ secrets.HARBOR_USERNAME }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
-
       # ── Public, anonymously-pullable canonical image on GHCR (spec §1.5).
       #    Uses the built-in GITHUB_TOKEN (packages:write). This is the artifact
-      #    customer clusters pull — Harbor is only the internal mirror.
+      #    customer clusters pull — Harbor is only an internal mirror, and it is
+      #    now taken LAST and best-effort (see the mirror step at the bottom).
+      #
+      #    It used to log in to Harbor FIRST, before this step. Harbor is private
+      #    and IP-allowlisted, so when its credentials went stale the login
+      #    failed, the job died before the build, and NO public image could be
+      #    produced from main at all — the customer artifact silently froze at
+      #    the last build that happened to predate the breakage. A dogfood mirror
+      #    must never be able to do that.
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -104,11 +103,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: |
-            ghcr.io/kernpilot/kubehz-agent
-            docker.kubehz.in.net/kubehz-builds/kubehz-agent
+          images: ghcr.io/kernpilot/kubehz-agent
           tags: |
-            type=semver,pattern={{version}}
             type=sha,format=long
             type=ref,event=branch
 
@@ -160,3 +156,32 @@ jobs:
           cosign attest --yes --type spdxjson \
             --predicate kubehz-agent.spdx.json \
             "ghcr.io/kernpilot/kubehz-agent@${{ steps.build.outputs.digest }}"
+
+      # ── Internal mirror: Harbor (docker.kubehz.in.net) for our own dogfooding
+      #    pulls. Copied BY DIGEST — imagetools re-pushes the index that was
+      #    already built and signed, so the bytes and the digest are identical
+      #    and nothing is rebuilt.
+      #
+      #    LAST, and best-effort on purpose. Harbor is private and IP-allowlisted;
+      #    a stale credential or an unreachable host must cost us a dogfood
+      #    convenience, never the public customer image. Guarded in-script rather
+      #    than in `if:` because a step's own `env:` is not visible to its own
+      #    `if:` expression.
+      - name: Mirror to the internal Harbor (best effort)
+        continue-on-error: true
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HARBOR_USERNAME}" ] || [ -z "${HARBOR_PASSWORD}" ]; then
+            echo "no Harbor credentials configured — skipping the internal mirror"
+            exit 0
+          fi
+          echo "${HARBOR_PASSWORD}" | docker login docker.kubehz.in.net \
+            -u "${HARBOR_USERNAME}" --password-stdin
+          docker buildx imagetools create \
+            --tag "docker.kubehz.in.net/kubehz-builds/kubehz-agent:${GITHUB_SHA}" \
+            --tag "docker.kubehz.in.net/kubehz-builds/kubehz-agent:main" \
+            "ghcr.io/kernpilot/kubehz-agent@${DIGEST}"
