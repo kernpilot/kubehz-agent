@@ -14,3 +14,7 @@ kind: Kustomization
 resources:
   - ../base
   - rbac-managed.yaml
+
+# IMAGE OVERRIDE: same rules as deploy/kustomization.yaml — the default is the
+# public digest-pinned GHCR ref; override the registry here (keeping the
+# digest) to pull from a mirror.

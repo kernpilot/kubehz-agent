@@ -24,10 +24,18 @@ resources:
   - configmap.yaml
   - deployment.yaml
 
-# To retarget/repin the image (e.g. the public GHCR ref once the package is
-# public, or a release digest), override here instead of editing deployment.yaml:
+# IMAGE OVERRIDE. The default is the PUBLIC GHCR image, pinned by digest
+# (base/deployment.yaml) — nothing to configure for a normal customer.
+#
+# Override here, never by editing deployment.yaml, when you pull from
+# somewhere else: our own Harbor dogfood mirror, an air-gapped mirror, or a
+# corporate pull-through cache. Keep the DIGEST — that is what makes the ref
+# verifiable and rollback-able; only the registry/repository changes.
 #
 # images:
-#   - name: docker.kubehz.in.net/kubehz-builds/kubehz-agent
-#     newName: ghcr.io/kernpilot/kubehz-agent
-#     digest: sha256:<release digest>
+#   - name: ghcr.io/kernpilot/kubehz-agent
+#     newName: docker.kubehz.in.net/kubehz-builds/kubehz-agent
+#     digest: sha256:9aaac7cbba3115d57691767a19bd1aad2695158c192eac8609c5a6e3f809730c
+#
+# To move to a specific release instead, take the digest from that release's
+# `digest.txt` (or apply its `install.yaml` directly).

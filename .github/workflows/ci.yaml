@@ -63,8 +63,12 @@ jobs:
 
   image:
     name: build · push image
-    # Publish only from main / tags, never from PRs (no secrets to forks).
-    if: github.event_name == 'push'
+    # Publish only from main: never from PRs (no secrets to forks) and never
+    # from TAGS — .github/workflows/release.yaml owns tags. Two workflows
+    # building one tag would push two DIFFERENT digests for the same version (a
+    # build is not bit-reproducible), leaving `vX.Y.Z` pointing at whichever
+    # run finished last. One tag, one builder, one digest.
+    if: github.event_name == 'push' && github.ref_type != 'tag'
     needs: test
     runs-on: ubuntu-latest
     permissions:

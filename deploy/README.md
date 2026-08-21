@@ -90,25 +90,61 @@ Shared objects (used, never modified, by this stack):
 
 ## Image
 
-The Deployment pins the image **by digest** (multi-arch index). The committed
-default is the kubehz-internal Harbor mirror
-(`docker.kubehz.in.net/kubehz-builds/kubehz-agent@sha256:…`) — the ref the
-pilot dogfoods. The canonical public image is
-`ghcr.io/kernpilot/kubehz-agent` (same digest, cosign-signed keyless with an
-attested SBOM); anonymous pulls require the GHCR package to be public.
+The Deployment pins the image **by digest** (a multi-arch index — `linux/amd64`
+and `linux/arm64`, because customer worker nodes are not all x86). The
+committed default is the **public** package
+`ghcr.io/kernpilot/kubehz-agent@sha256:…`, which anyone can pull without a
+registry login. That is the ref a customer cluster resolves.
 
-Retarget or repin via the kustomize `images:` override (commented example in
-`kustomization.yaml`) rather than editing `deployment.yaml`. Never deploy a
-moving tag (`main`, `latest`): a digest is the only ref cosign verification and
-rollback can reason about.
+It used to default to the internal Harbor mirror
+(`docker.kubehz.in.net/kubehz-builds/kubehz-agent`). Harbor is private and
+IP-allowlisted, so the shipped default was an `ImagePullBackOff` everywhere
+except our own pilot. Harbor is still mirrored by digest for dogfood pulls, but
+it is now the **override**, not the default:
+
+```yaml
+# deploy/kustomization.yaml (or deploy/managed/kustomization.yaml)
+images:
+  - name: ghcr.io/kernpilot/kubehz-agent
+    newName: docker.kubehz.in.net/kubehz-builds/kubehz-agent
+    digest: sha256:<the same digest>
+```
+
+The same override retargets an air-gapped mirror or a pull-through cache. Keep
+the digest and change only the registry — one build is mirrored by digest, so
+the bytes are identical either way.
+
+Never deploy a moving tag (`main`, `latest`). A digest is the only ref that
+`cosign verify` and a rollback can reason about. The release artifacts hold to
+the same rule: `install.yaml` and `install-managed.yaml` on each GitHub Release
+are rendered from this tree with that release's digest already substituted, and
+the release workflow fails if either still carries a tag.
+
+### Verify before you run it
+
+Every released digest is signed keyless through the GitHub Actions OIDC
+identity, with an attested SPDX SBOM. There is no key to trust and no account
+to hold — the certificate names the workflow, repo and ref that built the
+bytes.
 
 ```bash
-# Verify what you are about to run (keyless, GitHub Actions OIDC):
+digest=sha256:...                       # from digest.txt on the release, or the manifest above
+
 cosign verify \
-  --certificate-identity-regexp 'https://github.com/kernpilot/kubehz-agent/.*' \
+  --certificate-identity-regexp '^https://github.com/kernpilot/kubehz-agent/\.github/workflows/release\.yaml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/kernpilot/kubehz-agent@sha256:<digest>
+  "ghcr.io/kernpilot/kubehz-agent@${digest}"
+
+cosign verify-attestation --type spdxjson \
+  --certificate-identity-regexp '^https://github.com/kernpilot/kubehz-agent/\.github/workflows/release\.yaml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "ghcr.io/kernpilot/kubehz-agent@${digest}"
 ```
+
+The release workflow runs both commands against the published image before it
+publishes the release, so a digest that a customer cannot verify never ships.
+Images built from `main` by `ci.yaml` are signed under that workflow's identity
+instead — widen the regexp to `/\.github/workflows/` if you verify one of those.
 
 ## Migrating from the pre-rename scaffold
 

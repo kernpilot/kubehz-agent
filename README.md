@@ -407,12 +407,54 @@ guessed (see `AGENTS.md`).
 - **Image:** distroless `static-debian12:nonroot`, pinned by digest; static
   `CGO_ENABLED=0` binary; runs non-root (65532), read-only rootfs, all caps
   dropped, seccomp `RuntimeDefault`.
-- **CI:** `gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`; multi-arch
-  build pushed to **GHCR** (the canonical customer image — the package must be
-  set public for anonymous pulls) + internal **Harbor** mirror, **cosign**-signed
-  (keyless OIDC) with an attested **SBOM** and SLSA provenance.
 - **The token `A` is never logged or printed.** `Config.String()` redacts it; the
   claim-code `C` is never mounted or read by this agent.
+
+### Two lanes: `ci.yaml` and `release.yaml`
+
+`ci.yaml` is the continuous lane. Every push to `main` runs
+`gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`, then builds the
+moving `main` image and the internal Harbor mirror.
+
+`release.yaml` cuts the customer artifact for a `vX.Y.Z` git tag. Tags belong to
+it alone — `ci.yaml` skips them, because two workflows building one tag produce
+two different digests for one version and the registry tag then points at
+whichever run finished last.
+
+What a release publishes, per the platform spec's image supply chain (§1.5):
+
+| Requirement | How it ships |
+|---|---|
+| **Public** image | `ghcr.io/kernpilot/kubehz-agent`, anonymously pullable. GHCR is the only registry on the critical path; Harbor is mirrored afterwards and cannot fail a release. |
+| **Multi-arch** | `linux/amd64` + `linux/arm64`. A step reads the published index back and fails the release if either platform is missing. |
+| **Distroless/static base** | `gcr.io/distroless/static-debian12:nonroot`, itself pinned by digest in the `Dockerfile`. |
+| **cosign-signed** | Keyless, through the Actions OIDC identity. No long-lived key exists. |
+| **SBOM attached** | SPDX, generated from the pushed image, attested with `cosign attest --type spdxjson`, and uploaded to the release. BuildKit's own SBOM and SLSA provenance also ride inside the image index. |
+| **Pinned by digest in the manifests** | `deploy/base/deployment.yaml` carries a digest, never a tag. The release renders `install.yaml` / `install-managed.yaml` with the released digest and refuses to publish if a moving tag survived. |
+| **Verifiable** | The workflow runs the same `cosign verify` and `cosign verify-attestation` commands this README gives customers, against the public image, before it publishes. A digest a customer cannot verify never ships. |
+
+Actions are pinned by commit SHA. A tag can move; a commit cannot.
+
+### Publishing a release
+
+The repository is public and the GHCR package is already public — a customer
+can pull `ghcr.io/kernpilot/kubehz-agent` today with no credentials. Cutting a
+version is therefore one owner action and nothing else:
+
+```bash
+git tag -a v0.1.0 -m "kubehz-agent v0.1.0" && git push origin v0.1.0
+```
+
+That runs `release.yaml`: verify, build, sign, attest, verify again, then
+publish the GitHub Release with `install.yaml`, `install-managed.yaml`,
+`kubehz-agent.spdx.json`, `digest.txt` and `SHA256SUMS`.
+
+If a run dies halfway, re-run the workflow by hand (**Actions → Release → Run
+workflow**) with the same tag. Every step is idempotent.
+
+The Harbor mirror step needs the `HARBOR_USERNAME` / `HARBOR_PASSWORD`
+repository secrets. Without them it prints a line and skips — Harbor is a
+dogfood convenience, so its absence must never hold up a customer release.
 
 ## Follow-ups (later phases)
 
