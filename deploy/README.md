@@ -65,6 +65,17 @@ deliberately namespaced Roles.
 
 ## `deploy/inventory/` — the helm-release read (opt-in, either tier)
 
+> **Two switches, both off by default.** This overlay grants the RBAC, and
+> `KUBEHZ_OBSERVED_INVENTORY=true` turns the producer on. Neither implies the
+> other, and the producer defaults **off** because its pod-label fallback
+> needs no RBAC at all — without that default, upgrading the image alone would
+> start reporting every helm-managed release name in the cluster.
+>
+> **Applying this overlay to a RUNNING agent does not take effect until the
+> pod restarts.** The agent tries the helm-Secret watch once at startup; if
+> the permission is missing it closes that watch for the process lifetime and
+> falls back to pod labels. Roll the deployment after applying.
+
 The addon overview needs to know what is installed. On a cluster deployed by
 a recent `lo` that comes from the `ClusterInventory` CR (base RBAC, already
 covered). Everywhere else the agent **observes** it, and the best source is
@@ -79,7 +90,7 @@ base** — it is a trust decision, and the file's header states it plainly.
 
 What the agent does with the grant is auditable in
 `internal/inventory/helm.go`: the informer **transform** drops every Secret's
-`Data` before the object reaches the cache and keeps six metadata strings, so
+`Data` before the object reaches the cache and keeps seven metadata strings, so
 release payloads (rendered manifests, merged values — where credentials live)
 are never held in memory and cannot be reached from anywhere else in the
 process. Only `name` + `chartVersion` + `appVersion` + `source: helm` ride the
@@ -89,7 +100,7 @@ Skip the file and nothing breaks: the LIST is Forbidden, the agent logs it
 once, drops that watch, and falls back to helm's labels on pods
 (`app.kubernetes.io/managed-by=Helm` + `helm.sh/chart` +
 `app.kubernetes.io/version`) — no new permission, coverage limited to charts
-that propagate those labels. `KUBEHZ_OBSERVED_INVENTORY=false` turns the whole
+that propagate those labels. `KUBEHZ_OBSERVED_INVENTORY=true` turns the whole
 producer off.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)

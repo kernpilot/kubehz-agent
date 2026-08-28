@@ -25,9 +25,17 @@ data:
   # versions (the dashboard's addon overview) when the cluster carries no lok8s
   # ClusterInventory CR. Sources, in order: helm release Secrets — needs the
   # opt-in deploy/inventory RBAC, see its header — then helm's labels on pods,
-  # which need no extra permission. Set to "false" to report no observed
-  # inventory at all; the lo-written CR block is unaffected either way.
-  KUBEHZ_OBSERVED_INVENTORY: "true"
+  # which need no extra permission.
+  #
+  # OFF by default, and it must stay that way in the BASE: the pod-label
+  # fallback needs no RBAC, so shipping "true" here would make every existing
+  # deployment start reporting the names and versions of every helm-managed
+  # workload — tenant apps, not just framework addons — on an image upgrade
+  # alone. Release names are workload identifiers of the same class as
+  # namespace names, which KUBEHZ_REPORT_NAMESPACES gates off by default for
+  # exactly this reason. Set "true" to opt in; the lo-written CR block is
+  # unaffected either way.
+  KUBEHZ_OBSERVED_INVENTORY: "false"
   # ── P3 desired-state loop (worker scaling) ─────────────────────────────────
   # NOTE: none of these ENABLE acting. Execution is authorized exclusively by
   # the server's /desired execution{} flags (tier × access × kill switch) plus

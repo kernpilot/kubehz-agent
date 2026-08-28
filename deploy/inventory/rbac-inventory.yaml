@@ -17,7 +17,7 @@
 #   - the informer list+watch is field-selected to `type=helm.sh/release.v1`,
 #     so no other Secret is ever transferred to the pod;
 #   - `ProjectHelmRelease` runs as the informer TRANSFORM, i.e. on every object
-#     BEFORE it enters the cache: it drops `Data` unconditionally and keeps six
+#     BEFORE it enters the cache: it drops `Data` unconditionally and keeps seven
 #     strings (release name, chart, chartVersion, appVersion, status, revision,
 #     last-deployed). The release payload — rendered manifests and merged
 #     values, which is where credentials live — is never cached and can never

@@ -44,8 +44,8 @@ func TestLoad_Minimal(t *testing.T) {
 	if c.ReportNamespaces {
 		t.Errorf("ReportNamespaces must default to false (privacy)")
 	}
-	if !c.ObservedInventory {
-		t.Errorf("ObservedInventory must default to true (otherwise the addon overview is dark)")
+	if c.ObservedInventory {
+		t.Errorf("ObservedInventory must default to FALSE: the pod-label fallback needs no RBAC, so a true default would make every existing agent start reporting every helm-managed workload name on an image upgrade alone")
 	}
 	if c.Namespace != DefaultNamespace || c.SecretName != DefaultSecretName {
 		t.Errorf("secret locator defaults wrong: %s", c)
@@ -313,8 +313,8 @@ func TestResolveToken_FileErrorIsNonFatal(t *testing.T) {
 	}
 }
 
-// TestLoad_ObservedInventoryKillSwitch: the observed inventory producer is ON
-// unless an operator explicitly turns it off, and a typo'd value fails fast
+// TestLoad_ObservedInventoryKillSwitch: the observed inventory producer is OFF
+// until an operator explicitly turns it on, and a typo'd value fails fast
 // rather than silently picking a side.
 func TestLoad_ObservedInventoryKillSwitch(t *testing.T) {
 	base := map[string]string{
@@ -325,15 +325,15 @@ func TestLoad_ObservedInventoryKillSwitch(t *testing.T) {
 	for k, v := range base {
 		off[k] = v
 	}
-	off[EnvObservedInventory] = "false"
+	off[EnvObservedInventory] = "true"
 	c, err := Load(fakeEnv(off), noFile)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if c.ObservedInventory {
-		t.Errorf("%s=false was not applied", EnvObservedInventory)
+	if !c.ObservedInventory {
+		t.Errorf("%s=true was not applied", EnvObservedInventory)
 	}
-	if !strings.Contains(c.String(), "observedInventory=false") {
+	if !strings.Contains(c.String(), "observedInventory=true") {
 		t.Errorf("Config.String() must surface the switch: %s", c)
 	}
 

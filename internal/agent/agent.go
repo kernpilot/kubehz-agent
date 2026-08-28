@@ -269,10 +269,23 @@ func (a *Agent) Run(ctx context.Context) error {
 		// addon overview stops being dark on every cluster that was not
 		// deployed by a recent lo.
 		if payload.Inventory == nil && a.cfg.ObservedInventory {
-			payload.Inventory = inventory.Observe(inventory.Sources{
-				Secrets: helmSecrets,
-				Pods:    func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
-			})
+			// Observe promises it cannot fail a beat. Nothing in this process
+			// recovers from a panic, so that promise is only as strong as the
+			// code being nil-safe everywhere — and an inventory block is the
+			// least important thing in the payload. A recover keeps a future
+			// nil-map or index slip from taking heartbeats down with it.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						a.log.Warn("observed inventory panicked; beat continues without it", "panic", r)
+						payload.Inventory = nil
+					}
+				}()
+				payload.Inventory = inventory.Observe(inventory.Sources{
+					Secrets: helmSecrets,
+					Pods:    func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
+				})
+			}()
 		}
 		state.ApplyCaps(payload)
 		sender.Enqueue(payload)

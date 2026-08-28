@@ -30,7 +30,7 @@ import (
 // merged values, i.e. potentially credentials. None of that may enter the
 // informer cache, let alone a heartbeat. ProjectHelmRelease is an informer
 // TRANSFORM: it runs once per delivered object BEFORE the object reaches the
-// cache, decodes the payload, keeps six metadata strings, and drops `Data`
+// cache, decodes the payload, keeps seven metadata strings, and drops `Data`
 // entirely. From that point on nothing in this process holds release contents,
 // and the per-beat cost is a map read rather than a gunzip.
 
@@ -103,7 +103,7 @@ type release struct {
 //   - Data is dropped unconditionally — before any decoding, so a secret that
 //     is not a helm release, or whose payload is undecodable, is cached as an
 //     empty husk;
-//   - a decodable helm release leaves six metadata strings behind in
+//   - a decodable helm release leaves seven metadata strings behind in
 //     StringData (see the projection keys), which is all Observe reads.
 func ProjectHelmRelease(obj any) (any, error) {
 	if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {

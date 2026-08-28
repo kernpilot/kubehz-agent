@@ -182,7 +182,7 @@ func TestDecodeRelease_MalformedIsSkippedNotFatal(t *testing.T) {
 
 // TestProjectHelmRelease_NeverCachesPayloads is the privacy contract: whatever
 // goes in, what comes out carries NO Secret data — the helm payload (rendered
-// manifests, merged values, credentials) is decoded to six metadata strings
+// manifests, merged values, credentials) is decoded to seven metadata strings
 // and dropped, and a Secret that is not a helm release keeps nothing at all.
 func TestProjectHelmRelease_NeverCachesPayloads(t *testing.T) {
 	t.Run("helm release keeps metadata only", func(t *testing.T) {
@@ -197,6 +197,22 @@ func TestProjectHelmRelease_NeverCachesPayloads(t *testing.T) {
 		}
 		if s.StringData[projChartVersion] != "1.19.2" || s.StringData[projName] != "cilium" {
 			t.Errorf("projection = %v", s.StringData)
+		}
+		// BOUND the projection, do not just spot-check two keys. Without this
+		// an added `"values": …` line would keep the whole release payload in
+		// the cache and this test would still pass — which is the one thing
+		// it exists to prevent.
+		allowed := map[string]bool{
+			projName: true, projChart: true, projChartVersion: true, projAppVersion: true,
+			projStatus: true, projRevision: true, projLastDeployed: true,
+		}
+		for k := range s.StringData {
+			if !allowed[k] {
+				t.Errorf("projection leaked an unexpected key %q (value %q) — the transform must keep ONLY release metadata", k, s.StringData[k])
+			}
+		}
+		if len(s.StringData) > len(allowed) {
+			t.Errorf("projection has %d keys, allow-list has %d: %v", len(s.StringData), len(allowed), s.StringData)
 		}
 		rel, ok := releaseFromSecret(s)
 		if !ok || rel.Revision != 3 || rel.Namespace != "kube-system" {

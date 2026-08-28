@@ -153,12 +153,18 @@ type Config struct {
 	ReportNamespaces bool
 
 	// ObservedInventory enables the observed (helm-derived) inventory block on
-	// clusters with no lok8s ClusterInventory CR. Default TRUE — it reports
-	// release NAMES and chart versions, the same metadata class the CR block
-	// carries, and nothing that a release payload contains. A deployer who
-	// wants no inventory at all sets it false; the helm-release Secret watch
-	// is additionally gated by RBAC it does not have unless the
-	// deploy/inventory overlay was applied.
+	// clusters with no lok8s ClusterInventory CR. Default **FALSE**, and the
+	// reason matters: the helm-Secret source is gated by RBAC the agent does
+	// not have unless the deploy/inventory overlay was applied, but the
+	// POD-LABEL fallback needs no extra permission at all. A default of true
+	// would therefore make every existing deployment start reporting the
+	// names and versions of every helm-managed workload — tenant apps, not
+	// just framework addons — on nothing more than an image upgrade.
+	//
+	// Release names are workload identifiers of the same class as namespace
+	// names, and ReportNamespaces above defaults false for exactly that
+	// reason ("workload visibility without workload contents"). This follows
+	// that precedent rather than contradicting it. A deployer opts in.
 	ObservedInventory bool
 }
 
@@ -195,7 +201,7 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		MaxReplicas:         DefaultMaxReplicas,
 		HealEvictionTimeout: DefaultHealEvictionTimeout,
 		ReportNamespaces:    false,
-		ObservedInventory:   true,
+		ObservedInventory:   false,
 	}
 	if !namespaceRE.MatchString(c.MDNamespace) {
 		return nil, fmt.Errorf("%s must be a DNS-1123 label (got %q)", EnvMDNamespace, c.MDNamespace)
@@ -237,7 +243,7 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 	} else {
 		c.ReportNamespaces = b
 	}
-	if b, err := lookupBoolDefault(getenv, EnvObservedInventory, true); err != nil {
+	if b, err := lookupBoolDefault(getenv, EnvObservedInventory, false); err != nil {
 		return nil, err
 	} else {
 		c.ObservedInventory = b

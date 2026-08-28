@@ -223,7 +223,7 @@ order of fidelity:
    secrets `list`/`watch`, which is **opt-in**:
    `deploy/inventory/rbac-inventory.yaml`, whose header explains the trust
    decision. The informer's **transform** drops every Secret's `Data` before
-   it reaches the cache and keeps six metadata strings, so release payloads —
+   it reaches the cache and keeps seven metadata strings, so release payloads —
    rendered manifests and merged values — are never held and cannot be
    reached from the rest of the process.
 2. **helm's labels on pods** (`app.kubernetes.io/managed-by=Helm` +
@@ -235,8 +235,9 @@ Fail-soft throughout: a Forbidden LIST is logged once and the watch is
 dropped; an undecodable or foreign Secret is skipped; an uninstalled release
 (`--keep-history` tombstone) is not reported as installed; a name-collision
 across namespaces collapses to one entry (the wire schema has no namespace).
-Nothing here can fail a beat. `KUBEHZ_OBSERVED_INVENTORY=false` turns the
-producer off entirely.
+Nothing here can fail a beat, and a panic in the producer is recovered so it
+cannot take heartbeats down with it. `KUBEHZ_OBSERVED_INVENTORY=true` turns
+the producer ON; it is off by default.
 
 **The write-back — addon updates via plain kubectl.** The heartbeat
 *response* carries `availableUpdates: [{name, current, latest}]`, computed by
@@ -401,7 +402,7 @@ disabled — healing itself is unaffected. See
 | `KUBEHZ_DEBOUNCE` | `10s` | coalesce a change burst |
 | `KUBEHZ_MIN_GAP` | `15s` | floor between two pushes |
 | `KUBEHZ_REPORT_NAMESPACES` | `false` | opt into namespace/message reporting |
-| `KUBEHZ_OBSERVED_INVENTORY` | `true` | report the OBSERVED addon inventory (helm releases) when there is no `ClusterInventory` CR |
+| `KUBEHZ_OBSERVED_INVENTORY` | `false` | report the OBSERVED addon inventory (helm releases) when there is no `ClusterInventory` CR. Off by default: the pod-label source needs no RBAC, so a true default would report every helm release name on an image upgrade alone |
 | `KUBEHZ_DESIRED_POLL_SECONDS` | `60` | desired-state pull cadence (integer seconds; + ≤10% jitter) |
 | `KUBEHZ_MD_NAMESPACE` | `kube-system` | where the executor looks for MachineDeployments |
 | `KUBEHZ_MAX_REPLICAS` | `50` | per-pool ceiling; out-of-bounds desired is **refused**, not clamped |
