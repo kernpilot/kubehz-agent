@@ -7,6 +7,10 @@ kubectl apply -k deploy/
 
 # Managed tier — adds the acting permission for server-gated worker scaling:
 kubectl apply -k deploy/managed/
+
+# Either tier, optional — exact addon versions read from helm's own release
+# records (a CLUSTER-WIDE secrets list/watch; read the file header first):
+kubectl apply -f deploy/inventory/rbac-inventory.yaml
 ```
 
 ## The base/managed RBAC split
@@ -58,6 +62,35 @@ least privilege says an unused write should not exist. Without the overlay a
 If you relocate the pools (`KUBEHZ_MD_NAMESPACE`), move the Role's
 `namespace` in `rbac-managed.yaml` accordingly — the machine-side grants are
 deliberately namespaced Roles.
+
+## `deploy/inventory/` — the helm-release read (opt-in, either tier)
+
+The addon overview needs to know what is installed. On a cluster deployed by
+a recent `lo` that comes from the `ClusterInventory` CR (base RBAC, already
+covered). Everywhere else the agent **observes** it, and the best source is
+helm's own release records — one Secret per release revision, `type:
+helm.sh/release.v1`, carrying the chart and app versions.
+
+`rbac-inventory.yaml` grants the ServiceAccount `list`/`watch` on **secrets**,
+cluster-wide. RBAC cannot narrow that by type, label, or name: the agent's
+field selector (`type=helm.sh/release.v1`) restricts what it *requests*, never
+what the SA is *allowed* to request. That is why the rule is **not in the
+base** — it is a trust decision, and the file's header states it plainly.
+
+What the agent does with the grant is auditable in
+`internal/inventory/helm.go`: the informer **transform** drops every Secret's
+`Data` before the object reaches the cache and keeps six metadata strings, so
+release payloads (rendered manifests, merged values — where credentials live)
+are never held in memory and cannot be reached from anywhere else in the
+process. Only `name` + `chartVersion` + `appVersion` + `source: helm` ride the
+heartbeat.
+
+Skip the file and nothing breaks: the LIST is Forbidden, the agent logs it
+once, drops that watch, and falls back to helm's labels on pods
+(`app.kubernetes.io/managed-by=Helm` + `helm.sh/chart` +
+`app.kubernetes.io/version`) — no new permission, coverage limited to charts
+that propagate those labels. `KUBEHZ_OBSERVED_INVENTORY=false` turns the whole
+producer off.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)
 

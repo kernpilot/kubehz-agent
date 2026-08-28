@@ -21,6 +21,13 @@ data:
   # Privacy: keep per-namespace pod counts and event namespaces/messages OUT of
   # the payload by default (spec §1.2.5). Set to "true" to opt in.
   KUBEHZ_REPORT_NAMESPACES: "false"
+  # Observed inventory: report the installed addons/apps and their chart/app
+  # versions (the dashboard's addon overview) when the cluster carries no lok8s
+  # ClusterInventory CR. Sources, in order: helm release Secrets — needs the
+  # opt-in deploy/inventory RBAC, see its header — then helm's labels on pods,
+  # which need no extra permission. Set to "false" to report no observed
+  # inventory at all; the lo-written CR block is unaffected either way.
+  KUBEHZ_OBSERVED_INVENTORY: "true"
   # ── P3 desired-state loop (worker scaling) ─────────────────────────────────
   # NOTE: none of these ENABLE acting. Execution is authorized exclusively by
   # the server's /desired execution{} flags (tier × access × kill switch) plus

@@ -36,6 +36,12 @@ const (
 	EnvReportNamespaces = "KUBEHZ_REPORT_NAMESPACES"
 	EnvNamespace        = "KUBEHZ_NAMESPACE" // for the Secret API fallback
 	EnvSecretName       = "KUBEHZ_SECRET_NAME"
+	// EnvObservedInventory is the kill switch for the OBSERVED inventory
+	// producer (helm releases → the heartbeat's inventory block). Default TRUE:
+	// without it the dashboard's addon overview is dark on every cluster that
+	// has no lok8s ClusterInventory CR. Set to "false" to report no observed
+	// inventory at all — the declared CR block (when present) is unaffected.
+	EnvObservedInventory = "KUBEHZ_OBSERVED_INVENTORY"
 	// EnvDesiredPollSeconds is the desired-state pull cadence in WHOLE SECONDS
 	// (an integer, not a Go duration — the name says the unit). The effective
 	// wait adds up to 10% jitter to desynchronize a fleet.
@@ -145,6 +151,15 @@ type Config struct {
 	// counts, event namespaces + messages). Default FALSE — spec §2's
 	// "workload visibility without workload contents". A deployer opts in.
 	ReportNamespaces bool
+
+	// ObservedInventory enables the observed (helm-derived) inventory block on
+	// clusters with no lok8s ClusterInventory CR. Default TRUE — it reports
+	// release NAMES and chart versions, the same metadata class the CR block
+	// carries, and nothing that a release payload contains. A deployer who
+	// wants no inventory at all sets it false; the helm-release Secret watch
+	// is additionally gated by RBAC it does not have unless the
+	// deploy/inventory overlay was applied.
+	ObservedInventory bool
 }
 
 // HasToken reports whether a bearer token was already resolved from env/file.
@@ -158,9 +173,9 @@ func (c *Config) String() string {
 		tok = "khz_agt_***redacted***"
 	}
 	return fmt.Sprintf(
-		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t desiredPoll=%s mdNamespace=%q maxReplicas=%d healEvictionTimeout=%s}",
+		"Config{clusterID=%q apiURL=%q token=%s ns=%q secret=%q full=%s debounce=%s minGap=%s reportNamespaces=%t observedInventory=%t desiredPoll=%s mdNamespace=%q maxReplicas=%d healEvictionTimeout=%s}",
 		c.ClusterID, c.APIURL, tok, c.Namespace, c.SecretName,
-		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces,
+		c.FullInterval, c.Debounce, c.MinGap, c.ReportNamespaces, c.ObservedInventory,
 		c.DesiredPoll, c.MDNamespace, c.MaxReplicas, c.HealEvictionTimeout,
 	)
 }
@@ -180,6 +195,7 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		MaxReplicas:         DefaultMaxReplicas,
 		HealEvictionTimeout: DefaultHealEvictionTimeout,
 		ReportNamespaces:    false,
+		ObservedInventory:   true,
 	}
 	if !namespaceRE.MatchString(c.MDNamespace) {
 		return nil, fmt.Errorf("%s must be a DNS-1123 label (got %q)", EnvMDNamespace, c.MDNamespace)
@@ -220,6 +236,11 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 		return nil, err
 	} else {
 		c.ReportNamespaces = b
+	}
+	if b, err := lookupBoolDefault(getenv, EnvObservedInventory, true); err != nil {
+		return nil, err
+	} else {
+		c.ObservedInventory = b
 	}
 
 	if secs, ok, err := lookupPositiveInt(getenv, EnvDesiredPollSeconds); err != nil {
@@ -357,9 +378,16 @@ func applyDurations(getenv func(string) (string, bool), c *Config) error {
 }
 
 func lookupBool(getenv func(string) (string, bool), key string) (bool, error) {
+	return lookupBoolDefault(getenv, key, false)
+}
+
+// lookupBoolDefault parses an env var as a boolean, falling back to def when it
+// is unset or blank. A present-but-unparseable value is a hard error either
+// way — a typo'd "flase" must fail fast, not silently pick a default.
+func lookupBoolDefault(getenv func(string) (string, bool), key string, def bool) (bool, error) {
 	v, ok := getenv(key)
 	if !ok || strings.TrimSpace(v) == "" {
-		return false, nil
+		return def, nil
 	}
 	b, err := strconv.ParseBool(strings.TrimSpace(v))
 	if err != nil {
