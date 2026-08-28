@@ -44,6 +44,9 @@ func TestLoad_Minimal(t *testing.T) {
 	if c.ReportNamespaces {
 		t.Errorf("ReportNamespaces must default to false (privacy)")
 	}
+	if c.ObservedInventory {
+		t.Errorf("ObservedInventory must default to FALSE: the pod-label fallback needs no RBAC, so a true default would make every existing agent start reporting every helm-managed workload name on an image upgrade alone")
+	}
 	if c.Namespace != DefaultNamespace || c.SecretName != DefaultSecretName {
 		t.Errorf("secret locator defaults wrong: %s", c)
 	}
@@ -307,5 +310,39 @@ func TestResolveToken_FileErrorIsNonFatal(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("file read error should be non-fatal, got %v", err)
+	}
+}
+
+// TestLoad_ObservedInventoryKillSwitch: the observed inventory producer is OFF
+// until an operator explicitly turns it on, and a typo'd value fails fast
+// rather than silently picking a side.
+func TestLoad_ObservedInventoryKillSwitch(t *testing.T) {
+	base := map[string]string{
+		EnvClusterID: "kubehz.in.net",
+		EnvAPIURL:    "https://api.kubehz.cloud",
+	}
+	off := map[string]string{}
+	for k, v := range base {
+		off[k] = v
+	}
+	off[EnvObservedInventory] = "true"
+	c, err := Load(fakeEnv(off), noFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.ObservedInventory {
+		t.Errorf("%s=true was not applied", EnvObservedInventory)
+	}
+	if !strings.Contains(c.String(), "observedInventory=true") {
+		t.Errorf("Config.String() must surface the switch: %s", c)
+	}
+
+	bad := map[string]string{}
+	for k, v := range base {
+		bad[k] = v
+	}
+	bad[EnvObservedInventory] = "yes-please"
+	if _, err := Load(fakeEnv(bad), noFile); err == nil {
+		t.Errorf("an unparseable %s must be a hard error", EnvObservedInventory)
 	}
 }

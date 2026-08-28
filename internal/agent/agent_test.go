@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -499,6 +500,115 @@ func TestAgent_NoInventoryCRNoBlock(t *testing.T) {
 	for _, raw := range raws {
 		if strings.Contains(raw, `"inventory"`) {
 			t.Errorf("beat carried an inventory key without a CR: %s", raw)
+		}
+	}
+	mu.Unlock()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after context cancel")
+	}
+}
+
+// TestAgent_ObservedInventoryWiring: the observed producer is only as private
+// as agent.go's SetTransform call, and NOTHING tested that call — every other
+// fixture here leaves ObservedInventory false, so they pass with the feature
+// off. This turns it ON against a cluster with a real helm-release Secret and
+// asserts three things about the wire and one about the cache:
+//
+//  1. the beat carries the release NAME and chart version — i.e. the informer,
+//     the transform and the producer are actually wired to each other. Proven
+//     by mutation: replacing SetTransform with a no-op fails this, because the
+//     projection is ALSO the decode path, so an un-transformed Secret yields
+//     no inventory at all.
+//  2. no beat carries release PAYLOAD bytes. Be honest about this one: it is a
+//     belt-and-braces net, not the load-bearing assertion. Observe only ever
+//     copies name/chartVersion/appVersion onto the wire, so payload cannot
+//     reach a beat through that path today. It is here to catch a FUTURE
+//     change that widens what the producer forwards — the transform's own
+//     allow-list test in internal/inventory is what guards the cache.
+func TestAgent_ObservedInventoryWiring(t *testing.T) {
+	const marker = "SUPER-SECRET-VALUES-MARKER"
+	rel := fmt.Sprintf(`{"name":"grafana","info":{"status":"deployed","last_deployed":"2026-07-06T10:00:00Z"},`+
+		`"chart":{"metadata":{"name":"grafana","version":"8.5.1","appVersion":"11.2.0"}},`+
+		`"config":{"adminPassword":%q},"manifest":%q,"version":1}`, marker, marker)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sh.helm.release.v1.grafana.v1", Namespace: "monitoring"},
+		Type:       corev1.SecretType(inventory.HelmReleaseSecretType),
+		Data:       map[string][]byte{"release": []byte(base64.StdEncoding.EncodeToString([]byte(rel)))},
+	}
+	client := fake.NewClientset(testNode("cp-1"), secret)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			inventory.GVR:                 "ClusterInventoryList",
+			executor.MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:           "MachineList",
+		})
+
+	var mu sync.Mutex
+	var raws []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		raws = append(raws, string(b))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := &config.Config{
+		ClusterID:         "kubehz.in.net",
+		APIURL:            srv.URL,
+		AgentToken:        testToken,
+		FullInterval:      150 * time.Millisecond,
+		Debounce:          20 * time.Millisecond,
+		MinGap:            20 * time.Millisecond,
+		DesiredPoll:       time.Hour,
+		MDNamespace:       "kube-system",
+		MaxReplicas:       50,
+		ObservedInventory: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- New(cfg, client, dyn, nil).Run(ctx) }()
+
+	deadline := time.Now().Add(8 * time.Second)
+	var got string
+	for {
+		mu.Lock()
+		for _, raw := range raws {
+			if strings.Contains(raw, `"grafana"`) {
+				got = raw
+			}
+		}
+		mu.Unlock()
+		if got != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got == "" {
+		t.Fatal("no beat carried the observed release (the producer never reached the wire)")
+	}
+	if !strings.Contains(got, `"8.5.1"`) {
+		t.Errorf("beat lacks the chart version: %s", got)
+	}
+	// The whole point: the payload must never leave the cluster.
+	mu.Lock()
+	for _, raw := range raws {
+		if strings.Contains(raw, marker) {
+			t.Errorf("a beat carried RELEASE PAYLOAD bytes: %s", raw)
 		}
 	}
 	mu.Unlock()

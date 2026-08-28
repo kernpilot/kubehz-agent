@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# INVENTORY overlay = the read-only base PLUS the opt-in helm-release Secret
+# read (rbac-inventory.yaml — read its header first; it is a cluster-wide
+# secrets list/watch).
+#
+#   kubectl apply -k deploy/            # registered tier: observe + report only
+#   kubectl apply -k deploy/managed/    # + acting RBAC (worker scaling, P3)
+#   kubectl apply -k deploy/inventory/  # base + exact addon versions from helm
+#
+# The grant is ADDITIVE and binds the same ServiceAccount, so a MANAGED-tier
+# cluster that also wants it applies the one file on top of its own overlay
+# instead of choosing between them:
+#
+#   kubectl apply -k deploy/managed/
+#   kubectl apply -f deploy/inventory/rbac-inventory.yaml
+#
+# Without it the agent still reports an inventory, derived from helm's labels
+# on pods, with no permission change at all.
+resources:
+  - ../base
+  - rbac-inventory.yaml
+
+# IMAGE OVERRIDE: same rules as deploy/kustomization.yaml — the default is the
+# public digest-pinned GHCR ref; override the registry here (keeping the
+# digest) to pull from a mirror.

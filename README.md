@@ -42,7 +42,10 @@ recur — and the mapping is unit-tested as a regression guard.
   authenticated-heartbeat ratchet applies unchanged. (§1.7)
 - **Least privilege.** Read-only on nodes/pods/events and the lok8s
   `ClusterInventory`; a single name-scoped `get` on its own token Secret. No
-  logs/exec, no other secret reads. Every **acting** write —
+  logs/exec, and no other secret read unless an operator opts into the
+  helm-release inventory (`deploy/inventory/`, a cluster-wide secrets
+  `list`/`watch` — absent from the base, documented at the file, and the
+  payloads are dropped in the informer transform). Every **acting** write —
   MachineDeployment patch (replicas / kubelet version) and Machine **delete**
   (self-healing, the sharpest permission the agent holds — loudly documented
   in `deploy/managed/rbac-managed.yaml`, removable independently) — is an
@@ -93,7 +96,7 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/collector` | **typed** node/pod/event → payload mapping (the correctness core) |
 | `internal/state` | schema-2 payload types incl. `actions[]`/`machineIssues[]`/`inventory` + `ApplyCaps` (server-bound enforcement) |
 | `internal/publisher` | `Publisher` (POST+Bearer, response `availableUpdates` parse), `Backoff`, `Coalescer` (debounce), `Sender` (retry) |
-| `internal/inventory` | ClusterInventory (lok8s.dev) manager: periodic spec read → `inventory` block; idempotent `availableUpdates` status write-back |
+| `internal/inventory` | ClusterInventory (lok8s.dev) manager: periodic spec read → `inventory` block; idempotent `availableUpdates` status write-back. Plus the OBSERVED producer for clusters with no CR: helm release Secrets (payload-stripped in the informer transform) or helm's pod labels |
 | `internal/desired` | the pull loop: contract types (incl. the P5 `healing` policy), ETag-aware client, Poller |
 | `internal/machines` | grounded machine-controller API surface: GVRs, exact field paths, Machine→pool resolution |
 | `internal/machineissues` | ungated, fail-soft `machineIssues[]` collector (terminal errors, retry-loop events, join timeouts) |
@@ -202,6 +205,39 @@ itself prunes anything beyond those fields (no chart values, env overrides,
 credentials, or rendered manifests can exist in the CR), so it is the same
 privacy class as the version fields and is **not** gated by
 `KUBEHZ_REPORT_NAMESPACES`.
+
+**When there is no CR, the block is OBSERVED instead of declared.** The CR
+only exists on clusters deployed by a recent `lo`, so everywhere else the
+addon overview was dark. The agent now falls back to the cluster's own helm
+state (`internal/inventory/observed.go`), filling only what can honestly be
+observed — `addons[{name, chartVersion, appVersion, source: "helm"}]` and
+`renderedAt` (the newest release's last-deployed time, derived from the data,
+never from the clock). `lok8sVersion`/`kind`/`provider`/`specHash` stay empty:
+they are declarations, not observations. **The CR always wins when it
+exists** — it carries those fields plus curated categories. Two sources, in
+order of fidelity:
+
+1. **helm release Secrets** (`type=helm.sh/release.v1`) — exact chart and app
+   versions for every release. Informer-fed like everything else (no poll
+   loop) and folded into the same debounced push. Needs a cluster-wide
+   secrets `list`/`watch`, which is **opt-in**:
+   `deploy/inventory/rbac-inventory.yaml`, whose header explains the trust
+   decision. The informer's **transform** drops every Secret's `Data` before
+   it reaches the cache and keeps seven metadata strings, so release payloads —
+   rendered manifests and merged values — are never held and cannot be
+   reached from the rest of the process.
+2. **helm's labels on pods** (`app.kubernetes.io/managed-by=Helm` +
+   `helm.sh/chart` + `app.kubernetes.io/version`) — no new permission at all,
+   coverage limited to charts that propagate those labels to their pod
+   template. This is what a cluster without the opt-in RBAC reports.
+
+Fail-soft throughout: a Forbidden LIST is logged once and the watch is
+dropped; an undecodable or foreign Secret is skipped; an uninstalled release
+(`--keep-history` tombstone) is not reported as installed; a name-collision
+across namespaces collapses to one entry (the wire schema has no namespace).
+Nothing here can fail a beat, and a panic in the producer is recovered so it
+cannot take heartbeats down with it. `KUBEHZ_OBSERVED_INVENTORY=true` turns
+the producer ON; it is off by default.
 
 **The write-back — addon updates via plain kubectl.** The heartbeat
 *response* carries `availableUpdates: [{name, current, latest}]`, computed by
@@ -366,6 +402,7 @@ disabled — healing itself is unaffected. See
 | `KUBEHZ_DEBOUNCE` | `10s` | coalesce a change burst |
 | `KUBEHZ_MIN_GAP` | `15s` | floor between two pushes |
 | `KUBEHZ_REPORT_NAMESPACES` | `false` | opt into namespace/message reporting |
+| `KUBEHZ_OBSERVED_INVENTORY` | `false` | report the OBSERVED addon inventory (helm releases) when there is no `ClusterInventory` CR. Off by default: the pod-label source needs no RBAC, so a true default would report every helm release name on an image upgrade alone |
 | `KUBEHZ_DESIRED_POLL_SECONDS` | `60` | desired-state pull cadence (integer seconds; + ≤10% jitter) |
 | `KUBEHZ_MD_NAMESPACE` | `kube-system` | where the executor looks for MachineDeployments |
 | `KUBEHZ_MAX_REPLICAS` | `50` | per-pool ceiling; out-of-bounds desired is **refused**, not clamped |

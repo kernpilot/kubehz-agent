@@ -26,8 +26,12 @@ Security applies to every change — features, fixes, refactors, tests.
   reporting object. That write is a visibility feature: it can move no machine,
   pod, or credential. Every ACTING grant — MachineDeployment `patch`, Machine
   `delete` (P5), pods `delete` (the eviction unwedge) — lives in the opt-in
-  overlay `deploy/managed/` and is absent from the base. Any new capability must
-  justify its RBAC delta, and README.md + `deploy/README.md` must say so.
+  overlay `deploy/managed/` and is absent from the base. The one READ that is
+  also opt-in is the helm-release inventory (`deploy/inventory/`): secrets
+  `list`/`watch` cannot be narrowed by type in RBAC, so it stays out of the
+  base and the agent falls back to helm's pod labels without it. Any new
+  capability must justify its RBAC delta, and README.md + `deploy/README.md`
+  must say so.
   (This bullet used to name only nodes/pods/events + the Secret, which had gone
   stale against the shipped `deploy/` tree.)
 

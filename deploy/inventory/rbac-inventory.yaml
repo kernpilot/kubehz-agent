@@ -1,0 +1,69 @@
+# ⚠⚠ HELM RELEASE READ — OPT-IN OVERLAY. Read this before applying it. ⚠⚠
+#
+# This is the ONLY file in the repo that grants the agent a Secret permission
+# beyond the name-scoped `get` on its own token. It exists for exactly one
+# feature: the OBSERVED inventory — reporting which addons/apps are installed,
+# with their chart and app versions, so the dashboard's addon overview works on
+# clusters that carry no lok8s `ClusterInventory` CR.
+#
+# WHAT YOU ARE GRANTING. `list`/`watch` on secrets cannot be narrowed by type,
+# label, or name in RBAC — a field selector restricts what this agent REQUESTS
+# (`type=helm.sh/release.v1`), never what the ServiceAccount is ALLOWED to
+# request. Applying this file therefore lets the kubehz-live-agent
+# ServiceAccount read every Secret in the cluster. Treat it as the trust
+# decision it is; the base install deliberately does not include it.
+#
+# WHAT THE AGENT ACTUALLY DOES WITH IT (auditable in internal/inventory/helm.go):
+#   - the informer list+watch is field-selected to `type=helm.sh/release.v1`,
+#     so no other Secret is ever transferred to the pod;
+#   - `ProjectHelmRelease` runs as the informer TRANSFORM, i.e. on every object
+#     BEFORE it enters the cache: it drops `Data` unconditionally and keeps seven
+#     strings (release name, chart, chartVersion, appVersion, status, revision,
+#     last-deployed). The release payload — rendered manifests and merged
+#     values, which is where credentials live — is never cached and can never
+#     be reached from the rest of the process;
+#   - only name + chartVersion + appVersion + `source: helm` leave the cluster,
+#     the same metadata class the ClusterInventory block already carried.
+#
+# WITHOUT THIS FILE nothing breaks: the initial LIST is Forbidden, the agent
+# says so ONCE, stops that watch, and falls back to helm's labels on pods
+# (`app.kubernetes.io/managed-by=Helm` + `helm.sh/chart`), which needs no new
+# permission at all and covers every chart that propagates those labels.
+#
+# TO REPORT NO INVENTORY AT ALL, with or without this file, set
+# KUBEHZ_OBSERVED_INVENTORY=false in the ConfigMap.
+#
+# Additive to either tier — the base and the managed overlay both bind the same
+# ServiceAccount:
+#
+#   kubectl apply -k deploy/          # or deploy/managed/
+#   kubectl apply -f deploy/inventory/rbac-inventory.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubehz-live-agent-helm-inventory
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  # list/watch only — no get (the informer needs neither), and no
+  # create/update/patch/delete on any Secret, ever.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubehz-live-agent-helm-inventory
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubehz-live-agent-helm-inventory
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-live-agent
+    namespace: kubehz-system

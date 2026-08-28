@@ -12,9 +12,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,6 +53,12 @@ const (
 	// backoffBase/Max bound the Sender's retry spacing.
 	backoffBase = 1 * time.Second
 	backoffMax  = 5 * time.Minute
+	// helmSyncTimeout bounds how long the OPTIONAL helm-release Secret watch
+	// may take to sync before the agent gives up on it. Its RBAC lives in the
+	// opt-in deploy/inventory overlay, so on most clusters the initial LIST is
+	// Forbidden and the reflector would retry forever — this turns that into
+	// one log line and a fallback to pod labels.
+	helmSyncTimeout = 20 * time.Second
 )
 
 // Agent is the long-running managed-tier live-view + desired-state agent.
@@ -145,6 +153,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		default:
 		}
 	}
+
+	// OBSERVED inventory (helm releases). Optional and additive: the watch is
+	// restricted to helm's own release Secrets at the apiserver and its objects
+	// are stripped of their payload before they are cached (see
+	// inventory.ProjectHelmRelease). Nil when disabled, and unusable until (or
+	// unless) it syncs — Observe then falls back to the pod labels the live
+	// view already watches, and to nothing at all if those say nothing either.
+	helmSecrets := a.helmReleaseLister(ctx, handler, notifyChange)
 
 	pub := publisher.New(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
 
@@ -246,6 +262,31 @@ func (a *Agent) Run(ctx context.Context) error {
 		if invManager != nil {
 			payload.Inventory = invManager.Snapshot()
 		}
+		// The DECLARED inventory (the lo-written ClusterInventory CR) wins
+		// whenever it exists — it carries lok8sVersion/kind/provider/specHash
+		// and curated categories, none of which are observable. Only when
+		// there is none does the OBSERVED producer fill the block, so the
+		// addon overview stops being dark on every cluster that was not
+		// deployed by a recent lo.
+		if payload.Inventory == nil && a.cfg.ObservedInventory {
+			// Observe promises it cannot fail a beat. Nothing in this process
+			// recovers from a panic, so that promise is only as strong as the
+			// code being nil-safe everywhere — and an inventory block is the
+			// least important thing in the payload. A recover keeps a future
+			// nil-map or index slip from taking heartbeats down with it.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						a.log.Warn("observed inventory panicked; beat continues without it", "panic", r)
+						payload.Inventory = nil
+					}
+				}()
+				payload.Inventory = inventory.Observe(inventory.Sources{
+					Secrets: helmSecrets,
+					Pods:    func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
+				})
+			}()
+		}
 		state.ApplyCaps(payload)
 		sender.Enqueue(payload)
 		a.log.Debug("queued live-view push",
@@ -260,6 +301,90 @@ func (a *Agent) Run(ctx context.Context) error {
 	})
 	return ctx.Err()
 }
+
+// helmReleaseLister starts the OPTIONAL helm-release Secret informer and
+// returns a lister for it, or nil when the watch is disabled or unusable.
+//
+// Three things keep this narrow:
+//
+//   - the list+watch is field-selected to `type=helm.sh/release.v1` at the
+//     apiserver, so no other Secret is ever transferred;
+//   - inventory.ProjectHelmRelease runs as the informer TRANSFORM, dropping
+//     every Secret's Data before it reaches the cache and keeping only the six
+//     release metadata strings the heartbeat can carry;
+//   - the sync happens OFF the startup path and is time-bounded. The RBAC
+//     lives in the opt-in deploy/inventory overlay, so on a cluster without it
+//     the initial LIST is Forbidden; rather than delaying the first heartbeat
+//     or leaving a reflector retrying forever, the returned lister reports
+//     "not synced" (the caller falls back to pod labels) and the watch is
+//     stopped after one log line.
+//
+// Failure is never fatal: every path degrades and the live view continues.
+func (a *Agent) helmReleaseLister(ctx context.Context, handler cache.ResourceEventHandler, notify func()) func() ([]*corev1.Secret, error) {
+	if !a.cfg.ObservedInventory {
+		return nil
+	}
+	// Its own stop channel (not the agent's ctx): a watch that never syncs has
+	// to be stoppable on its own, without touching anything else.
+	stopCh := make(chan struct{})
+
+	factory := informers.NewSharedInformerFactoryWithOptions(a.client, resyncPeriod,
+		informers.WithTweakListOptions(func(o *metav1.ListOptions) {
+			o.FieldSelector = fields.OneTermEqualSelector("type", inventory.HelmReleaseSecretType).String()
+		}))
+	secretInf := factory.Core().V1().Secrets()
+	if err := secretInf.Informer().SetTransform(inventory.ProjectHelmRelease); err != nil {
+		// Unreachable in practice (the informer has not started yet), but a
+		// transform that did not take would mean caching release payloads —
+		// refuse the watch instead.
+		a.log.Warn("helm release watch disabled (transform not installed)", "error", err.Error())
+		close(stopCh)
+		return nil
+	}
+	if _, err := secretInf.Informer().AddEventHandler(handler); err != nil {
+		a.log.Warn("helm release watch disabled (handler not registered)", "error", err.Error())
+		close(stopCh)
+		return nil
+	}
+
+	// synced gates the lister: an unsynced cache is EMPTY, and an empty cache
+	// is indistinguishable from "this cluster runs no helm releases" — which
+	// would silently suppress the pod-label fallback. Reporting an error until
+	// the cache is real keeps the fallback honest.
+	var synced atomic.Bool
+	lister := secretInf.Lister()
+
+	go func() {
+		factory.Start(stopCh)
+		syncCtx, cancelSync := context.WithTimeout(ctx, helmSyncTimeout)
+		defer cancelSync()
+		if !cache.WaitForCacheSync(syncCtx.Done(), secretInf.Informer().HasSynced) {
+			close(stopCh)
+			a.log.Info("helm release inventory unavailable (fail-soft; needs cluster-wide secrets list/watch — deploy/inventory) — falling back to helm labels on pods",
+				"timeout", helmSyncTimeout.String())
+			return
+		}
+		synced.Store(true)
+		a.log.Info("observing helm releases for the inventory block",
+			"secretType", inventory.HelmReleaseSecretType)
+		if notify != nil {
+			notify() // ship the now-exact inventory on the next debounced push
+		}
+		<-ctx.Done()
+		close(stopCh)
+	}()
+
+	return func() ([]*corev1.Secret, error) {
+		if !synced.Load() {
+			return nil, errHelmCacheNotSynced
+		}
+		return lister.List(labels.Everything())
+	}
+}
+
+// errHelmCacheNotSynced marks "the helm-release cache is not usable (yet)" —
+// never surfaced to a user, it only tells Observe to use the pod fallback.
+var errHelmCacheNotSynced = errors.New("helm release cache not synced")
 
 func (a *Agent) setVersion(v string) {
 	a.mu.Lock()
