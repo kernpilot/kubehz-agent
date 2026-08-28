@@ -101,7 +101,7 @@ once, drops that watch, and falls back to helm's labels on pods
 (`app.kubernetes.io/managed-by=Helm` + `helm.sh/chart` +
 `app.kubernetes.io/version`) — no new permission, coverage limited to charts
 that propagate those labels. `KUBEHZ_OBSERVED_INVENTORY=true` turns the whole
-producer off.
+producer ON; it is off by default.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)
 
