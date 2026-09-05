@@ -146,7 +146,7 @@ func (p *Poller) reloadToken(ctx context.Context) bool {
 		return false
 	}
 	if changed {
-		p.log.Info("agent token changed on disk; polling desired state again with the new token")
+		p.log.Info("agent token changed at its source; polling desired state again with the new token")
 	}
 	return changed
 }

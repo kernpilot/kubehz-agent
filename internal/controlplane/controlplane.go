@@ -16,8 +16,8 @@
 //     manager), read off the SAME pod informer cache the live view uses —
 //     no extra RBAC.
 //   - certificate expiry = the earliest NotAfter across the certificates
-//     issued on CertificateSigningRequests (certificates.k8s.io, get/list —
-//     the one RBAC delta). Approved CSRs are garbage-collected an hour after
+//     issued on CertificateSigningRequests (certificates.k8s.io, list — the
+//     one RBAC delta). Approved CSRs are garbage-collected an hour after
 //     issuance, so the field is present only while a recent rotation is
 //     visible; that matches the CronJob's coverage.
 //
@@ -122,6 +122,11 @@ func ParseReadyz(body []byte, err error) (apiserver, etcd string) {
 	} else if strings.Contains(text, "[-]") {
 		apiserver = Unhealthy
 	}
+	// The per-check lines are trusted only when the overall verdict is: a
+	// failed transport with a partial body must not yield an etcd status.
+	if apiserver == "" {
+		return "", ""
+	}
 	switch {
 	case strings.Contains(text, "[-]etcd"):
 		etcd = Unhealthy
@@ -220,12 +225,6 @@ type Manager struct {
 // pods through the caller's informer lister. notify wakes the coalescer when
 // the snapshot changed; logger may be nil.
 func NewManager(client kubernetes.Interface, pods func() ([]*corev1.Pod, error), interval time.Duration, notify func(), logger *slog.Logger) *Manager {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	if interval <= 0 {
-		interval = time.Minute
-	}
 	// A fake/offline clientset has no REST client; the health URLs then read
 	// as unreachable (omitted), never as a panic in the beat loop.
 	rc := client.Discovery().RESTClient()
@@ -259,6 +258,9 @@ func newManager(probe Probe, interval time.Duration, notify func(), logger *slog
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
 	return &Manager{probe: probe, interval: interval, notify: notify, log: logger}
 }
 
@@ -277,7 +279,14 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 }
 
+// probeTimeout bounds one refresh: a hung apiserver (the moment /readyz is
+// interesting) must not park the manager forever on a stale snapshot. The
+// in-cluster rest.Config sets no Timeout of its own.
+const probeTimeout = 10 * time.Second
+
 func (m *Manager) refresh(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
 	snap := Collect(ctx, m.probe)
 	m.mu.Lock()
 	changed := !equal(m.snap, snap)

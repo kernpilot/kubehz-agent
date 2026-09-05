@@ -183,7 +183,7 @@ reachability fallback), scheduler and controller-manager from the
 kube-system static pods' Ready condition (the pod informer cache — no extra
 RBAC), and `certificates.expiresAt` as the earliest `NotAfter` across the
 certificates issued on CertificateSigningRequests (the one RBAC delta:
-`certificatesigningrequests` get/list, public material only). Approved CSRs
+`certificatesigningrequests` list, public material only). Approved CSRs
 are garbage-collected an hour after issuance, so `certificates` is present
 only while a recent rotation is visible; that matches the CronJob's
 coverage. Every probe fails soft: a failed read omits its entry, never a

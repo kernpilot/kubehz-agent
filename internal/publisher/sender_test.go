@@ -277,8 +277,9 @@ func TestSender_AuthErrorReloadsTokenFromFile(t *testing.T) {
 	}
 }
 
-// An unchanged file must not short-circuit the backoff: a revoked token that
-// was NOT rotated still backs off exactly as before.
+// An unchanged token must not short-circuit the backoff: a revoked token
+// that was NOT rotated still waits the full, growing backoff after every
+// rejection, with exactly one reload per rejection.
 func TestSender_AuthErrorUnchangedTokenStillBacksOff(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -293,21 +294,52 @@ func TestSender_AuthErrorUnchangedTokenStillBacksOff(t *testing.T) {
 		atomic.AddInt32(&reloads, 1)
 		return testToken, nil // same token: nothing rotated
 	})
-	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
-	s.afterFunc = instantAfter
+	s := NewSender(pub, time.Millisecond, time.Second, nil)
+	// Deterministic backoff (no jitter) so the waits are comparable, and a
+	// recording timer so every wait the sender takes is observable.
+	var backoffs []*Backoff
+	s.newBackoff = func() *Backoff {
+		b := NewBackoff(time.Millisecond, time.Second)
+		b.jitter = func() float64 { return 1 }
+		backoffs = append(backoffs, b)
+		return b
+	}
+	var mu sync.Mutex
+	var waits []time.Duration
+	s.afterFunc = func(d time.Duration) <-chan time.Time {
+		mu.Lock()
+		waits = append(waits, d)
+		mu.Unlock()
+		return instantAfter(d)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() { defer wg.Done(); s.Run(ctx) }()
 
 	s.Enqueue(samplePayload())
-	// One reload per rejection: wait for the third reload, then check that
-	// no request went out without a rejection before it.
-	waitFor(t, func() bool { return atomic.LoadInt32(&reloads) >= 3 }, 2*time.Second)
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(waits) >= 3
+	}, 2*time.Second)
 	cancel()
 	wg.Wait()
 
-	if c, r := atomic.LoadInt32(&calls), atomic.LoadInt32(&reloads); c < r {
-		t.Errorf("calls = %d, reloads = %d: a reload must follow a rejection, never precede a request", c, r)
+	mu.Lock()
+	defer mu.Unlock()
+	if r := atomic.LoadInt32(&reloads); int(r) < len(waits) {
+		t.Errorf("reloads = %d, waits = %d: every rejection must re-read the token before waiting", r, len(waits))
+	}
+	if len(backoffs) != 1 || backoffs[0].Attempt() < 3 {
+		t.Errorf("backoff attempts = %v, want one backoff at attempt >= 3 (never reset by an unchanged reload)", backoffs)
+	}
+	for i := 1; i < 3; i++ {
+		if waits[i] < waits[i-1] {
+			t.Errorf("waits = %v: an unchanged token must keep the growing backoff", waits)
+		}
+	}
+	if waits[1] <= waits[0] {
+		t.Errorf("waits = %v: the second wait must be longer than the first (exponential)", waits)
 	}
 }

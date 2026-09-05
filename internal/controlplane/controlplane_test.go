@@ -86,6 +86,7 @@ func TestParseReadyz(t *testing.T) {
 		{"healthy", readyzOK, nil, Healthy, Healthy},
 		{"etcd down (500 with check lines)", readyzEtcdDown, errors.New("500"), Unhealthy, Unhealthy},
 		{"transport error, no body", "", errors.New("dial tcp: refused"), "", ""},
+		{"transport error, partial body", "[+]etcd ok\n", errors.New("unexpected EOF"), "", ""},
 		{"2xx without etcd line", "[+]ping ok\nreadyz check passed\n", nil, Healthy, ""},
 	}
 	for _, tc := range cases {

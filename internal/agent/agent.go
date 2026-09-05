@@ -53,6 +53,8 @@ const (
 	// backoffBase/Max bound the Sender's retry spacing.
 	backoffBase = 1 * time.Second
 	backoffMax  = 5 * time.Minute
+	// tokenReadTimeout bounds a Secret re-read on the API-fallback path.
+	tokenReadTimeout = 10 * time.Second
 )
 
 // Agent is the long-running managed-tier live-view + desired-state agent.
@@ -299,6 +301,10 @@ func (a *Agent) tokenReloader() publisher.TokenReloader {
 	case config.TokenSourceSecret:
 		ns, name := a.cfg.Namespace, a.cfg.SecretName
 		return func(ctx context.Context) (string, error) {
+			// Bounded: a hung apiserver must not park the sender inside a
+			// token re-read (the in-cluster rest.Config sets no Timeout).
+			ctx, cancel := context.WithTimeout(ctx, tokenReadTimeout)
+			defer cancel()
 			raw, err := kube.ReadAgentToken(ctx, a.client, ns, name, config.DefaultSecretKey)
 			if err != nil {
 				return "", err

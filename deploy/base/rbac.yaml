@@ -67,12 +67,13 @@ rules:
     verbs: [patch]
   # Heartbeat certificates.expiresAt: the earliest NotAfter across the
   # certificates issued on CertificateSigningRequests (kubelet rotations).
-  # get/list only — the agent never approves, signs, creates, or deletes a
-  # CSR, and a CSR carries public material only (a request + an issued cert,
-  # never a private key). This is the CronJob agent's read, ported.
+  # `list` only — the one call is a List; the agent never gets a CSR by name
+  # and never approves, signs, creates, or deletes one. A CSR carries public
+  # material only (a request + an issued cert, never a private key). This is
+  # the CronJob agent's read, ported.
   - apiGroups: [certificates.k8s.io]
     resources: [certificatesigningrequests]
-    verbs: [get, list]
+    verbs: [list]
   # Heartbeat components[]: apiserver/etcd health from GET /readyz?verbose
   # (+ /version as the reachability fallback). Read-only, and normally already
   # granted to every authenticated principal by the default

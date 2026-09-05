@@ -67,7 +67,7 @@ Two kubehz agents can run in the same cluster:
 |---|---|---|
 | workload | CronJob `kubehz-heartbeat` (lok8s-managed) | Deployment `kubehz-live-agent` |
 | SA / RBAC / ConfigMap prefix | `kubehz-agent*` | `kubehz-live-agent*` |
-| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events/clusterinventories `get,list,watch` + CSRs `get,list` + `/readyz`,`/version` `get` + clusterinventories/status `patch` + scoped Secret `get` |
+| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events/clusterinventories `get,list,watch` + CSRs `list` + `/readyz`,`/version` `get` + clusterinventories/status `patch` + scoped Secret `get` |
 
 The name split is deliberate and load-bearing: the two RBAC sets are
 **different**, so reusing the `kubehz-agent*` names would overwrite the
