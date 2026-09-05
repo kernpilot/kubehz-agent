@@ -113,6 +113,15 @@ type Config struct {
 	// k8s API at runtime (see EnvAgentTokenFile vs the API fallback in package
 	// kube). NEVER log this field directly — use String().
 	AgentToken string
+	// TokenSource records where AgentToken came from (TokenSourceEnv,
+	// TokenSourceFile, TokenSourceSecret; "" until resolved). The agent
+	// re-reads a file or Secret token after the server rejects it — a
+	// re-enrollment (`lo kubehz re-enroll`) rotates the Secret and the
+	// kubelet refreshes the projected file — while an env token cannot change.
+	TokenSource string
+	// TokenFile is the path the token was read from when TokenSource is
+	// TokenSourceFile; "" otherwise.
+	TokenFile string
 
 	// Namespace/SecretName locate the agent Secret for the API-read fallback.
 	Namespace  string
@@ -146,6 +155,13 @@ type Config struct {
 	// "workload visibility without workload contents". A deployer opts in.
 	ReportNamespaces bool
 }
+
+// TokenSource values.
+const (
+	TokenSourceEnv    = "env"
+	TokenSourceFile   = "file"
+	TokenSourceSecret = "secret" // the k8s-API fallback, set by main
+)
 
 // HasToken reports whether a bearer token was already resolved from env/file.
 // When false, the caller reads it from the k8s API before starting.
@@ -207,11 +223,11 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 	// Token resolution order: explicit env (tests/local) → mounted file →
 	// left empty for the runtime k8s-API fallback. A present-but-malformed
 	// token is a hard error (fail fast, don't ship a 401-guaranteed bearer).
-	tok, err := resolveToken(getenv, readFile)
+	tok, source, path, err := resolveToken(getenv, readFile)
 	if err != nil {
 		return nil, err
 	}
-	c.AgentToken = tok
+	c.AgentToken, c.TokenSource, c.TokenFile = tok, source, path
 
 	if err := applyDurations(getenv, c); err != nil {
 		return nil, err
@@ -269,22 +285,41 @@ func lookupPositiveInt(getenv func(string) (string, bool), key string) (int, boo
 	return n, true, nil
 }
 
-func resolveToken(getenv func(string) (string, bool), readFile func(string) ([]byte, error)) (string, error) {
+// resolveToken returns (token, source, filePath, err). An unreadable or empty
+// file is not an error: the token may be read from the k8s API at runtime.
+func resolveToken(getenv func(string) (string, bool), readFile func(string) ([]byte, error)) (string, string, string, error) {
 	if v, ok := getenv(EnvAgentToken); ok {
 		v = strings.TrimSpace(v)
 		if v != "" {
-			return validateToken(v)
+			tok, err := validateToken(v)
+			return tok, TokenSourceEnv, "", err
 		}
 	}
 	path := lookupDefault(getenv, EnvAgentTokenFile, DefaultTokenFile)
 	b, err := readFile(path)
 	if err != nil {
-		// Not fatal: the token may be read from the k8s API at runtime instead.
-		return "", nil
+		return "", "", "", nil
 	}
 	v := strings.TrimSpace(string(b))
 	if v == "" {
-		return "", nil
+		return "", "", "", nil
+	}
+	tok, err := validateToken(v)
+	return tok, TokenSourceFile, path, err
+}
+
+// ReadTokenFile reads bearer A from path and validates its shape. Unlike the
+// startup resolution, a missing or empty file IS an error here: the caller
+// is re-reading a file that held a valid token before, so nothing else can
+// explain the absence. The error never carries the file content.
+func ReadTokenFile(readFile func(string) ([]byte, error), path string) (string, error) {
+	b, err := readFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read agent token file: %w", err)
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return "", fmt.Errorf("agent token file %s is empty", path)
 	}
 	return validateToken(v)
 }

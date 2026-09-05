@@ -7,12 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
 )
 
@@ -345,4 +347,64 @@ func TestPoller_LogsHealingArmStateAndPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+// After a rejection the poller re-reads the token (a re-enrollment rotates
+// the Secret under the running pod) and, when it changed, polls again at
+// once instead of backing off with the dead token.
+func TestPoller_AuthErrorReloadsTokenFromFile(t *testing.T) {
+	const rotated = "khz_agt_" + "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	var mu sync.Mutex
+	var bearers []string
+	srv := &desiredServer{revision: 1}
+	inner := srv.handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		bearers = append(bearers, auth)
+		mu.Unlock()
+		if auth != "Bearer "+rotated {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		inner(w, r)
+	}))
+	defer ts.Close()
+
+	tokenFile := t.TempDir() + "/agent-token"
+	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	actor := &recordingActor{}
+	p, tm := newTestPoller(t, ts.URL, actor)
+	p.client.SetTokenReloader(func(context.Context) (string, error) {
+		return config.ReadTokenFile(os.ReadFile, tokenFile)
+	})
+	// The "kubelet" refreshes the projected file with the rotated token.
+	if err := os.WriteFile(tokenFile, []byte(rotated+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); p.Run(ctx) }()
+
+	// First GET 401s with the old token; the reload makes the poller retry
+	// immediately (no wait in between), so the first park is AFTER the 200.
+	trigger := tm.next(t)
+
+	mu.Lock()
+	got := append([]string(nil), bearers...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "Bearer "+testToken || got[1] != "Bearer "+rotated {
+		t.Fatalf("bearers = %v, want [old, rotated]", got)
+	}
+	if actor.calls() != 1 || actor.doc(0).Revision != 1 {
+		t.Errorf("actor calls = %d, want 1 reconcile with the doc pulled by the rotated token", actor.calls())
+	}
+
+	cancel()
+	trigger <- time.Now()
+	wg.Wait()
 }

@@ -77,6 +77,7 @@ func main() {
 			os.Exit(1)
 		}
 		cfg.AgentToken = tok
+		cfg.TokenSource = config.TokenSourceSecret
 		log.Info("agent token resolved from in-cluster Secret (API fallback)")
 	}
 

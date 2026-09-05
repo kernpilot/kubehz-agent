@@ -50,7 +50,13 @@ func testNode(name string) *corev1.Node {
 // sync, (2) a cluster change propagates into a later snapshot, (3) cancelling
 // the context stops Run promptly and cleanly.
 func TestAgent_RunPublishesAndShutsDown(t *testing.T) {
-	client := fake.NewClientset(testNode("cp-1"))
+	// A Ready kube-scheduler static pod: the control-plane manager must turn
+	// it into components[] on the beat (the CronJob's read, ported).
+	scheduler := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-scheduler-cp-1", Namespace: "kube-system", Labels: map[string]string{"component": "kube-scheduler"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}},
+	}
+	client := fake.NewClientset(testNode("cp-1"), scheduler)
 
 	var mu sync.Mutex
 	var payloads []state.Payload
@@ -92,6 +98,27 @@ func TestAgent_RunPublishesAndShutsDown(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 	waitForPayload(t, &mu, &payloads, func(p state.Payload) bool { return len(p.Nodes) == 2 })
+
+	// (2b) components[] rides the beat: scheduler Healthy from the static pod.
+	// The fake clientset has no REST client, so /readyz reads as unreachable
+	// and apiserver/etcd are omitted — never reported Unhealthy.
+	waitForPayload(t, &mu, &payloads, func(p state.Payload) bool {
+		for _, c := range p.Components {
+			if c.Name == "scheduler" && c.Status == "Healthy" {
+				return true
+			}
+		}
+		return false
+	})
+	mu.Lock()
+	for _, p := range payloads {
+		for _, c := range p.Components {
+			if c.Name == "apiserver" || c.Name == "etcd" {
+				t.Errorf("beat reported %s=%s although /readyz was unreachable", c.Name, c.Status)
+			}
+		}
+	}
+	mu.Unlock()
 
 	// (3) Cancel stops Run promptly with the context error (clean shutdown).
 	cancel()

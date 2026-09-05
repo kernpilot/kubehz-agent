@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
 
@@ -205,4 +207,107 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %s", timeout)
+}
+
+// A re-enrollment (`lo kubehz re-enroll`) rotates the in-cluster Secret and
+// the kubelet refreshes the projected file under the running pod. The sender
+// must re-read the token after a rejection and retry with the new one — the
+// old behaviour was a 401 loop until the pod restarted.
+func TestSender_AuthErrorReloadsTokenFromFile(t *testing.T) {
+	const rotated = "khz_agt_" + "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	var mu sync.Mutex
+	var bearers []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		mu.Lock()
+		bearers = append(bearers, auth)
+		mu.Unlock()
+		if auth != "Bearer "+rotated {
+			w.WriteHeader(http.StatusUnauthorized) // the old token is revoked
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// The mounted Secret file: starts with the token the publisher was built
+	// with, then the "kubelet" swaps in the rotated one.
+	tokenFile := t.TempDir() + "/agent-token"
+	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pub := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	pub.SetTokenReloader(func(context.Context) (string, error) {
+		return config.ReadTokenFile(os.ReadFile, tokenFile)
+	})
+	if err := os.WriteFile(tokenFile, []byte(rotated+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
+	s.afterFunc = instantAfter
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); s.Run(ctx) }()
+
+	s.Enqueue(samplePayload())
+	// Two requests seen AND the slot cleared: the 200 was fully processed.
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(bearers) >= 2 && s.take() == nil
+	}, 2*time.Second)
+	cancel()
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bearers) != 2 {
+		t.Fatalf("requests = %d, want exactly 2 (one 401 with the old token, one 200 with the new)", len(bearers))
+	}
+	if bearers[0] != "Bearer "+testToken {
+		t.Errorf("first request bearer = %q, want the original token", bearers[0])
+	}
+	if bearers[1] != "Bearer "+rotated {
+		t.Errorf("retry bearer = %q, want the rotated token re-read from the file", bearers[1])
+	}
+	if s.take() != nil {
+		t.Error("payload still queued after the successful retry")
+	}
+}
+
+// An unchanged file must not short-circuit the backoff: a revoked token that
+// was NOT rotated still backs off exactly as before.
+func TestSender_AuthErrorUnchangedTokenStillBacksOff(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	pub := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	var reloads int32
+	pub.SetTokenReloader(func(context.Context) (string, error) {
+		atomic.AddInt32(&reloads, 1)
+		return testToken, nil // same token: nothing rotated
+	})
+	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
+	s.afterFunc = instantAfter
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); s.Run(ctx) }()
+
+	s.Enqueue(samplePayload())
+	// One reload per rejection: wait for the third reload, then check that
+	// no request went out without a rejection before it.
+	waitFor(t, func() bool { return atomic.LoadInt32(&reloads) >= 3 }, 2*time.Second)
+	cancel()
+	wg.Wait()
+
+	if c, r := atomic.LoadInt32(&calls), atomic.LoadInt32(&reloads); c < r {
+		t.Errorf("calls = %d, reloads = %d: a reload must follow a rejection, never precede a request", c, r)
+	}
 }

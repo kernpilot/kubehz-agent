@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/buildinfo"
 	"github.com/kernpilot/kubehz-agent/internal/collector"
 	"github.com/kernpilot/kubehz-agent/internal/config"
+	"github.com/kernpilot/kubehz-agent/internal/controlplane"
 	"github.com/kernpilot/kubehz-agent/internal/desired"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/inventory"
@@ -147,6 +149,21 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	pub := publisher.New(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+	// Token reload: after the server rejects bearer A, re-read it from where
+	// it came from. `lo kubehz re-enroll` rotates the in-cluster Secret and
+	// the kubelet refreshes the projected file, so the running pod picks the
+	// new token up without a restart. An env token cannot change (nil).
+	reloadToken := a.tokenReloader()
+	pub.SetTokenReloader(reloadToken)
+
+	// Control-plane health + certificate expiry — the two schema-1 facts the
+	// bash CronJob reported. Operator mode silences the CronJob, so the live
+	// agent carries them itself (internal/controlplane). Same shape as the
+	// inventory manager: refreshed at the full-beat cadence, fail-soft.
+	cpManager := controlplane.NewManager(a.client,
+		func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
+		a.cfg.FullInterval, notifyChange, a.log)
+	go cpManager.Run(ctx)
 
 	// ClusterInventory (lok8s.dev) manager: a light periodic GET at the
 	// full-beat cadence threads the lo-written deployment inventory (spec)
@@ -211,6 +228,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			Logger:          a.log,
 		})
 		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+		dclient.SetTokenReloader(reloadToken)
 		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
 		go poller.Run(ctx)
 		a.log.Info("desired-state pull loop started",
@@ -243,6 +261,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		// are non-empty.
 		payload.Actions = actionStore.Snapshot()
 		payload.MachineIssues = issueStore.Snapshot()
+		cp := cpManager.Snapshot()
+		payload.Components = cp.Components
+		payload.Certificates = cp.Certificates
 		if invManager != nil {
 			payload.Inventory = invManager.Snapshot()
 		}
@@ -256,9 +277,37 @@ func (a *Agent) Run(ctx context.Context) error {
 			"actions", len(payload.Actions),
 			"machineIssues", len(payload.MachineIssues),
 			"inventory", payload.Inventory != nil,
+			"components", len(payload.Components),
+			"certificates", payload.Certificates != nil,
 		)
 	})
 	return ctx.Err()
+}
+
+// tokenReloader returns how to re-read bearer A after a rejection, keyed on
+// where the startup token came from: the mounted file (the kubelet refreshes
+// it after a Secret rotation), or the Secret itself on the API-fallback
+// path (the same scoped get that resolved it at startup). An env token
+// cannot change, so there is nothing to reload (nil).
+func (a *Agent) tokenReloader() publisher.TokenReloader {
+	switch a.cfg.TokenSource {
+	case config.TokenSourceFile:
+		path := a.cfg.TokenFile
+		return func(context.Context) (string, error) {
+			return config.ReadTokenFile(os.ReadFile, path)
+		}
+	case config.TokenSourceSecret:
+		ns, name := a.cfg.Namespace, a.cfg.SecretName
+		return func(ctx context.Context) (string, error) {
+			raw, err := kube.ReadAgentToken(ctx, a.client, ns, name, config.DefaultSecretKey)
+			if err != nil {
+				return "", err
+			}
+			return config.ValidateToken(raw)
+		}
+	default:
+		return nil
+	}
 }
 
 func (a *Agent) setVersion(v string) {

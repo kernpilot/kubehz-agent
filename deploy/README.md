@@ -67,15 +67,17 @@ Two kubehz agents can run in the same cluster:
 |---|---|---|
 | workload | CronJob `kubehz-heartbeat` (lok8s-managed) | Deployment `kubehz-live-agent` |
 | SA / RBAC / ConfigMap prefix | `kubehz-agent*` | `kubehz-live-agent*` |
-| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events/clusterinventories `get,list,watch` + clusterinventories/status `patch` + scoped Secret `get` |
+| ClusterRole rules | nodes, componentstatuses, namespaces, CSRs, `/readyz`, `/version`, kube-system pod list, Secret **create** | nodes/pods/events/clusterinventories `get,list,watch` + CSRs `get,list` + `/readyz`,`/version` `get` + clusterinventories/status `patch` + scoped Secret `get` |
 
 The name split is deliberate and load-bearing: the two RBAC sets are
 **different**, so reusing the `kubehz-agent*` names would overwrite the
 CronJob's ClusterRole/Role and break its component-health heartbeat. Applying
 this kustomization never touches the CronJob agent; it may **coexist with or
-replace** it (replacing = also removing the lok8s CronJob manifests — the live
-agent does not report `components[]`/certificates yet, so keep the CronJob
-until it does).
+replace** it. The live agent reports `components[]` and `certificates` itself
+(the CronJob's reads, ported — README "The payload"), so replacing the
+CronJob loses nothing; lok8s does exactly that in operator mode
+(`KUBEHZ_HEARTBEAT_OWNER=operator` silences the CronJob so one producer
+beats).
 
 Shared objects (used, never modified, by this stack):
 

@@ -79,9 +79,18 @@ func (p *Poller) Run(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			wait = backoff.Next()
 			var authErr *publisher.AuthError
 			if errors.As(err, &authErr) {
+				// A re-enrollment rotates the Secret under the running pod.
+				// Re-read the token first (same discipline as the Sender): a
+				// CHANGED token is polled again at once with a fresh backoff.
+				if p.reloadToken(ctx) {
+					backoff.Reset()
+					continue
+				}
+			}
+			wait = backoff.Next()
+			if authErr != nil {
 				// Identity problem: surface loudly but keep retrying (recovery
 				// is a redeploy/rotation, outside the agent's authority). The
 				// full backoff wait is honored — same fix as the Sender's.
@@ -126,6 +135,20 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-p.afterFunc(wait):
 		}
 	}
+}
+
+// reloadToken re-reads bearer A after a rejection and reports whether it
+// changed. Errors are logged (never the token) and count as "unchanged".
+func (p *Poller) reloadToken(ctx context.Context) bool {
+	changed, err := p.client.ReloadToken(ctx)
+	if err != nil {
+		p.log.Warn("could not re-read the agent token after a rejection", "error", err.Error())
+		return false
+	}
+	if changed {
+		p.log.Info("agent token changed on disk; polling desired state again with the new token")
+	}
+	return changed
 }
 
 func (p *Poller) jitteredInterval() time.Duration {
