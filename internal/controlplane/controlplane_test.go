@@ -17,6 +17,9 @@ import (
 	certv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
@@ -146,11 +149,14 @@ func TestCollect_FullAndFailSoft(t *testing.T) {
 		Pods: func() ([]*corev1.Pod, error) {
 			return []*corev1.Pod{staticPod("kube-scheduler", true), staticPod("kube-controller-manager", true)}, nil
 		},
-		CSRs: func(context.Context) ([]certv1.CertificateSigningRequest, error) {
-			return []certv1.CertificateSigningRequest{issuedCSR(t, "kubelet", now.Add(48*time.Hour))}, nil
+		CSRs: func(context.Context, string) ([]certv1.CertificateSigningRequest, string, error) {
+			return []certv1.CertificateSigningRequest{issuedCSR(t, "kubelet", now.Add(48*time.Hour))}, "", nil
 		},
 	}
-	snap := Collect(context.Background(), full)
+	snap, err := Collect(context.Background(), full)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
 	want := []state.Component{
 		{Name: "apiserver", Status: Healthy},
 		{Name: "etcd", Status: Healthy},
@@ -175,9 +181,11 @@ func TestCollect_FullAndFailSoft(t *testing.T) {
 		Readyz:  func(context.Context) ([]byte, error) { return nil, errors.New("timeout") },
 		Version: func(context.Context) error { return nil },
 		Pods:    func() ([]*corev1.Pod, error) { return nil, errors.New("lister down") },
-		CSRs:    func(context.Context) ([]certv1.CertificateSigningRequest, error) { return nil, errors.New("forbidden") },
+		CSRs: func(context.Context, string) ([]certv1.CertificateSigningRequest, string, error) {
+			return nil, "", errors.New("forbidden")
+		},
 	}
-	snap = Collect(context.Background(), degraded)
+	snap, _ = Collect(context.Background(), degraded)
 	if len(snap.Components) != 1 || snap.Components[0] != (state.Component{Name: "apiserver", Status: Healthy}) {
 		t.Errorf("degraded components = %+v, want only apiserver Healthy", snap.Components)
 	}
@@ -190,7 +198,7 @@ func TestCollect_FullAndFailSoft(t *testing.T) {
 		Readyz:  func(context.Context) ([]byte, error) { return nil, errors.New("down") },
 		Version: func(context.Context) error { return errors.New("down") },
 	}
-	snap = Collect(context.Background(), dead)
+	snap, _ = Collect(context.Background(), dead)
 	if len(snap.Components) != 0 || snap.Certificates != nil {
 		t.Errorf("dead cluster → %+v, want empty", snap)
 	}
@@ -223,5 +231,78 @@ func TestManager_NotifiesOnChangeOnly(t *testing.T) {
 	snap.Components[0].Status = "tampered"
 	if m.Snapshot().Components[0].Status == "tampered" {
 		t.Error("Snapshot returned the manager's own slice")
+	}
+}
+
+// csrPager serves CSR pages through the REAL List closure (newProbe) with a
+// reactor on a fake clientset: page n carries a continue token until the
+// last one. The fake tracker ignores Limit/Continue, so the reactor is what
+// makes the client paginate.
+func csrPager(t *testing.T, pages [][]certv1.CertificateSigningRequest, endless bool) (Probe, *int32) {
+	t.Helper()
+	client := fake.NewClientset()
+	var calls int32
+	client.PrependReactor("list", "certificatesigningrequests", func(k8stesting.Action) (bool, runtime.Object, error) {
+		n := int(atomic.AddInt32(&calls, 1)) - 1
+		list := &certv1.CertificateSigningRequestList{}
+		if n < len(pages) {
+			list.Items = pages[n]
+		}
+		if endless || n < len(pages)-1 {
+			list.Continue = "page-" + string(rune('a'+n))
+		}
+		return true, list, nil
+	})
+	return newProbe(client, nil), &calls
+}
+
+// More than one page: the earliest NotAfter must come from the SECOND page,
+// which the old single List never saw.
+func TestCollect_CSRsAcrossPages(t *testing.T) {
+	base := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	probe, calls := csrPager(t, [][]certv1.CertificateSigningRequest{
+		{issuedCSR(t, "p1-a", base.Add(72*time.Hour)), issuedCSR(t, "p1-b", base.Add(96*time.Hour))},
+		{issuedCSR(t, "p2-a", base.Add(24*time.Hour))},
+		{issuedCSR(t, "p3-a", base.Add(48*time.Hour))},
+	}, false)
+	snap, err := Collect(context.Background(), probe)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if got := atomic.LoadInt32(calls); got != 3 {
+		t.Errorf("List calls = %d, want 3 (one per page)", got)
+	}
+	if snap.Certificates == nil || snap.Certificates.ExpiresAt != base.Add(24*time.Hour).Format(time.RFC3339) {
+		t.Errorf("certificates = %+v, want the second page's earliest NotAfter", snap.Certificates)
+	}
+}
+
+// A cluster whose CSR cleaner is down pages forever: stop at the budget,
+// drop the field (never report an earliest-of-a-prefix), and say so once.
+func TestCollect_CSRPageBudget(t *testing.T) {
+	base := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	probe, calls := csrPager(t, [][]certv1.CertificateSigningRequest{
+		{issuedCSR(t, "p1", base.Add(24*time.Hour))},
+	}, true)
+	snap, err := Collect(context.Background(), probe)
+	if !errors.Is(err, errCSRBudget) {
+		t.Fatalf("Collect err = %v, want errCSRBudget", err)
+	}
+	if got := atomic.LoadInt32(calls); got != csrPageBudget {
+		t.Errorf("List calls = %d, want exactly the budget (%d)", got, csrPageBudget)
+	}
+	if snap.Certificates != nil {
+		t.Errorf("certificates = %+v, want omitted past the budget", snap.Certificates)
+	}
+
+	// The manager logs the budget once and keeps serving components.
+	m := newManager(probe, time.Hour, nil, nil)
+	m.refresh(context.Background())
+	m.refresh(context.Background())
+	if !m.budgetLogged {
+		t.Error("budget hit was not recorded for the one-time log")
+	}
+	if m.Snapshot().Certificates != nil {
+		t.Error("snapshot carries certificates past the budget")
 	}
 }

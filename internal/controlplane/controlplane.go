@@ -64,9 +64,24 @@ type Probe struct {
 	Version func(ctx context.Context) error
 	// Pods lists the cached pods (kube-system is filtered here).
 	Pods func() ([]*corev1.Pod, error)
-	// CSRs lists the cluster's CertificateSigningRequests.
-	CSRs func(ctx context.Context) ([]certv1.CertificateSigningRequest, error)
+	// CSRs lists the cluster's CertificateSigningRequests ONE PAGE at a
+	// time: cont is the continue token from the previous page ("" for the
+	// first); the returned token is "" on the last page. Paged so a cluster
+	// whose CSR cleaner is down (the failure this probe would report) cannot
+	// hand the 256Mi agent tens of thousands of CSRs in one response.
+	CSRs func(ctx context.Context, cont string) ([]certv1.CertificateSigningRequest, string, error)
 }
+
+// CSR paging: csrPageSize items per List, at most csrPageBudget pages per
+// refresh. Past the budget the certificates field is DROPPED for that beat
+// (fail-soft) — an earliest-of-a-prefix would be a wrong fact, not a partial
+// one — and Collect reports errCSRBudget so the manager can log it once.
+const (
+	csrPageSize   = 500
+	csrPageBudget = 20
+)
+
+var errCSRBudget = errors.New("certificate signing requests exceed the page budget; certificates omitted")
 
 // Snapshot is what a beat carries: nil/empty means "omit the key".
 type Snapshot struct {
@@ -74,10 +89,12 @@ type Snapshot struct {
 	Certificates *state.CertInfo
 }
 
-// Collect runs every probe once. It never returns an error: each failed
-// probe drops its own entries (fail toward report-only).
-func Collect(ctx context.Context, p Probe) Snapshot {
+// Collect runs every probe once. Each failed probe drops its own entries
+// (fail toward report-only); the only error returned is errCSRBudget, which
+// is informational — the snapshot is still valid without certificates.
+func Collect(ctx context.Context, p Probe) (Snapshot, error) {
 	var snap Snapshot
+	var collectErr error
 
 	if p.Readyz != nil {
 		body, err := p.Readyz(ctx)
@@ -100,15 +117,42 @@ func Collect(ctx context.Context, p Probe) Snapshot {
 	}
 
 	if p.CSRs != nil {
-		if csrs, err := p.CSRs(ctx); err == nil {
+		exp, err := earliestCSRExpiry(ctx, p.CSRs)
+		switch {
+		case errors.Is(err, errCSRBudget):
+			collectErr = err
+		case err != nil:
+			// forbidden / unreachable: omit, like every other probe
+		case !exp.IsZero():
 			// Reported as-is even when already past: an expired cert is the
 			// loudest fact the field can carry.
-			if exp := EarliestCertExpiry(csrs); !exp.IsZero() {
-				snap.Certificates = &state.CertInfo{ExpiresAt: exp.UTC().Format(time.RFC3339)}
-			}
+			snap.Certificates = &state.CertInfo{ExpiresAt: exp.UTC().Format(time.RFC3339)}
 		}
 	}
-	return snap
+	return snap, collectErr
+}
+
+// earliestCSRExpiry folds EarliestCertExpiry over the CSR pages without
+// retaining any page. It stops at csrPageBudget pages with errCSRBudget.
+func earliestCSRExpiry(ctx context.Context, list func(context.Context, string) ([]certv1.CertificateSigningRequest, string, error)) (time.Time, error) {
+	var earliest time.Time
+	cont := ""
+	for page := 0; ; page++ {
+		if page == csrPageBudget {
+			return time.Time{}, errCSRBudget
+		}
+		items, next, err := list(ctx, cont)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if e := EarliestCertExpiry(items); !e.IsZero() && (earliest.IsZero() || e.Before(earliest)) {
+			earliest = e
+		}
+		if next == "" {
+			return earliest, nil
+		}
+		cont = next
+	}
 }
 
 // ParseReadyz maps a /readyz?verbose response to (apiserver, etcd) statuses.
@@ -216,8 +260,9 @@ type Manager struct {
 	notify   func()
 	log      *slog.Logger
 
-	mu   sync.RWMutex
-	snap Snapshot
+	mu           sync.RWMutex
+	snap         Snapshot
+	budgetLogged bool
 }
 
 // NewManager wires the real probes: /readyz and /version through the
@@ -227,8 +272,14 @@ type Manager struct {
 func NewManager(client kubernetes.Interface, pods func() ([]*corev1.Pod, error), interval time.Duration, notify func(), logger *slog.Logger) *Manager {
 	// A fake/offline clientset has no REST client; the health URLs then read
 	// as unreachable (omitted), never as a panic in the beat loop.
+	return newManager(newProbe(client, pods), interval, notify, logger)
+}
+
+// newProbe wires the real reads; split from NewManager so a test can drive
+// the paging closure against a fake clientset.
+func newProbe(client kubernetes.Interface, pods func() ([]*corev1.Pod, error)) Probe {
 	rc := client.Discovery().RESTClient()
-	probe := Probe{
+	return Probe{
 		Readyz: func(ctx context.Context) ([]byte, error) {
 			if rc == nil {
 				return nil, errNoRESTClient
@@ -243,15 +294,15 @@ func NewManager(client kubernetes.Interface, pods func() ([]*corev1.Pod, error),
 			return err
 		},
 		Pods: pods,
-		CSRs: func(ctx context.Context) ([]certv1.CertificateSigningRequest, error) {
-			list, err := client.CertificatesV1().CertificateSigningRequests().List(ctx, metav1.ListOptions{})
+		CSRs: func(ctx context.Context, cont string) ([]certv1.CertificateSigningRequest, string, error) {
+			list, err := client.CertificatesV1().CertificateSigningRequests().List(ctx,
+				metav1.ListOptions{Limit: csrPageSize, Continue: cont})
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
-			return list.Items, nil
+			return list.Items, list.Continue, nil
 		},
 	}
-	return newManager(probe, interval, notify, logger)
 }
 
 func newManager(probe Probe, interval time.Duration, notify func(), logger *slog.Logger) *Manager {
@@ -287,11 +338,20 @@ const probeTimeout = 10 * time.Second
 func (m *Manager) refresh(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	snap := Collect(ctx, m.probe)
+	snap, err := Collect(ctx, m.probe)
 	m.mu.Lock()
 	changed := !equal(m.snap, snap)
 	m.snap = snap
+	budgetHit := err != nil && !m.budgetLogged
+	if budgetHit {
+		m.budgetLogged = true
+	}
 	m.mu.Unlock()
+	if budgetHit {
+		// Once, not per refresh: the condition persists until the CSR
+		// cleaner catches up, and a per-minute line would be noise.
+		m.log.Debug("control-plane probe", "warning", err.Error(), "pageBudget", csrPageBudget, "pageSize", csrPageSize)
+	}
 	if changed {
 		m.log.Debug("control-plane snapshot changed", "components", len(snap.Components), "certificates", snap.Certificates != nil)
 		if m.notify != nil {

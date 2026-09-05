@@ -182,8 +182,10 @@ apiserver and etcd from `GET /readyz?verbose` (with `/version` as the
 reachability fallback), scheduler and controller-manager from the
 kube-system static pods' Ready condition (the pod informer cache — no extra
 RBAC), and `certificates.expiresAt` as the earliest `NotAfter` across the
-certificates issued on CertificateSigningRequests (the one RBAC delta:
-`certificatesigningrequests` list, public material only). Approved CSRs
+certificates issued on CertificateSigningRequests (paged, 500 per List,
+at most 20 pages per beat — past that the field is omitted). The RBAC delta
+is two read-only rules: `certificatesigningrequests` list (public material
+only) and `nonResourceURLs` `/readyz`, `/version` get. Approved CSRs
 are garbage-collected an hour after issuance, so `certificates` is present
 only while a recent rotation is visible; that matches the CronJob's
 coverage. Every probe fails soft: a failed read omits its entry, never a
