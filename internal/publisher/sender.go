@@ -99,9 +99,17 @@ func (s *Sender) Run(ctx context.Context) {
 				return
 			}
 
-			wait := backoff.Next()
 			var authErr *AuthError
-			if errors.As(err, &authErr) {
+			if errors.As(err, &authErr) && s.reloadToken(ctx) {
+				// A re-enrollment rotates the Secret under the running pod
+				// (the kubelet refreshes the projected file). Re-read the
+				// token first: a CHANGED token is retried at once with a
+				// fresh backoff, because the rejection was about the old one.
+				backoff.Reset()
+				continue
+			}
+			wait := backoff.Next()
+			if authErr != nil {
 				// Identity problem: surface loudly but keep retrying (recovery
 				// is a redeploy/rotation, outside the agent's authority).
 				s.log.Error("heartbeat auth rejected; will keep retrying",
@@ -131,6 +139,20 @@ func (s *Sender) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// reloadToken re-reads bearer A after a rejection and reports whether it
+// changed. Errors are logged (never the token) and count as "unchanged".
+func (s *Sender) reloadToken(ctx context.Context) bool {
+	changed, err := s.pub.ReloadToken(ctx)
+	if err != nil {
+		s.log.Warn("could not re-read the agent token after a rejection", "error", err.Error())
+		return false
+	}
+	if changed {
+		s.log.Info("agent token changed at its source; retrying the heartbeat with the new token")
+	}
+	return changed
 }
 
 // discard is an io.Writer that drops everything (default no-op logger sink).

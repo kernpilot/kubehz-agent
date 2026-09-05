@@ -30,11 +30,12 @@ const maxBodyBytes = 1 << 20
 type Client struct {
 	client    *http.Client
 	url       string
-	token     string
 	userAgent string
 
-	mu   sync.Mutex
-	etag string // last seen ETag; empty = no cached representation
+	mu     sync.Mutex
+	token  string
+	reload publisher.TokenReloader // nil = the token cannot change (env)
+	etag   string                  // last seen ETag; empty = no cached representation
 }
 
 // NewClient builds a Client. httpClient may be nil
@@ -54,6 +55,43 @@ func NewClient(apiURL, clusterID, token, agentVersion string, httpClient *http.C
 // URL is the full endpoint (exposed for logging without leaking the token).
 func (c *Client) URL() string { return c.url }
 
+// SetTokenReloader registers how to re-read bearer A after a rejection —
+// the same reloader the heartbeat Publisher uses (one credential, one
+// source). Wire it before the Poller starts; nil disables reloading.
+func (c *Client) SetTokenReloader(fn publisher.TokenReloader) {
+	c.mu.Lock()
+	c.reload = fn
+	c.mu.Unlock()
+}
+
+// ReloadToken re-reads bearer A; true when it changed. See
+// publisher.Publisher.ReloadToken for the contract.
+func (c *Client) ReloadToken(ctx context.Context) (bool, error) {
+	c.mu.Lock()
+	fn := c.reload
+	c.mu.Unlock()
+	if fn == nil {
+		return false, nil
+	}
+	tok, err := fn(ctx)
+	if err != nil {
+		return false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if tok == c.token {
+		return false, nil
+	}
+	c.token = tok
+	return true, nil
+}
+
+func (c *Client) bearer() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token
+}
+
 // Fetch performs one conditional GET. It returns:
 //   - (doc, false, nil) on 200 — a (re)changed document, ETag cached;
 //   - (nil, true, nil) on 304 — unchanged since the last 200;
@@ -72,7 +110,7 @@ func (c *Client) Fetch(ctx context.Context) (*Doc, bool, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
 	// The ONLY credential the agent ever sends: bearer A, outbound.
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.bearer())
 	if etag := c.currentETag(); etag != "" {
 		req.Header.Set("If-None-Match", etag)
 	}

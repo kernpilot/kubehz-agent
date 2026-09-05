@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kernpilot/kubehz-agent/internal/state"
@@ -29,9 +30,16 @@ const heartbeatPath = "/api/clusters/%s/heartbeat"
 
 // AuthError signals a 401/403 from the server — the token is unknown/revoked or
 // bound to another cluster. It is surfaced (not silently retried forever) so
-// operators see an identity problem, though the sender still keeps trying: the
-// only recovery is a redeploy/rotation, which is out of the agent's scope.
+// operators see an identity problem. The sender keeps trying: it re-reads
+// the token through the TokenReloader first (a re-enrollment rotates the
+// Secret under the running pod), then honors the full backoff.
 type AuthError struct{ Status int }
+
+// TokenReloader returns the CURRENT bearer A from wherever the agent was
+// configured to read it (the mounted Secret file, or the Secret itself on
+// the API-fallback path). It is called only after the server rejected the
+// token the agent holds. It must never log the token.
+type TokenReloader func(ctx context.Context) (string, error)
 
 func (e *AuthError) Error() string {
 	return fmt.Sprintf("agent token rejected by server (HTTP %d) — token unknown, revoked, or bound to another cluster", e.Status)
@@ -48,8 +56,11 @@ const maxResponseBytes = 128 << 10
 type Publisher struct {
 	client    *http.Client
 	url       string
-	token     string
 	userAgent string
+
+	mu     sync.Mutex
+	token  string
+	reload TokenReloader // nil = the token cannot change (env)
 
 	// onUpdates consumes the availableUpdates the server computes from the
 	// reported inventory and returns in the 200 body (nil = the body is
@@ -107,6 +118,44 @@ func New(apiURL, clusterID, token, agentVersion string, httpClient *http.Client)
 // URL is the full endpoint (exposed for logging without leaking the token).
 func (p *Publisher) URL() string { return p.url }
 
+// SetTokenReloader registers how to re-read bearer A after a rejection. Wire
+// it during startup, before the Sender starts; nil disables reloading.
+func (p *Publisher) SetTokenReloader(fn TokenReloader) {
+	p.mu.Lock()
+	p.reload = fn
+	p.mu.Unlock()
+}
+
+// ReloadToken re-reads bearer A through the registered reloader. It returns
+// true when the token CHANGED (the next request carries the new one). A
+// missing reloader, a read error, or an unchanged token all return false;
+// only the read error is non-nil, so the caller can log it.
+func (p *Publisher) ReloadToken(ctx context.Context) (bool, error) {
+	p.mu.Lock()
+	fn := p.reload
+	p.mu.Unlock()
+	if fn == nil {
+		return false, nil
+	}
+	tok, err := fn(ctx)
+	if err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if tok == p.token {
+		return false, nil
+	}
+	p.token = tok
+	return true, nil
+}
+
+func (p *Publisher) bearer() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.token
+}
+
 // OnAvailableUpdates registers the consumer for the availableUpdates the
 // server returns in a 2xx heartbeat response. NOT safe to call once the
 // Sender is running — wire it during startup, before the first Enqueue.
@@ -131,7 +180,7 @@ func (p *Publisher) Publish(ctx context.Context, payload *state.Payload) error {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", p.userAgent)
 	// The ONLY credential the agent ever sends: bearer A, outbound.
-	req.Header.Set("Authorization", "Bearer "+p.token)
+	req.Header.Set("Authorization", "Bearer "+p.bearer())
 
 	resp, err := p.client.Do(req)
 	if err != nil {

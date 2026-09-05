@@ -140,6 +140,48 @@ func TestLoad_TokenFromFile(t *testing.T) {
 	if c.AgentToken != validToken {
 		t.Errorf("token from file = %q, want %q", c.AgentToken, validToken)
 	}
+	if c.TokenSource != TokenSourceFile || c.TokenFile != DefaultTokenFile {
+		t.Errorf("token provenance = (%q, %q), want (file, %s)", c.TokenSource, c.TokenFile, DefaultTokenFile)
+	}
+}
+
+func TestLoad_TokenFromEnvHasNoFile(t *testing.T) {
+	c, err := Load(fakeEnv(map[string]string{
+		EnvClusterID: "d", EnvAPIURL: "https://x", EnvAgentToken: validToken,
+	}), noFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TokenSource != TokenSourceEnv || c.TokenFile != "" {
+		t.Errorf("token provenance = (%q, %q), want (env, \"\")", c.TokenSource, c.TokenFile)
+	}
+}
+
+func TestReadTokenFile(t *testing.T) {
+	files := map[string][]byte{
+		"/ok":        []byte(validToken + "\n"),
+		"/empty":     []byte("  \n"),
+		"/malformed": []byte("not-a-token"),
+	}
+	rf := func(path string) ([]byte, error) {
+		b, ok := files[path]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return b, nil
+	}
+	if tok, err := ReadTokenFile(rf, "/ok"); err != nil || tok != validToken {
+		t.Errorf("ok file: (%q, %v)", tok, err)
+	}
+	for _, path := range []string{"/empty", "/malformed", "/missing"} {
+		tok, err := ReadTokenFile(rf, path)
+		if err == nil || tok != "" {
+			t.Errorf("%s: want error and no token, got (%q, %v)", path, tok, err)
+		}
+		if err != nil && strings.Contains(err.Error(), "not-a-token") {
+			t.Errorf("%s: error leaked file content: %v", path, err)
+		}
+	}
 }
 
 func TestLoad_MalformedTokenIsError(t *testing.T) {
@@ -302,7 +344,7 @@ func TestValidateToken(t *testing.T) {
 
 func TestResolveToken_FileErrorIsNonFatal(t *testing.T) {
 	// A failing readFile must not fail Load — the API fallback covers it.
-	_, err := resolveToken(fakeEnv(nil), func(string) ([]byte, error) {
+	_, _, _, err := resolveToken(fakeEnv(nil), func(string) ([]byte, error) {
 		return nil, errors.New("permission denied")
 	})
 	if err != nil {

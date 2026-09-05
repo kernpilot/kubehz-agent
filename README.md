@@ -132,6 +132,11 @@ extended.
       "capacity": { "cpu": "4", "memory": "8148Mi" }
     }
   ],
+  "components": [                                    // control-plane health (schema-1 field, see below)
+    { "name": "apiserver", "status": "Healthy" }, { "name": "etcd", "status": "Healthy" },
+    { "name": "scheduler", "status": "Healthy" }, { "name": "controller-manager", "status": "Healthy" }
+  ],
+  "certificates": { "expiresAt": "2027-07-05T12:00:00Z" },  // earliest NotAfter on issued CSRs (absent when none)
   "workloads": {
     "pods": { "total": 42, "running": 40, "pending": 1, "failed": 1,
               "succeeded": 0, "unknown": 0 }        // counts only — no names
@@ -168,6 +173,23 @@ extended.
   // forward-compat, populated in later phases: "pools":[…], "desired":{…}
 }
 ```
+
+**`components[]` and `certificates`** are the two schema-1 facts the bash
+CronJob reports. Operator mode silences the CronJob (lok8s
+`KUBEHZ_HEARTBEAT_OWNER=operator`, exactly one producer beats), so the live
+agent reads them itself (`internal/controlplane`), the CronJob's way:
+apiserver and etcd from `GET /readyz?verbose` (with `/version` as the
+reachability fallback), scheduler and controller-manager from the
+kube-system static pods' Ready condition (the pod informer cache — no extra
+RBAC), and `certificates.expiresAt` as the earliest `NotAfter` across the
+certificates issued on CertificateSigningRequests (paged, 500 per List,
+at most 20 pages per beat — past that the field is omitted). The RBAC delta
+is two read-only rules: `certificatesigningrequests` list (public material
+only) and `nonResourceURLs` `/readyz`, `/version` get. Approved CSRs
+are garbage-collected an hour after issuance, so `certificates` is present
+only while a recent rotation is visible; that matches the CronJob's
+coverage. Every probe fails soft: a failed read omits its entry, never a
+false `Unhealthy`.
 
 **Action targets are opaque identifiers.** For `heal` the target is the
 **Machine** name (stable pre-join — a machine whose node never appeared has
@@ -380,6 +402,15 @@ Token resolution order: env → mounted file → k8s-API Secret read (fallback).
 Deployment mounts the Secret as a **read-only file** (default), so no Secret-`get`
 RBAC is exercised.
 
+**Re-enrollment without a restart.** `lo kubehz re-enroll` rotates the
+in-cluster Secret; the kubelet refreshes the projected file within its sync
+period (about a minute). When the server rejects the token (401/403), the
+heartbeat sender and the desired-state poller re-read it from where it came
+from — the mounted file, or the Secret on the API-fallback path — and, if it
+changed, retry at once with the new token. An unchanged token keeps the full
+backoff. A token given via `KUBEHZ_AGENT_TOKEN` (env) cannot change, so that
+path needs a rollout restart.
+
 ## Build, test, run
 
 ```bash
@@ -433,7 +464,19 @@ What a release publishes, per the platform spec's image supply chain (§1.5):
 | **Pinned by digest in the manifests** | `deploy/base/deployment.yaml` carries a digest, never a tag. The release renders `install.yaml` / `install-managed.yaml` with the released digest and refuses to publish if a moving tag survived. |
 | **Verifiable** | The workflow runs the same `cosign verify` and `cosign verify-attestation` commands this README gives customers, against the public image, before it publishes. A digest a customer cannot verify never ships. |
 
-Actions are pinned by commit SHA. A tag can move; a commit cannot.
+Actions are pinned by commit SHA in both lanes. A tag can move; a commit
+cannot.
+
+### How the agent is updated
+
+There is no self-update and no auto-pull: the agent runs the digest its
+manifest pins until the manifest changes. To move to a newer version, apply
+the newer `install.yaml` / `install-managed.yaml` (or re-apply `deploy/`
+after bumping the digest in `deploy/base/deployment.yaml`), or, on a lok8s
+cluster, re-run `lo kubehz deploy` after lok8s re-vendors `deploy/`
+(`internal/kubehz/manifests/live-agent/`, digest-pinned). Rolling back is
+the same step with the previous digest. Nothing on the platform side can
+change what runs in a customer's cluster.
 
 ### Publishing a release
 
@@ -465,7 +508,7 @@ dogfood convenience, so its absence must never hold up a customer release.
 - **Observed pools:** a MachineDeployment informer feeding `pools[]` (observed
   replicas/ready per pool) once the API ingests it — closes the
   desired→observed convergence loop in the dashboard; apps deployments
-  summary; CSR cert-expiry (spec §2).
+  summary.
 - **Field-level deltas:** the current push is a change-triggered *full* snapshot
   (latest-wins, matching the server JSONB). Delta encoding is a future
   optimization if payload size ever matters.
