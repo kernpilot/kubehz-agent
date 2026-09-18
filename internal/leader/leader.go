@@ -10,9 +10,10 @@
 //
 // So the agent does not act unless it can PROVE it is the only actor, and the
 // proof is a Lease in the agent's own namespace: exactly one holder at a time,
-// arbitrated by the apiserver. No Lease (no RBAC, no coordination API,
-// apiserver unreachable) means no acting — the agent keeps reporting, which is
-// the same fail-toward-report-only posture every other guard has.
+// arbitrated by the apiserver. No Lease — no RBAC, no coordination API, an
+// unreachable apiserver, or simply a peer holding it — means no acting. The
+// agent keeps reporting, the same fail-toward-report-only posture every other
+// guard has, and says so in its log (see AcquireWarnAfter).
 //
 // The callback's context is cancelled the moment the lease is lost, so the
 // acting loops stop with it; the successor starts with a FRESH cooldown
@@ -131,10 +132,10 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 	}
 
 	for {
-		// One warning per attempt if the lease stays out of reach. The agent
-		// cannot tell "another replica holds it" from "the Lease RBAC is
-		// missing" — the library retries both the same way — so it names both
-		// and keeps contending.
+		// One warning per attempt if the lease stays out of reach. The library
+		// retries a held lease, a denied one and an unreachable apiserver the
+		// same way, and none of them reaches this code as an error, so the
+		// warning names all three causes and the agent keeps contending.
 		acquired := make(chan struct{})
 		var once sync.Once
 		go func() {
@@ -143,7 +144,7 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 			case <-ctx.Done():
 			case <-time.After(cfg.AcquireWarnAfter):
 				log.Warn("no acting lease after "+cfg.AcquireWarnAfter.String()+
-					"; the agent is REPORTING but NOT acting — another replica may hold it, or the managed RBAC overlay (deploy/managed) is missing",
+					"; the agent is REPORTING but NOT acting — another replica holds it, the Lease RBAC (deploy/managed) is missing, or the apiserver is unreachable",
 					"lease", cfg.Namespace+"/"+cfg.Name, "identity", cfg.Identity)
 			}
 		}()

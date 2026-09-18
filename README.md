@@ -416,8 +416,9 @@ How they work, truthfully:
    per-*process* state, so two actors would double every one of those bounds.
    **No Lease, no acting**: without the coordination RBAC (or the API) the
    agent keeps reporting and never acts, and after two minutes without the
-   lease it says so in its log — it cannot tell a missing grant from a peer
-   holding the lease, so the one warning names both. Running more than one replica
+   lease it says so in its log — it cannot tell a peer holding the lease from
+   a missing grant or an unreachable apiserver, so the one warning names all
+   three. Running more than one replica
    is therefore safe; the live view is duplicated (latest-wins) and the acting
    is not. Upgrading from an agent that predates this: re-apply
    `deploy/managed/`.
