@@ -66,6 +66,35 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
           "$(go env GOPATH)/bin/govulncheck" ./...
 
+  integration:
+    name: integration · kind
+    # A REAL apiserver, not a fake client. Every unit test in this repository
+    # drives a fake dynamic client, so the SCALING loop — the reversible one —
+    # also runs against a throwaway kind cluster: real merge patches, real
+    # schema validation of spec.replicas, real resourceVersion (which is how
+    # "idempotent" gets measured instead of asserted). See test/integration.
+    # After the unit lane: a broken tree must not spend a cluster.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # The node image is pinned by DIGEST, like every image this repo ships.
+      # v1.35.x matches the pilot's Kubernetes and client-go v0.35.6.
+      - name: Create a throwaway kind cluster
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          cluster_name: kubehz-agent-it
+          node_image: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+
+      - name: Scaling loop against a real apiserver
+        run: go test -tags integration -count=1 -v ./test/integration/...
+
   image:
     name: build · push image
     # Publish only from main: never from PRs (no secrets to forks) and never

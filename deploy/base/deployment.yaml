@@ -10,9 +10,11 @@ metadata:
     app.kubernetes.io/part-of: kubehz
     app.kubernetes.io/component: live-view
 spec:
-  # Single replica for the pilot. HA (multiple replicas with a leader-elected
-  # Lease in kubehz-system) is a follow-up — see README "Follow-ups". Strategy
-  # Recreate avoids two agents briefly double-reporting during a rollout.
+  # Single replica by default. More than one is SAFE now: ACTING is gated on a
+  # leader-elected Lease (kubehz-system/kubehz-live-agent, RBAC in
+  # deploy/managed/), so exactly one replica ever patches a MachineDeployment
+  # or deletes a Machine while the others report. Strategy Recreate still
+  # avoids two agents briefly double-reporting during a rollout.
   replicas: 1
   strategy:
     type: Recreate
@@ -59,6 +61,15 @@ spec:
           envFrom:
             - configMapRef:
                 name: kubehz-live-agent-config
+          env:
+            # The replica's own name, for the acting Lease's holderIdentity:
+            # `kubectl get lease -n kubehz-system kubehz-live-agent` then names
+            # the pod that may act. Nothing else reads it, and it never leaves
+            # the cluster.
+            - name: KUBEHZ_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           # No ports: the agent is OUTBOUND-ONLY. It opens connections to the
           # apiserver (watch) and kubehz-api (heartbeat POST); nothing dials in,
           # so there is no containerPort and no readiness/liveness HTTP probe.

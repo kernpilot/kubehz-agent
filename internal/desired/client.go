@@ -103,6 +103,29 @@ func (c *Client) bearer() string {
 // A 4xx (including auth) never yields a document, so the caller's report-only
 // posture — act on nothing — follows for free.
 func (c *Client) Fetch(ctx context.Context) (*Doc, bool, error) {
+	return c.fetch(ctx, false)
+}
+
+// Revalidate performs one UNCONDITIONAL GET: no If-None-Match, and
+// Cache-Control/Pragma no-cache so no intermediary may answer from a stored
+// copy. It exists because a 304 proves nothing about freshness — any cache
+// between the agent and the platform can serve one from a frozen
+// representation, and the agent must not act forever on intent nobody
+// re-affirmed (see the Poller's freshness bounds).
+//
+// A 304 has no meaning without a conditional header, so one is reported as an
+// error here: the answer is a broken cache, not an affirmation.
+func (c *Client) Revalidate(ctx context.Context) (*Doc, bool, error) {
+	doc, notModified, err := c.fetch(ctx, true)
+	if err == nil && notModified {
+		return nil, false, fmt.Errorf("desired state answered 304 to an unconditional request (a cache is serving a frozen copy)")
+	}
+	return doc, notModified, err
+}
+
+// fetch is the shared request path. revalidate drops the conditional header
+// and asks every cache on the way for the origin's own answer.
+func (c *Client) fetch(ctx context.Context, revalidate bool) (*Doc, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("build request: %w", err)
@@ -111,8 +134,14 @@ func (c *Client) Fetch(ctx context.Context) (*Doc, bool, error) {
 	req.Header.Set("User-Agent", c.userAgent)
 	// The ONLY credential the agent ever sends: bearer A, outbound.
 	req.Header.Set("Authorization", "Bearer "+c.bearer())
-	if etag := c.currentETag(); etag != "" {
-		req.Header.Set("If-None-Match", etag)
+	switch {
+	case revalidate:
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+	default:
+		if etag := c.currentETag(); etag != "" {
+			req.Header.Set("If-None-Match", etag)
+		}
 	}
 
 	resp, err := c.client.Do(req)

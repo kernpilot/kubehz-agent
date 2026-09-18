@@ -19,6 +19,9 @@
 #     (surfacing machine-controller provisioning failures on the heartbeat)
 #     and the P5/P6 loops' pool/health/progress reads — PLUS delete, below.
 #     No machinesets;
+#   - the acting LEASE in kubehz-system (leader election): without it the
+#     agent refuses to act at all, because it cannot prove it is the only
+#     actor — see that object's own header;
 #   - ONE ClusterRole at the bottom (pods delete only — the P5 eviction
 #     unwedge; see its own header), the single cluster-scoped write grant in
 #     this overlay. Everything else stays namespaced.
@@ -64,6 +67,52 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: kubehz-live-agent-machinedeployments
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-live-agent
+    namespace: kubehz-system
+---
+# ACTING LEASE — leader election. Acting is single-writer: the agent patches a
+# MachineDeployment or deletes a Machine only while it holds the Lease
+# kubehz-system/kubehz-live-agent, because every remaining guardrail (per-pool
+# cooldown, in-flight budget, one pool rolling at a time) is per-PROCESS state
+# a second replica cannot see — two actors would double every bound.
+#
+# Without this Role the agent CANNOT ACT AT ALL: it logs the missing lease
+# loudly and keeps reporting (fail toward report-only). Apply this overlay
+# again when upgrading from an agent that predates leader election.
+#
+# One Lease, three verbs: create (the object is made on first acquisition),
+# get + update on that name only (hold and renew it).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubehz-live-agent-lease
+  namespace: kubehz-system
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [kubehz-live-agent]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehz-live-agent-lease
+  namespace: kubehz-system
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubehz-live-agent-lease
 subjects:
   - kind: ServiceAccount
     name: kubehz-live-agent
