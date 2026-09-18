@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +46,12 @@ const (
 	DefaultLeaseDuration = 30 * time.Second
 	DefaultRenewDeadline = 20 * time.Second
 	DefaultRetryPeriod   = 5 * time.Second
+	// DefaultAcquireWarnAfter is how long the agent waits for the lease before
+	// it says, in its OWN log, that it is reporting but not acting. Contending
+	// forever is silent by design — a standby replica must not shout — and a
+	// missing RBAC grant looks exactly the same from here, so the one warning
+	// names both causes.
+	DefaultAcquireWarnAfter = 2 * time.Minute
 )
 
 // Config configures Run. Client, Namespace and Identity are required; the
@@ -59,7 +66,10 @@ type Config struct {
 	LeaseDuration time.Duration
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
-	Logger        *slog.Logger
+	// AcquireWarnAfter bounds the silence: without the lease by then, the agent
+	// logs that it is reporting and not acting (default DefaultAcquireWarnAfter).
+	AcquireWarnAfter time.Duration
+	Logger           *slog.Logger
 }
 
 // Identity builds this process's lease identity: the pod name (the Deployment
@@ -102,6 +112,9 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 	if cfg.RetryPeriod <= 0 {
 		cfg.RetryPeriod = DefaultRetryPeriod
 	}
+	if cfg.AcquireWarnAfter <= 0 {
+		cfg.AcquireWarnAfter = DefaultAcquireWarnAfter
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -118,6 +131,23 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 	}
 
 	for {
+		// One warning per attempt if the lease stays out of reach. The agent
+		// cannot tell "another replica holds it" from "the Lease RBAC is
+		// missing" — the library retries both the same way — so it names both
+		// and keeps contending.
+		acquired := make(chan struct{})
+		var once sync.Once
+		go func() {
+			select {
+			case <-acquired:
+			case <-ctx.Done():
+			case <-time.After(cfg.AcquireWarnAfter):
+				log.Warn("no acting lease after "+cfg.AcquireWarnAfter.String()+
+					"; the agent is REPORTING but NOT acting — another replica may hold it, or the managed RBAC overlay (deploy/managed) is missing",
+					"lease", cfg.Namespace+"/"+cfg.Name, "identity", cfg.Identity)
+			}
+		}()
+
 		elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 			Lock:          lock,
 			LeaseDuration: cfg.LeaseDuration,
@@ -128,6 +158,7 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 			ReleaseOnCancel: true,
 			Callbacks: leaderelection.LeaderCallbacks{
 				OnStartedLeading: func(lctx context.Context) {
+					once.Do(func() { close(acquired) })
 					log.Info("acting leader acquired; desired-state loop starting",
 						"lease", cfg.Namespace+"/"+cfg.Name, "identity", cfg.Identity)
 					onLeading(lctx)
@@ -139,10 +170,12 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 			},
 		})
 		if err != nil {
+			once.Do(func() { close(acquired) })
 			return fmt.Errorf("leader election: %w", err)
 		}
 
 		elector.Run(ctx)
+		once.Do(func() { close(acquired) })
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

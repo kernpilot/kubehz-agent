@@ -3,13 +3,18 @@ package leader
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // testConfig is the same election, sped up: seconds instead of the production
@@ -159,5 +164,66 @@ func TestIdentity_IsUniquePerProcess(t *testing.T) {
 	}
 	if Identity("") == "" {
 		t.Error("an empty pod name must still produce an identity (hostname fallback)")
+	}
+}
+
+// syncBuffer collects log output written from the election goroutines.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// Without the Lease RBAC the agent must NOT act — and must say so in its own
+// log. The election library retries a denied lease exactly like a held one, so
+// the agent cannot tell them apart; the one warning names both causes.
+func TestRun_WithoutLeaseRBACItReportsAndDoesNotAct(t *testing.T) {
+	client := fake.NewClientset()
+	client.PrependReactor("*", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"},
+			LeaseName, errors.New("no RBAC for leases"))
+	})
+
+	var logs syncBuffer
+	cfg := testConfig(client, "replica-a")
+	cfg.AcquireWarnAfter = 200 * time.Millisecond
+	cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var mu sync.Mutex
+	acted := false
+	_ = Run(ctx, cfg, func(lctx context.Context) {
+		mu.Lock()
+		acted = true
+		mu.Unlock()
+		<-lctx.Done()
+	})
+
+	mu.Lock()
+	didAct := acted
+	mu.Unlock()
+	if didAct {
+		t.Fatal("acted without ever holding the lease")
+	}
+	out := logs.String()
+	if !strings.Contains(out, "NOT acting") {
+		t.Errorf("log = %q, want the agent to say it is reporting but not acting", out)
+	}
+	if !strings.Contains(out, "deploy/managed") {
+		t.Errorf("log = %q, want the missing RBAC overlay named as a cause", out)
 	}
 }

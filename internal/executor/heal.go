@@ -135,8 +135,8 @@ type localBounds struct {
 	perPool          map[string]int
 }
 
-// cap is how many machines of one pool this pass may remediate.
-func (b localBounds) cap(pool string) int {
+// capFor is how many machines of one pool this pass may remediate.
+func (b localBounds) capFor(pool string) int {
 	if n, ok := b.perPool[pool]; ok {
 		return n
 	}
@@ -317,7 +317,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			wait := (cooldown - now.Sub(e.lastHealTime(c.pool))).Truncate(time.Second)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("cooldown: next remediation in pool %s allowed in %s", c.pool, wait))
-		case remediated[c.pool] >= bounds.cap(c.pool):
+		case remediated[c.pool] >= bounds.capFor(c.pool):
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("waiting: pool %s already had %d remediation(s) this pass — one pass remediates at most %d/%d of a pool",
 					c.pool, remediated[c.pool], healFractionNumerator, healFractionDenominator))
