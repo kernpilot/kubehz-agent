@@ -430,7 +430,8 @@ func TestHeal_HaltsOnDeleteFailure(t *testing.T) {
 	})
 	// The two failures are STAGGERED on purpose: two nodes failing inside
 	// simultaneousFailureWindow is an outage signature and would be refused
-	// before any delete is attempted (see TestHeal_RefusesSimultaneousFailure).
+	// before any delete is attempted (see
+	// TestHeal_RefusesSimultaneousClusterFailure).
 	exec, store := newHealExecutor(dyn, []*corev1.Node{
 		notReadyNode("w-1", corev1.ConditionFalse, t0.Add(-time.Hour), false),
 		notReadyNode("w-2", corev1.ConditionFalse, t0.Add(-20*time.Minute), false),

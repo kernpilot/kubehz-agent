@@ -16,7 +16,9 @@ in-cluster agent-token the bash heartbeat uses.
 > capability is **server-gated** (the `/desired` `execution{}` flags computed
 > from tier × access × platform kill switch) with hard, unit-tested
 > guardrails; anything authorized-but-unbuilt is reported as an unsupported
-> action, never improvised. Control-plane upgrades stay user-driven.
+> action, never improvised. Acting is single-writer (a leader-elected Lease),
+> so running more than one replica is safe. Control-plane upgrades stay
+> user-driven.
 
 It complements, and does not replace, the lightweight bash **heartbeat CronJob**
 (registered tier). The Go rewrite exists because node facts must be **correct**:
@@ -413,8 +415,9 @@ How they work, truthfully:
    per-pool cooldown, the in-flight budget and the one-pool-at-a-time roll are
    per-*process* state, so two actors would double every one of those bounds.
    **No Lease, no acting**: without the coordination RBAC (or the API) the
-   agent logs the missing lease loudly and keeps reporting — it never acts
-   while it cannot prove it is the only actor. Running more than one replica
+   agent keeps reporting and never acts, and after two minutes without the
+   lease it says so in its log — it cannot tell a missing grant from a peer
+   holding the lease, so the one warning names both. Running more than one replica
    is therefore safe; the live view is duplicated (latest-wins) and the acting
    is not. Upgrading from an agent that predates this: re-apply
    `deploy/managed/`.

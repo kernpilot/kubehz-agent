@@ -201,7 +201,16 @@ func ensureMachineDeploymentCRD(ctx context.Context, t *testing.T, dyn dynamic.I
 	crd := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apiextensions.k8s.io/v1",
 		"kind":       "CustomResourceDefinition",
-		"metadata":   map[string]any{"name": mdCRDName},
+		"metadata": map[string]any{
+			"name": mdCRDName,
+			// cluster.k8s.io is a PROTECTED group (*.k8s.io), so the apiserver
+			// rejects a CRD in it without this annotation. The value is the one
+			// machine-controller itself ships (examples/machine-controller.yaml),
+			// so the fixture is the same shape a real cluster carries.
+			"annotations": map[string]any{
+				"api-approved.kubernetes.io": "unapproved, legacy API",
+			},
+		},
 		"spec": map[string]any{
 			"group": "cluster.k8s.io",
 			"names": map[string]any{
@@ -319,20 +328,20 @@ func withAutoscaler() func(map[string]any) {
 }
 
 // create writes one fixture, retrying while the freshly established CRD is
-// still propagating to every apiserver handler.
+// still propagating to every apiserver handler. A timeout reports the LAST
+// error: "the resource never accepted it" is not a diagnosis.
 func create(ctx context.Context, t *testing.T, client dynamic.ResourceInterface, obj *unstructured.Unstructured) {
 	t.Helper()
-	var lastErr error
-	waitFor(t, "the MachineDeployment resource to accept "+obj.GetName(), func() bool {
+	deadline := time.Now().Add(waitTimeout)
+	for {
 		_, err := client.Create(ctx, obj, metav1.CreateOptions{})
 		if err == nil || apierrors.IsAlreadyExists(err) {
-			return true
+			return
 		}
-		lastErr = err
-		return false
-	})
-	if lastErr != nil {
-		t.Logf("create %s succeeded after retries (last error: %v)", obj.GetName(), lastErr)
+		if time.Now().After(deadline) {
+			t.Fatalf("create %s: still rejected after %s: %v", obj.GetName(), waitTimeout, err)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
