@@ -24,7 +24,7 @@ status subresource cannot touch the lo-owned spec. Dropping the rule only
 loses the kubectl mirror (the agent warns once and keeps beating).
 
 `deploy/managed/` is the base **plus** `rbac-managed.yaml`, which grants
-exactly three things to the `kubehz-live-agent` ServiceAccount:
+exactly four things to the `kubehz-live-agent` ServiceAccount:
 
 1. **MachineDeployment patch** (namespaced Role, kube-system):
    `get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
@@ -46,6 +46,15 @@ exactly three things to the `kubehz-live-agent` ServiceAccount:
    unreachable. It has to be a ClusterRole (the stuck pods span arbitrary
    namespaces); drop it and the unwedge is disabled while healing keeps
    working.
+
+4. **The acting Lease** (namespaced Role, kubehz-system): `create` on
+   `leases.coordination.k8s.io` plus `get,update` on the single name
+   `kubehz-live-agent`. Acting is single-writer — the per-pool cooldown, the
+   in-flight budget and the one-pool-at-a-time roll are per-process state
+   that a second replica cannot see, so two actors would double every bound.
+   **Without this Role the agent does not act at all**: it logs the missing
+   lease and keeps reporting. Upgrading from an agent that predates leader
+   election means re-applying this overlay.
 
 Every write is executed only when the platform's `/desired` document
 authorizes it — the overlay grants ability, never intent.
