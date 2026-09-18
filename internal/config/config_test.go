@@ -351,3 +351,33 @@ func TestResolveToken_FileErrorIsNonFatal(t *testing.T) {
 		t.Errorf("file read error should be non-fatal, got %v", err)
 	}
 }
+
+// KUBEHZ_POD_NAME names this replica in the acting Lease. A malformed value is
+// IGNORED, never fatal: the live view must not fail to start over a label.
+func TestLoad_PodName(t *testing.T) {
+	for name, tc := range map[string]struct {
+		value string
+		want  string
+	}{
+		"downward API value": {value: "kubehz-live-agent-6d4f9b7c4-x9k2p", want: "kubehz-live-agent-6d4f9b7c4-x9k2p"},
+		"unset":              {value: "", want: ""},
+		"malformed":          {value: "not a pod name", want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{
+				EnvClusterID: "kubehz.in.net",
+				EnvAPIURL:    "https://api.kubehz.cloud",
+			}
+			if tc.value != "" {
+				env[EnvPodName] = tc.value
+			}
+			cfg, err := Load(fakeEnv(env), noFile)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.PodName != tc.want {
+				t.Errorf("PodName = %q, want %q", cfg.PodName, tc.want)
+			}
+		})
+	}
+}
