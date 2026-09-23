@@ -48,6 +48,12 @@ jobs:
             echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
           fi
 
+      - name: Render deploy/base (the manifest lok8s vendors)
+        run: |
+          kubectl kustomize deploy/base > /tmp/deploy-base.yaml
+          grep -q 'node-role.kubernetes.io/control-plane' /tmp/deploy-base.yaml
+          grep -q 'name: kubehz-live-agent' /tmp/deploy-base.yaml
+          echo "deploy/base renders: $(grep -c '^kind:' /tmp/deploy-base.yaml) objects"
       - name: go vet
         run: go vet ./...
 
