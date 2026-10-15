@@ -286,3 +286,54 @@ func TestClient_EscapesClusterID(t *testing.T) {
 		t.Errorf("cluster ID not escaped: %s", c.URL())
 	}
 }
+
+// Revalidate must ask the ORIGIN: no If-None-Match, plus no-cache so no
+// intermediary may answer from a stored copy. It exists because a 304 proves
+// nothing about freshness — anything in the path can serve one forever.
+func TestClient_RevalidateBypassesCaches(t *testing.T) {
+	const etag = `"3-10"`
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write([]byte(docBody))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	if _, _, err := c.Fetch(context.Background()); err != nil { // caches the ETag
+		t.Fatalf("priming fetch: %v", err)
+	}
+	doc, notModified, err := c.Revalidate(context.Background())
+	if err != nil || notModified || doc == nil {
+		t.Fatalf("revalidate: doc=%v notModified=%v err=%v", doc, notModified, err)
+	}
+	if v := got.Get("If-None-Match"); v != "" {
+		t.Errorf("revalidation sent If-None-Match %q — a conditional request can be answered 304 by any cache", v)
+	}
+	if v := got.Get("Cache-Control"); v != "no-cache" {
+		t.Errorf("revalidation Cache-Control = %q, want no-cache", v)
+	}
+}
+
+// A 304 to an unconditional request is a broken cache answering, never an
+// affirmation — the client reports it as an error so the poller counts the
+// poll as unaffirmed.
+func TestClient_Revalidate304IsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	doc, notModified, err := c.Revalidate(context.Background())
+	if err == nil {
+		t.Fatalf("revalidate accepted a 304: doc=%v notModified=%v", doc, notModified)
+	}
+	if !strings.Contains(err.Error(), "304") {
+		t.Errorf("error = %q, want it to name the 304", err.Error())
+	}
+	if doc != nil || notModified {
+		t.Errorf("a rejected revalidation must yield no document: doc=%v notModified=%v", doc, notModified)
+	}
+}

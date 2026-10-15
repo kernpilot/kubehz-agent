@@ -37,6 +37,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/inventory"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
+	"github.com/kernpilot/kubehz-agent/internal/leader"
 	"github.com/kernpilot/kubehz-agent/internal/machineissues"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
 	"github.com/kernpilot/kubehz-agent/internal/state"
@@ -216,30 +217,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	if a.dyn != nil {
-		exec := executor.New(a.dyn, actionStore, executor.Options{
-			Namespace:       a.cfg.MDNamespace,
-			MaxReplicas:     a.cfg.MaxReplicas,
-			ObservedVersion: a.getVersion,
-			// Node health for the P5 healer comes from the SAME informer cache
-			// the live view reports from — one watch, one truth. Pods feed the
-			// post-heal eviction unwedge (executor/unwedge.go) from the same
-			// cache.
-			Nodes:           func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) },
-			Pods:            func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) },
-			EvictionTimeout: a.cfg.HealEvictionTimeout,
-			Logger:          a.log,
-		})
-		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
-		dclient.SetTokenReloader(reloadToken)
-		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
-		go poller.Run(ctx)
-		a.log.Info("desired-state pull loop started",
-			"endpoint", dclient.URL(),
-			"interval", a.cfg.DesiredPoll.String(),
-			"mdNamespace", a.cfg.MDNamespace,
-			"maxReplicas", a.cfg.MaxReplicas,
-			"healEvictionTimeout", a.cfg.HealEvictionTimeout.String(),
-		)
+		// Node health for the P5 healer comes from the SAME informer cache the
+		// live view reports from — one watch, one truth. Pods feed the
+		// post-heal eviction unwedge (executor/unwedge.go) from the same cache.
+		nodes := func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) }
+		pods := func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) }
+		go a.runActingLoop(ctx, actionStore, nodes, pods, reloadToken)
 	} else {
 		a.log.Warn("desired-state loop disabled (no dynamic client) — running report-only")
 	}
@@ -284,6 +267,68 @@ func (a *Agent) Run(ctx context.Context) error {
 		)
 	})
 	return ctx.Err()
+}
+
+// runActingLoop runs the desired-state pull loop under LEADER ELECTION: it
+// blocks on the acting Lease and starts the Poller/Executor only while this
+// replica holds it (internal/leader explains why acting must be single-writer
+// while reporting need not be). Losing the lease stops the loop and clears the
+// action reports, so this replica stops asserting outcomes the new leader now
+// owns. A leader-election failure — no Lease RBAC, no coordination API — is
+// loud and leaves the agent reporting, never acting.
+func (a *Agent) runActingLoop(
+	ctx context.Context,
+	actionStore *actions.Store,
+	nodes executor.NodeSource,
+	pods executor.PodSource,
+	reloadToken publisher.TokenReloader,
+) {
+	// The Lease lives beside the agent. A caller that built its Config by hand
+	// may have left the namespace empty; fall back to the same default Load
+	// uses rather than refusing to act over a missing string.
+	namespace := a.cfg.Namespace
+	if namespace == "" {
+		namespace = config.DefaultNamespace
+	}
+	cfg := leader.Config{
+		Client:    a.client,
+		Namespace: namespace,
+		Identity:  leader.Identity(a.cfg.PodName),
+		Logger:    a.log,
+	}
+	a.log.Info("desired-state loop waiting for the acting lease (exactly one replica may act)",
+		"lease", namespace+"/"+leader.LeaseName, "identity", cfg.Identity)
+
+	err := leader.Run(ctx, cfg, func(lctx context.Context) {
+		exec := executor.New(a.dyn, actionStore, executor.Options{
+			Namespace:       a.cfg.MDNamespace,
+			MaxReplicas:     a.cfg.MaxReplicas,
+			ObservedVersion: a.getVersion,
+			Nodes:           nodes,
+			Pods:            pods,
+			EvictionTimeout: a.cfg.HealEvictionTimeout,
+			Logger:          a.log,
+		})
+		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+		dclient.SetTokenReloader(reloadToken)
+		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
+		a.log.Info("desired-state pull loop started",
+			"endpoint", dclient.URL(),
+			"interval", a.cfg.DesiredPoll.String(),
+			"mdNamespace", a.cfg.MDNamespace,
+			"maxReplicas", a.cfg.MaxReplicas,
+			"healEvictionTimeout", a.cfg.HealEvictionTimeout.String(),
+		)
+		poller.Run(lctx)
+		// Leadership ended (or the agent is shutting down): drop the reports.
+		// The next beat carries no actions[], which the server reads as
+		// "clear", and the new leader reports its own outcomes.
+		actionStore.Clear()
+	})
+	if err != nil && ctx.Err() == nil {
+		a.log.Error("acting lease unavailable — the agent will NOT act; is the managed RBAC overlay (deploy/managed) applied?",
+			"lease", namespace+"/"+leader.LeaseName, "error", err.Error())
+	}
 }
 
 // tokenReloader returns how to re-read bearer A after a rejection, keyed on

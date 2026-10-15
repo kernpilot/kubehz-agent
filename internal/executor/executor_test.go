@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -355,5 +356,180 @@ func TestReconcile_InvalidPoolName(t *testing.T) {
 	}
 	if patchCount(dyn) != 0 {
 		t.Errorf("invalid name reached the API")
+	}
+}
+
+// typedMD is an MD whose template declares a Hetzner server type, the way
+// machine-controller stores it (raw provider JSON under providerSpec.value).
+func typedMD(name string, replicas int64, serverType string) *unstructured.Unstructured {
+	u := md(name, replicas)
+	if err := unstructured.SetNestedMap(u.Object, map[string]any{
+		"cloudProvider":     "hetzner",
+		"cloudProviderSpec": map[string]any{"serverType": serverType},
+	}, "spec", "template", "spec", "providerSpec", "value"); err != nil {
+		panic(err)
+	}
+	return u
+}
+
+// The document's machineType is DECODED and REPORTED, never applied: changing
+// it would replace every server in the pool, and the same template carries the
+// image, network and SSH keys. It used to be read and dropped in silence.
+func TestReconcile_MachineTypeDivergenceIsReported(t *testing.T) {
+	dyn := fakeDyn(typedMD("pool-a", 2, "cpx31"))
+	exec, store := newExecutor(dyn)
+
+	exec.Reconcile(context.Background(), scalingDoc(7, desired.WorkerPool{
+		Name: "pool-a", MachineType: "cpx41", DesiredReplicas: 3,
+	}))
+
+	a := findAction(t, store, "pool-a")
+	if a.Status != state.ActionDone {
+		t.Fatalf("action = %+v, want the scale to succeed", a)
+	}
+	if !strings.Contains(a.Detail, "machineType cpx41 not applied") || !strings.Contains(a.Detail, "cpx31") {
+		t.Errorf("detail = %q, want it to name the requested and the running machine type", a.Detail)
+	}
+	// Replicas moved; the template did not.
+	if got := replicasOf(t, dyn, "pool-a"); got != 3 {
+		t.Errorf("replicas = %d, want 3", got)
+	}
+	current, err := dyn.Resource(MachineDeploymentGVR).Namespace(ns).Get(context.Background(), "pool-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := machines.MDMachineType(current); got != "cpx31" {
+		t.Errorf("machine type = %q, want the untouched cpx31", got)
+	}
+}
+
+// No note when the types agree, and none when the template's type cannot be
+// read — unknown is never reported as a mismatch.
+func TestReconcile_MachineTypeQuietWhenMatchedOrUnknown(t *testing.T) {
+	for name, tc := range map[string]struct {
+		md     *unstructured.Unstructured
+		wanted string
+	}{
+		"same type":    {md: typedMD("pool-a", 2, "cpx31"), wanted: "cpx31"},
+		"unknown type": {md: md("pool-a", 2), wanted: "cpx41"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dyn := fakeDyn(tc.md)
+			exec, store := newExecutor(dyn)
+
+			exec.Reconcile(context.Background(), scalingDoc(7, desired.WorkerPool{
+				Name: "pool-a", MachineType: tc.wanted, DesiredReplicas: 3,
+			}))
+
+			if a := findAction(t, store, "pool-a"); strings.Contains(a.Detail, "machineType") {
+				t.Errorf("detail = %q, want no machineType note", a.Detail)
+			}
+		})
+	}
+}
+
+// POOL CREATE is out of scope: the refusal must say so, so the platform stops
+// waiting for a MachineDeployment the agent will never make.
+func TestReconcile_MissingPoolSaysTheAgentNeverCreatesPools(t *testing.T) {
+	dyn := fakeDyn(md("pool-a", 2))
+	exec, store := newExecutor(dyn)
+
+	exec.Reconcile(context.Background(), scalingDoc(1,
+		desired.WorkerPool{Name: "ghost", DesiredReplicas: 3}))
+
+	a := findAction(t, store, "ghost")
+	if a.Status != state.ActionFailed || !strings.Contains(a.Detail, "never creates pools") {
+		t.Errorf("action = %+v, want a refusal that names the permanent behaviour", a)
+	}
+	for _, act := range dyn.Actions() {
+		if act.GetVerb() == "create" {
+			t.Fatalf("the agent created a MachineDeployment: %+v", act)
+		}
+	}
+}
+
+// POOL DELETE is out of scope too: a MachineDeployment the document does not
+// declare is never touched, never reported as a failure, and named once in the
+// log so an operator can remove it deliberately.
+func TestReconcile_UndeclaredPoolIsLeftAloneAndLogged(t *testing.T) {
+	dyn := fakeDyn(md("pool-a", 2), md("pool-legacy", 4))
+	store := actions.New(nil)
+	var logs strings.Builder
+	exec := New(dyn, store, Options{
+		Namespace:   ns,
+		MaxReplicas: 50,
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+
+	exec.Reconcile(context.Background(), scalingDoc(3,
+		desired.WorkerPool{Name: "pool-a", DesiredReplicas: 2}))
+
+	for _, act := range dyn.Actions() {
+		if act.GetVerb() == "delete" {
+			t.Fatalf("the agent deleted a MachineDeployment: %+v", act)
+		}
+	}
+	if got := replicasOf(t, dyn, "pool-legacy"); got != 4 {
+		t.Errorf("undeclared pool replicas = %d, want the untouched 4", got)
+	}
+	for _, a := range store.Snapshot() {
+		if a.Target == "pool-legacy" {
+			t.Errorf("undeclared pool reported as an action: %+v", a)
+		}
+	}
+	if !strings.Contains(logs.String(), "pool-legacy") || !strings.Contains(logs.String(), "never deletes a pool") {
+		t.Errorf("log = %q, want the undeclared pool named once", logs.String())
+	}
+}
+
+// A document the platform stopped serving must not act — and the refusal has
+// to reach the heartbeat, one report per declared pool for every armed loop.
+func TestRefuseStale_ReportsEveryArmedLoop(t *testing.T) {
+	dyn := fakeDyn(md("pool-a", 2))
+	exec, store := newExecutor(dyn)
+	version := "v1.35.6"
+
+	exec.RefuseStale(context.Background(), &desired.Doc{
+		Revision:          9,
+		KubernetesVersion: &version,
+		WorkerPools:       []desired.WorkerPool{{Name: "pool-a", DesiredReplicas: 3}},
+		Execution:         desired.Execution{Scaling: true, Upgrades: true, Healing: true},
+		Healing:           desired.Healing{Enabled: true, MaxUnhealthy: 2},
+	}, "refusing to act: the platform has not served this document again")
+
+	byType := map[string]state.Action{}
+	for _, a := range store.Snapshot() {
+		byType[a.Type] = a
+	}
+	for _, typ := range []string{state.ActionScale, state.ActionUpgrade, state.ActionHeal} {
+		a, ok := byType[typ]
+		if !ok {
+			t.Fatalf("no %s refusal reported: %+v", typ, store.Snapshot())
+		}
+		if a.Status != state.ActionFailed || a.Target != "pool-a" || a.Revision != 9 {
+			t.Errorf("%s action = %+v, want a failed pool-a report at revision 9", typ, a)
+		}
+		if !strings.Contains(a.Detail, "has not served this document") {
+			t.Errorf("%s detail = %q, want the poller's reason verbatim", typ, a.Detail)
+		}
+	}
+	if len(dyn.Actions()) != 0 {
+		t.Errorf("a refusal must touch the cluster not at all: %+v", dyn.Actions())
+	}
+}
+
+// Nothing armed, nothing reported: a report-only document has no acting to
+// refuse.
+func TestRefuseStale_SilentWhenNothingIsArmed(t *testing.T) {
+	dyn := fakeDyn(md("pool-a", 2))
+	exec, store := newExecutor(dyn)
+
+	exec.RefuseStale(context.Background(), &desired.Doc{
+		Revision:    9,
+		WorkerPools: []desired.WorkerPool{{Name: "pool-a", DesiredReplicas: 3}},
+	}, "refusing to act")
+
+	if got := store.Snapshot(); got != nil {
+		t.Errorf("report-only document produced refusals: %+v", got)
 	}
 }

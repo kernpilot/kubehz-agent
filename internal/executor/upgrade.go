@@ -186,7 +186,7 @@ func (e *Executor) upgradePools(ctx context.Context, doc *desired.Doc) (retry bo
 				"queued: an earlier action failed; retrying next poll")
 		case st.md == nil:
 			e.reportUpgrade(doc.Revision, name, state.ActionFailed,
-				fmt.Sprintf("no MachineDeployment named %q in namespace %q (pools are matched to MDs by name)", name, e.namespace))
+				fmt.Sprintf("no MachineDeployment named %q in namespace %q — the agent never creates pools; create it with your own tooling (lo provision / kubeone apply)", name, e.namespace))
 		case st.current == "":
 			e.reportUpgrade(doc.Revision, name, state.ActionFailed,
 				"MachineDeployment has no spec.template.spec.versions.kubelet; refusing to invent one")

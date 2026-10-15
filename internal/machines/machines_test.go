@@ -155,3 +155,55 @@ func TestDeletingAndAge(t *testing.T) {
 		t.Fatal("machine with deletionTimestamp not reported deleting")
 	}
 }
+
+// The pool template's machine type is read from the raw provider JSON
+// machine-controller stores. The agent reports a divergence from the desired
+// document and never applies one, so an UNREADABLE type must read as "" —
+// unknown is not a mismatch.
+func TestMDMachineType(t *testing.T) {
+	withProvider := func(value map[string]any) *unstructured.Unstructured {
+		u := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "cluster.k8s.io/v1alpha1",
+			"kind":       "MachineDeployment",
+			"metadata":   map[string]any{"name": "pool-a"},
+		}}
+		if value != nil {
+			if err := unstructured.SetNestedMap(u.Object, value,
+				"spec", "template", "spec", "providerSpec", "value"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return u
+	}
+
+	for name, tc := range map[string]struct {
+		value map[string]any
+		want  string
+	}{
+		"hetzner serverType": {
+			value: map[string]any{"cloudProviderSpec": map[string]any{"serverType": "cpx31"}},
+			want:  "cpx31",
+		},
+		"ConfigVarString object": {
+			value: map[string]any{"cloudProviderSpec": map[string]any{
+				"serverType": map[string]any{"value": "cx53"}}},
+			want: "cx53",
+		},
+		"instanceType fallback": {
+			value: map[string]any{"cloudProviderSpec": map[string]any{"instanceType": "m5.large"}},
+			want:  "m5.large",
+		},
+		"secret reference has no literal": {
+			value: map[string]any{"cloudProviderSpec": map[string]any{
+				"serverType": map[string]any{"secretKeyRef": map[string]any{"name": "s", "key": "k"}}}},
+			want: "",
+		},
+		"no provider spec at all": {value: nil, want: ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := MDMachineType(withProvider(tc.value)); got != tc.want {
+				t.Errorf("MDMachineType = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

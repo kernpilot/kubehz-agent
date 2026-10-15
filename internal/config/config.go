@@ -47,6 +47,12 @@ const (
 	// not an enable switch): a desiredReplicas outside 0..max is REFUSED and
 	// reported failed — never rewritten to the bound and applied.
 	EnvMaxReplicas = "KUBEHZ_MAX_REPLICAS"
+	// EnvPodName carries this pod's own name (the Deployment injects it through
+	// the downward API). It is used for ONE thing: the acting lease's holder
+	// identity, so `kubectl get lease -n kubehz-system` names the replica that
+	// may act. Unset or malformed falls back to the hostname — never a startup
+	// failure, because a missing identity must not cost the live view.
+	EnvPodName = "KUBEHZ_POD_NAME"
 	// EnvHealEvictionTimeoutSeconds is how long a HEAL-DELETED machine may sit
 	// deleting before the eviction unwedge force-deletes the pods stuck
 	// Terminating on its (still-unreachable) node. Whole seconds; floored at
@@ -97,6 +103,11 @@ var agentTokenRE = regexp.MustCompile(`^khz_agt_[0-9a-f]{64}$`)
 // KUBEHZ_MD_NAMESPACE feeds API request paths, so it is validated up front.
 var namespaceRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
+// podNameRE is the DNS-1123 subdomain shape every pod name has. The value
+// becomes a Lease holderIdentity, so anything else is ignored rather than
+// written into a cluster object.
+var podNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
+
 // clusterIDRE constrains CLUSTER_ID to a DNS-name-like shape (the cluster
 // domain, e.g. "kubehz.in.net"). The value is embedded in the heartbeat URL
 // path, so anything with separators/whitespace ('/', '?', '#', spaces, …) is
@@ -124,8 +135,14 @@ type Config struct {
 	TokenFile string
 
 	// Namespace/SecretName locate the agent Secret for the API-read fallback.
+	// Namespace also holds the acting Lease (leader election).
 	Namespace  string
 	SecretName string
+
+	// PodName identifies this replica in the acting Lease ("" = use the
+	// hostname). It is never sent anywhere: the lease is a cluster-local
+	// object.
+	PodName string
 
 	FullInterval time.Duration
 	Debounce     time.Duration
@@ -199,6 +216,12 @@ func Load(getenv func(string) (string, bool), readFile func(string) ([]byte, err
 	}
 	if !namespaceRE.MatchString(c.MDNamespace) {
 		return nil, fmt.Errorf("%s must be a DNS-1123 label (got %q)", EnvMDNamespace, c.MDNamespace)
+	}
+
+	// A malformed pod name is IGNORED, not fatal: it only labels the lease
+	// holder, and the live view must never fail to start over a label.
+	if name := strings.TrimSpace(lookupDefault(getenv, EnvPodName, "")); podNameRE.MatchString(name) {
+		c.PodName = name
 	}
 
 	c.ClusterID = strings.TrimSpace(lookupDefault(getenv, EnvClusterID, ""))

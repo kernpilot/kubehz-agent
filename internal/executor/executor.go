@@ -92,6 +92,11 @@ const callTimeout = 15 * time.Second
 // pool count is far below this.)
 const maxPoolsPerPass = 100
 
+// maxLoggedPools bounds how many MachineDeployment names one log line carries
+// (the undeclared-pool note): a cluster with hundreds of pools must not write
+// a kilobyte log line.
+const maxLoggedPools = 10
+
 // autoscalerAnnotationKeys mark an MD as cluster-autoscaler-managed. The
 // clusterapi provider reads its node-group bounds from these annotations —
 // both the legacy cluster.k8s.io and the cluster.x-k8s.io spellings are
@@ -166,6 +171,13 @@ type Executor struct {
 	// evictionTimeout is how long a heal-deleted Machine may sit deleting
 	// before the unwedge fires (KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS).
 	evictionTimeout time.Duration
+	// machineTypeWarned remembers the last machine type reported as diverging
+	// per pool, so the log line is written once per change instead of once per
+	// poll (the divergence itself rides every beat in the action detail).
+	machineTypeWarned map[string]string
+	// undeclaredPools remembers the last set of MachineDeployments the document
+	// did not declare, for the same once-per-change logging.
+	undeclaredPools string
 }
 
 // Options configures New. Namespace and MaxReplicas are required by the
@@ -201,20 +213,21 @@ func New(dyn dynamic.Interface, store *actions.Store, opts Options) *Executor {
 		opts.EvictionTimeout = defaultEvictionTimeout
 	}
 	return &Executor{
-		dyn:             dyn,
-		namespace:       opts.Namespace,
-		maxReplicas:     opts.MaxReplicas,
-		store:           store,
-		observedVersion: opts.ObservedVersion,
-		nodes:           opts.Nodes,
-		pods:            opts.Pods,
-		log:             opts.Logger,
-		now:             opts.Now,
-		baseline:        opts.Now(),
-		lastHeal:        make(map[string]time.Time),
-		rollFrom:        make(map[string]string),
-		healDeleted:     make(map[string]*healDeletion),
-		evictionTimeout: opts.EvictionTimeout,
+		dyn:               dyn,
+		namespace:         opts.Namespace,
+		maxReplicas:       opts.MaxReplicas,
+		store:             store,
+		observedVersion:   opts.ObservedVersion,
+		nodes:             opts.Nodes,
+		pods:              opts.Pods,
+		log:               opts.Logger,
+		now:               opts.Now,
+		baseline:          opts.Now(),
+		lastHeal:          make(map[string]time.Time),
+		rollFrom:          make(map[string]string),
+		healDeleted:       make(map[string]*healDeletion),
+		evictionTimeout:   opts.EvictionTimeout,
+		machineTypeWarned: make(map[string]string),
 	}
 }
 
@@ -257,6 +270,62 @@ func (e *Executor) Reconcile(ctx context.Context, doc *desired.Doc) (retry bool)
 	return retry
 }
 
+// RefuseStale implements desired.Actor. The poller has found the cached
+// document too old to act on (the platform stopped serving it — see the
+// Poller's freshness bounds), so the refusal is REPORTED where the outcomes
+// are: on the heartbeat, not only in the agent's log.
+//
+// One report per declared pool, for each armed loop. A heal action normally
+// carries a MACHINE name; a refusal has no candidate machine, so the pool name
+// stands in — the contract treats action targets as opaque identifiers, and
+// the next healing pass prunes the report as soon as acting resumes.
+func (e *Executor) RefuseStale(_ context.Context, doc *desired.Doc, reason string) {
+	if doc == nil {
+		return
+	}
+	healing := doc.Execution.Healing && doc.Healing.Enabled
+	upgrading := doc.Execution.Upgrades && doc.KubernetesVersion != nil && strings.TrimSpace(*doc.KubernetesVersion) != ""
+	if !doc.Execution.Scaling && !upgrading && !healing {
+		return
+	}
+	names := validPoolNames(doc)
+	if len(names) == 0 {
+		return
+	}
+	e.store.Begin(doc.Revision)
+	for _, name := range names {
+		if doc.Execution.Scaling {
+			e.report(doc.Revision, name, state.ActionFailed, reason)
+		}
+		if upgrading {
+			e.reportUpgrade(doc.Revision, name, state.ActionFailed, reason)
+		}
+		if healing {
+			e.reportHeal(doc.Revision, name, state.ActionFailed, reason)
+		}
+	}
+}
+
+// validPoolNames returns the doc's reportable pool names: sorted, deduplicated,
+// DNS-1123 valid (an invalid target 400s the whole beat) and capped at
+// maxPoolsPerPass.
+func validPoolNames(doc *desired.Doc) []string {
+	seen := make(map[string]bool, len(doc.WorkerPools))
+	names := make([]string, 0, len(doc.WorkerPools))
+	for _, p := range doc.WorkerPools {
+		if p.Name == "" || seen[p.Name] || len(validation.IsDNS1123Subdomain(p.Name)) > 0 {
+			continue
+		}
+		seen[p.Name] = true
+		names = append(names, p.Name)
+	}
+	sort.Strings(names)
+	if len(names) > maxPoolsPerPass {
+		names = names[:maxPoolsPerPass]
+	}
+	return names
+}
+
 // scalePools processes the desired pools sequentially (name order, one action
 // at a time). Returns true if any pool needs a retry.
 func (e *Executor) scalePools(ctx context.Context, doc *desired.Doc) (retry bool) {
@@ -290,6 +359,7 @@ func (e *Executor) scalePools(ctx context.Context, doc *desired.Doc) (retry bool
 	for i := range list.Items {
 		byName[list.Items[i].GetName()] = &list.Items[i]
 	}
+	e.noteUndeclaredPools(byName, pools)
 
 	halted := false
 	for _, pool := range pools {
@@ -341,8 +411,12 @@ func (e *Executor) scaleOne(ctx context.Context, revision int, pool desired.Work
 	e.report(revision, pool.Name, state.ActionPending, "")
 
 	if md == nil {
+		// POOL CREATE is out of scope, permanently: a MachineDeployment carries
+		// the image, network, SSH keys and cloud-init of the user's own
+		// provisioning, none of which the agent may invent. The RBAC overlay
+		// grants patch, never create. Say so, so nobody waits for it.
 		e.report(revision, pool.Name, state.ActionFailed,
-			fmt.Sprintf("no MachineDeployment named %q in namespace %q (pools are matched to MDs by name)", pool.Name, e.namespace))
+			fmt.Sprintf("no MachineDeployment named %q in namespace %q — the agent never creates pools; create it with your own tooling (lo provision / kubeone apply)", pool.Name, e.namespace))
 		return outcomeRefused
 	}
 	if isControlPlane(md) {
@@ -361,11 +435,15 @@ func (e *Executor) scaleOne(ctx context.Context, revision int, pool desired.Work
 		return outcomeRefused
 	}
 
+	// The document may also carry a machineType. The agent reads it, never
+	// applies it, and reports the divergence (see machineTypeNote).
+	typeNote := e.machineTypeNote(pool, md)
+
 	current, known := currentReplicas(md)
 	if known && current == int64(pool.DesiredReplicas) {
 		// Idempotent no-op: already converged; confirm without a write.
 		e.report(revision, pool.Name, state.ActionDone,
-			fmt.Sprintf("already at %d replicas", pool.DesiredReplicas))
+			fmt.Sprintf("already at %d replicas", pool.DesiredReplicas)+typeNote)
 		return outcomeConverged
 	}
 
@@ -397,10 +475,70 @@ func (e *Executor) scaleOne(ctx context.Context, revision int, pool desired.Work
 		from = fmt.Sprintf("%d", current)
 	}
 	e.report(revision, pool.Name, state.ActionDone,
-		fmt.Sprintf("replicas %s to %d; machine-controller reconciles the machines with the cluster's own credentials", from, pool.DesiredReplicas))
+		fmt.Sprintf("replicas %s to %d; machine-controller reconciles the machines with the cluster's own credentials", from, pool.DesiredReplicas)+typeNote)
 	e.log.Info("machinedeployment scaled",
 		"pool", pool.Name, "namespace", e.namespace, "from", from, "to", pool.DesiredReplicas, "revision", revision)
 	return outcomeConverged
+}
+
+// machineTypeNote compares the document's machineType with the one the pool
+// template declares and returns a sentence for the action detail when they
+// differ.
+//
+// The agent NEVER changes a machine type. machine-controller would replace
+// every server in the pool, and the same template holds the image, the network
+// and the SSH keys — a rewrite the agent has no business improvising. The
+// divergence is REPORTED instead, so the platform can see that the change did
+// not land (it used to be decoded and dropped in silence). An unreadable
+// template type reports nothing: unknown is never a mismatch.
+func (e *Executor) machineTypeNote(pool desired.WorkerPool, md *unstructured.Unstructured) string {
+	want := strings.TrimSpace(pool.MachineType)
+	have := machines.MDMachineType(md)
+	if want == "" || have == "" || strings.EqualFold(want, have) {
+		delete(e.machineTypeWarned, pool.Name)
+		return ""
+	}
+	if e.machineTypeWarned[pool.Name] != want {
+		e.machineTypeWarned[pool.Name] = want
+		e.log.Warn("desired machineType differs from the pool template; the agent never changes machine types",
+			"pool", pool.Name, "desired", want, "declared", have, "namespace", e.namespace)
+	}
+	return fmt.Sprintf("; machineType %s not applied (pool runs %s) — the agent never changes machine types", want, have)
+}
+
+// noteUndeclaredPools names the MachineDeployments the document does not
+// declare. POOL DELETE is out of scope, permanently: a delete tears down every
+// server in the pool, and a document that dropped a pool looks exactly like a
+// partial one. Such pools are left untouched, and named once per change so an
+// operator can remove them deliberately.
+func (e *Executor) noteUndeclaredPools(byName map[string]*unstructured.Unstructured, pools []desired.WorkerPool) {
+	declared := make(map[string]bool, len(pools))
+	for _, p := range pools {
+		declared[p.Name] = true
+	}
+	extra := make([]string, 0, len(byName))
+	for name := range byName {
+		if !declared[name] {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	listed := extra
+	suffix := ""
+	if len(listed) > maxLoggedPools {
+		listed = listed[:maxLoggedPools]
+		suffix = fmt.Sprintf(" (+%d more)", len(extra)-maxLoggedPools)
+	}
+	joined := strings.Join(listed, ",") + suffix
+	if joined == e.undeclaredPools {
+		return
+	}
+	e.undeclaredPools = joined
+	if len(extra) == 0 {
+		return
+	}
+	e.log.Info("MachineDeployments the platform does not declare are left untouched (the agent never deletes a pool)",
+		"machinedeployments", joined, "namespace", e.namespace)
 }
 
 func (e *Executor) report(revision int, target, status, detail string) {

@@ -19,27 +19,51 @@ import (
 )
 
 // recordingActor records every doc it is handed and returns scripted retry
-// values (default false).
+// values (default false). It also records the stale-document refusals, in the
+// same ordered trail as the reconciles, so a test can assert that acting STOPS
+// where the refusals start.
 type recordingActor struct {
-	mu    sync.Mutex
-	docs  []*Doc
-	retry func(call int) bool
+	mu       sync.Mutex
+	docs     []*Doc
+	trail    []string // "act" / "refuse", in call order
+	refusals []string // refusal reasons, in call order
+	retry    func(call int) bool
 }
 
 func (a *recordingActor) Reconcile(_ context.Context, doc *Doc) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.docs = append(a.docs, doc)
+	a.trail = append(a.trail, "act")
 	if a.retry != nil {
 		return a.retry(len(a.docs))
 	}
 	return false
 }
 
+func (a *recordingActor) RefuseStale(_ context.Context, _ *Doc, reason string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.trail = append(a.trail, "refuse")
+	a.refusals = append(a.refusals, reason)
+}
+
 func (a *recordingActor) calls() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.docs)
+}
+
+func (a *recordingActor) refused() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.refusals...)
+}
+
+func (a *recordingActor) calltrail() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.trail...)
 }
 
 func (a *recordingActor) doc(i int) *Doc {
@@ -262,6 +286,180 @@ func TestPoller_TransientFailureRetriesOn304(t *testing.T) {
 	}
 	if actor.doc(1).Revision != 3 {
 		t.Errorf("retry used revision %d, want cached 3", actor.doc(1).Revision)
+	}
+
+	cancel()
+	trigger <- time.Now()
+	wg.Wait()
+}
+
+// healingBody is a healing-ARMED document (both bits), the case that asks for
+// a re-run on every single tick.
+func healingBody(revision int) string {
+	return fmt.Sprintf(`{"revision":%d,"kubernetesVersion":null,`+
+		`"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],`+
+		`"execution":{"scaling":false,"upgrades":false,"healing":true},`+
+		`"healing":{"enabled":true,"maxUnhealthy":2,"nodeStartupTimeoutSeconds":600,`+
+		`"unhealthyAfterSeconds":300,"cooldownSeconds":900}}`, revision)
+}
+
+// drivePolls releases n parked waits, i.e. lets the poller run n more polls.
+func drivePolls(t *testing.T, tm *timers, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		tm.next(t) <- time.Now()
+	}
+}
+
+// firstRefusal reports the index of the first refusal in the call trail
+// (-1 = none).
+func firstRefusal(trail []string) int {
+	for i, s := range trail {
+		if s == "refuse" {
+			return i
+		}
+	}
+	return -1
+}
+
+// A FROZEN CACHE — anything answering 304 forever, proxy or CDN — must not
+// keep the healer acting. Healing asks for a re-run on every tick, so without
+// a freshness bound the agent would delete machines on intent nobody
+// re-affirmed, for as long as the frozen copy is served. Acting must stop at
+// the bound, the refusal must be REPORTED, and one served document must
+// restore acting.
+func TestPoller_FrozenCacheStopsActingAndReportsRefusal(t *testing.T) {
+	var mu sync.Mutex
+	served := 0
+	frozen := true
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		first := served == 0
+		served++
+		stillFrozen := frozen
+		mu.Unlock()
+		if first || !stillFrozen {
+			w.Header().Set("ETag", `"3-001"`)
+			_, _ = fmt.Fprint(w, healingBody(3))
+			return
+		}
+		// The frozen copy: 304 to EVERY request, conditional or not.
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer ts.Close()
+
+	// Healing's real behaviour: every pass asks to be re-run.
+	actor := &recordingActor{retry: func(int) bool { return true }}
+	p, tm := newTestPoller(t, ts.URL, actor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); p.Run(ctx) }()
+
+	const polls = 20
+	drivePolls(t, tm, polls)
+	trigger := tm.next(t)
+
+	trail := actor.calltrail()
+	acts := actor.calls()
+	refusals := actor.refused()
+
+	if acts < 2 {
+		t.Fatalf("reconciles = %d — the fresh document must still drive the healer", acts)
+	}
+	if acts > staleHealingTicks+1 {
+		t.Errorf("reconciles = %d over %d polls, want at most %d (the healing freshness bound)",
+			acts, polls, staleHealingTicks+1)
+	}
+	if len(refusals) == 0 {
+		t.Fatalf("no refusal reported after %d polls of a frozen 304 (trail %v)", polls, trail)
+	}
+	if !strings.Contains(refusals[0], "does not act on intent nobody re-affirmed") {
+		t.Errorf("refusal reason = %q, want it to say why the agent stopped", refusals[0])
+	}
+	if i := firstRefusal(trail); i >= 0 {
+		for _, step := range trail[i:] {
+			if step == "act" {
+				t.Fatalf("acted again after refusing; trail = %v", trail)
+			}
+		}
+	}
+
+	// A served document re-affirms the intent: acting resumes at once.
+	mu.Lock()
+	frozen = false
+	mu.Unlock()
+	before := actor.calls()
+	trigger <- time.Now()
+	trigger = tm.next(t)
+	if actor.calls() != before+1 {
+		t.Errorf("reconciles after a served document = %d, want %d — a fresh document must clear the refusal",
+			actor.calls(), before+1)
+	}
+
+	cancel()
+	trigger <- time.Now()
+	wg.Wait()
+}
+
+// The bound must not break healing on a HEALTHY platform. A revision that
+// never changes 304s every conditional poll, so the agent revalidates
+// unconditionally (no If-None-Match, no-cache) — the origin's 200 re-affirms
+// the intent and the healer keeps running, forever, with no refusal.
+func TestPoller_RevalidationKeepsHealingAlive(t *testing.T) {
+	var mu sync.Mutex
+	unconditional := 0
+	var revalidateHeaders http.Header
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"3-001"`)
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		// The first poll has no cached ETag yet and is not a revalidation;
+		// count only the cache-busting ones.
+		if r.Header.Get("Cache-Control") == "no-cache" {
+			mu.Lock()
+			unconditional++
+			if revalidateHeaders == nil {
+				revalidateHeaders = r.Header.Clone()
+			}
+			mu.Unlock()
+		}
+		_, _ = fmt.Fprint(w, healingBody(3))
+	}))
+	defer ts.Close()
+
+	actor := &recordingActor{retry: func(int) bool { return true }}
+	p, tm := newTestPoller(t, ts.URL, actor)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); p.Run(ctx) }()
+
+	const polls = 20
+	drivePolls(t, tm, polls)
+	trigger := tm.next(t)
+
+	mu.Lock()
+	revalidations, headers := unconditional, revalidateHeaders
+	mu.Unlock()
+
+	if revalidations < 2 {
+		t.Errorf("unconditional revalidations = %d over %d polls, want at least 2 (every %d polls)",
+			revalidations, polls, staleRevalidateTicks)
+	}
+	if headers.Get("Cache-Control") != "no-cache" {
+		t.Errorf("revalidation Cache-Control = %q, want no-cache (no intermediary may answer it)",
+			headers.Get("Cache-Control"))
+	}
+	if len(actor.refused()) != 0 {
+		t.Errorf("refusals = %v, want none — a platform that keeps serving the document is not stale", actor.refused())
+	}
+	if got := actor.calls(); got != polls+1 {
+		t.Errorf("reconciles = %d, want %d (healing runs on every poll while the document stays fresh)", got, polls+1)
 	}
 
 	cancel()

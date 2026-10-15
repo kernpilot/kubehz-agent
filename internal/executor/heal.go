@@ -24,6 +24,12 @@
 //     pool, with the executor's construction time as a baseline — an agent
 //     RESTART starts a fresh cooldown, so a crash-looping agent can never
 //     become a machine-delete loop.
+//   - LOCAL SANITY BOUNDS, owed to no server number: one pass remediates at
+//     most a THIRD of a pool (floored at one machine), and a pool — or the
+//     whole worker set — whose nodes ALL went unhealthy inside one short
+//     window is refused outright. Simultaneous failure is an outage or a
+//     partition, and a partitioned node is indistinguishable from a dead one
+//     from here. See localBoundsFor.
 //   - AUTOSCALER POOLS are skipped (refused loudly): the cluster-autoscaler
 //     owns their machine lifecycle; fighting it is worse than a NotReady node.
 //   - UNOWNED machines are refused: deleting a Machine no MachineSet/
@@ -73,6 +79,69 @@ import (
 // junk-proofed server row could legally carry 0, and sub-minute remediation
 // would fight the kubelet's own grace periods.
 const minDetectionWindow = 60 * time.Second
+
+// LOCAL SANITY BOUNDS. maxUnhealthy, the cooldown and the in-flight budget are
+// all SERVER-owned numbers, and a wrong-but-plausible document (maxUnhealthy
+// 50 on a 12-machine cluster) satisfies every one of them while real servers
+// are torn down one cooldown apart. The two bounds below need no server input:
+// they are computed from what the agent sees in its own cluster.
+const (
+	// healFractionNumerator/healFractionDenominator cap what ONE pass may
+	// remediate as a FRACTION of the pool — rounded down, floored at one so a
+	// small pool still heals. The excess waits for the next pass and is
+	// reported, so the blast radius of a single pass never scales with a
+	// number the platform sent.
+	healFractionNumerator   = 1
+	healFractionDenominator = 3
+
+	// simultaneousFailureWindow: nodes that ALL stop reporting inside this
+	// window failed TOGETHER. Independent hardware does not do that; a network
+	// partition, an apiserver outage or a control-plane restart does — and in
+	// those the servers are alive and still running the user's workload while
+	// their nodes read Unknown. The agent cannot tell a dead node from a
+	// partitioned one, so it does not guess: it refuses and reports.
+	//
+	// Five minutes, not seconds: the node controller flips every unreachable
+	// node within one grace period, and a partition that spreads over a few
+	// minutes is still a partition. The cost of the wide window is a delayed
+	// remediation, which the cluster survives; the cost of a narrow one is a
+	// deleted healthy server.
+	simultaneousFailureWindow = 5 * time.Minute
+
+	// minSimultaneousNodes: simultaneity needs at least two nodes to mean
+	// anything. A one-node pool has nothing to fail together with, and
+	// refusing there would disable healing for exactly the case it exists for
+	// (the cluster-wide check still covers such pools).
+	minSimultaneousNodes = 2
+)
+
+// poolCensus is the LOCAL evidence one pass has about a pool: how many
+// machines it owns, how many of them joined a node, when each unhealthy node
+// last changed its Ready condition, and how many candidates it produced.
+type poolCensus struct {
+	machines   int
+	nodes      int
+	unhealthy  []time.Time
+	candidates int
+}
+
+// localBounds is what the cluster's own state says one pass may do:
+// refuseEverything (an outage signature across the whole worker set),
+// refusePool (the same signature inside one pool) and perPool (the fraction
+// cap per pool).
+type localBounds struct {
+	refuseEverything string
+	refusePool       map[string]string
+	perPool          map[string]int
+}
+
+// capFor is how many machines of one pool this pass may remediate.
+func (b localBounds) capFor(pool string) int {
+	if n, ok := b.perPool[pool]; ok {
+		return n
+	}
+	return 1
+}
 
 // healCandidate is one unhealthy worker machine.
 type healCandidate struct {
@@ -214,6 +283,11 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 		return
 	}
 
+	// ── LOCAL SANITY BOUNDS (independent of the server's numbers).
+	bounds := e.localBoundsFor(cands, machineList, nodes, byNodeName, resolver)
+	// remediated counts THIS pass's deletions per pool, against the fraction cap.
+	remediated := make(map[string]int, len(cands))
+
 	budget := pol.MaxUnhealthy - inFlight
 	halted := false
 	for _, c := range cands {
@@ -232,6 +306,10 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			key, _ := hasAutoscalerAnnotations(c.md)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed,
 				"refusing to heal: pool "+c.pool+" is managed by cluster-autoscaler ("+key+" present)")
+		case bounds.refuseEverything != "":
+			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed, bounds.refuseEverything)
+		case bounds.refusePool[c.pool] != "":
+			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed, bounds.refusePool[c.pool])
 		case budget <= 0:
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("waiting: %d disruption(s) already in flight (maxUnhealthy %d)", inFlight, pol.MaxUnhealthy))
@@ -239,15 +317,162 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			wait := (cooldown - now.Sub(e.lastHealTime(c.pool))).Truncate(time.Second)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("cooldown: next remediation in pool %s allowed in %s", c.pool, wait))
+		case remediated[c.pool] >= bounds.capFor(c.pool):
+			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
+				fmt.Sprintf("waiting: pool %s already had %d remediation(s) this pass — one pass remediates at most %d/%d of a pool",
+					c.pool, remediated[c.pool], healFractionNumerator, healFractionDenominator))
 		default:
 			if !e.remediate(ctx, doc.Revision, c, now) {
 				halted = true // §3 halt-on-failure: queue the rest, retry next poll
 			} else {
 				inFlight++
 				budget--
+				remediated[c.pool]++
 			}
 		}
 	}
+}
+
+// localBoundsFor reads the cluster's OWN evidence and returns what this pass
+// may do. Two rules, both computed locally, both refusal-biased:
+//
+//  1. SIMULTANEOUS FAILURE → refuse. Every node of a pool (or of the whole
+//     worker set) unhealthy, with the Ready transitions inside
+//     simultaneousFailureWindow, is an outage or a partition, not hardware.
+//     Deleting those machines would destroy healthy capacity to "fix" a
+//     reachability problem. Needs at least minSimultaneousNodes nodes — one
+//     node has nothing to be simultaneous with.
+//  2. FRACTION → cap. One pass remediates at most healFraction of a pool
+//     (floored at one machine); the rest waits and is reported. maxUnhealthy
+//     cannot express this: it is one absolute number for clusters of any size.
+func (e *Executor) localBoundsFor(
+	cands []healCandidate,
+	machineList []unstructured.Unstructured,
+	nodes []*corev1.Node,
+	byNodeName map[string]*unstructured.Unstructured,
+	resolver *machines.PoolResolver,
+) localBounds {
+	census := make(map[string]*poolCensus)
+	entry := func(pool string) *poolCensus {
+		c, ok := census[pool]
+		if !ok {
+			c = &poolCensus{}
+			census[pool] = c
+		}
+		return c
+	}
+
+	for i := range machineList {
+		m := &machineList[i]
+		if machines.Deleting(m) {
+			continue
+		}
+		if pool, _ := resolver.PoolFor(m); pool != "" {
+			entry(pool).machines++
+		}
+	}
+
+	clusterNodes := 0
+	var clusterUnhealthy []time.Time
+	for _, node := range nodes {
+		if node == nil || isControlPlaneNode(node) {
+			continue
+		}
+		m := byNodeName[node.Name]
+		if m == nil {
+			continue // no backing machine (static worker): not healable, not evidence
+		}
+		pool, _ := resolver.PoolFor(m)
+		if pool == "" {
+			continue
+		}
+		c := entry(pool)
+		c.nodes++
+		clusterNodes++
+		status, since := nodeReadyCondition(node)
+		if status == corev1.ConditionTrue || since.IsZero() {
+			continue
+		}
+		c.unhealthy = append(c.unhealthy, since)
+		clusterUnhealthy = append(clusterUnhealthy, since)
+	}
+
+	for _, c := range cands {
+		if c.pool != "" {
+			entry(c.pool).candidates++
+		}
+	}
+
+	bounds := localBounds{
+		refusePool: make(map[string]string, len(census)),
+		perPool:    make(map[string]int, len(census)),
+	}
+	for pool, c := range census {
+		bounds.perPool[pool] = maxPerPass(c.machines)
+	}
+
+	if clusterNodes >= minSimultaneousNodes && len(clusterUnhealthy) == clusterNodes && withinWindow(clusterUnhealthy) {
+		bounds.refuseEverything = fmt.Sprintf(
+			"refusing to heal: all %d worker nodes went unhealthy within %s — an outage or a partition, not node hardware",
+			clusterNodes, simultaneousFailureWindow)
+		e.log.Warn("heal: every worker node failed at once; refusing all remediation",
+			"nodes", clusterNodes, "window", simultaneousFailureWindow.String())
+		return bounds
+	}
+
+	for _, pool := range sortedKeys(census) {
+		c := census[pool]
+		if c.candidates == 0 {
+			continue
+		}
+		if c.nodes >= minSimultaneousNodes && len(c.unhealthy) == c.nodes && withinWindow(c.unhealthy) {
+			bounds.refusePool[pool] = fmt.Sprintf(
+				"refusing to heal: all %d nodes of pool %s went unhealthy within %s — an outage or a partition, not node hardware",
+				c.nodes, pool, simultaneousFailureWindow)
+			e.log.Warn("heal: every node of a pool failed at once; refusing its remediation",
+				"pool", pool, "nodes", c.nodes, "window", simultaneousFailureWindow.String())
+		}
+	}
+	return bounds
+}
+
+// maxPerPass is how many machines of a pool of this size one pass may
+// remediate: the configured fraction, rounded down, floored at one.
+func maxPerPass(poolMachines int) int {
+	n := poolMachines * healFractionNumerator / healFractionDenominator
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// withinWindow reports whether every transition time lies inside
+// simultaneousFailureWindow (first to last).
+func withinWindow(times []time.Time) bool {
+	if len(times) == 0 {
+		return false
+	}
+	first, last := times[0], times[0]
+	for _, t := range times[1:] {
+		if t.Before(first) {
+			first = t
+		}
+		if t.After(last) {
+			last = t
+		}
+	}
+	return last.Sub(first) <= simultaneousFailureWindow
+}
+
+// sortedKeys returns a map's keys in a deterministic order (log and report
+// order must not depend on map iteration).
+func sortedKeys(m map[string]*poolCensus) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // remediate deletes one candidate's Machine, reporting in-progress →
