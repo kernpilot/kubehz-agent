@@ -6,10 +6,12 @@ go 1.26.0
 // go1.26.6 fixes FIVE reachable stdlib advisories that govulncheck reports
 // against 1.26.4 — GO-2026-6218 (net/url), GO-2026-6090 + GO-2026-5856
 // (crypto/tls), GO-2026-5972 (encoding/asn1), GO-2026-5026 (net/http) — all
-// reachable through the heartbeat's single https client. 1.26.7 is the current
-// patch in that line. An older local toolchain builds a vulnerable binary and
-// fails govulncheck.
-toolchain go1.26.7
+// reachable through the heartbeat's single https client. go1.26.10 fixes ten
+// more that govulncheck reports against 1.26.7: GO-2026-6603, -6605, -6610,
+// -6611, -6612, -6613, -6617 (net/http), GO-2026-6607 (crypto/tls),
+// GO-2026-6608 (mime/multipart), GO-2026-6809 (crypto/x509). An older local
+// toolchain builds a vulnerable binary and fails govulncheck.
+toolchain go1.26.10
 
 require (
 	github.com/google/cel-go v0.26.0
