@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-# Pinned by digest (supply chain): golang:1.26.7-bookworm, verified against
-# Docker Hub on 2026-08-21. Update the tag AND the digest together, and keep
+# Pinned by digest (supply chain): golang:1.26.10-bookworm, verified against
+# Docker Hub on 2026-11-06. Update the tag AND the digest together, and keep
 # both in lockstep with go.mod's `toolchain` and the workflows' GO_VERSION —
-# 1.26.4 carries five reachable stdlib advisories (see go.mod).
-FROM golang:1.26.7-bookworm@sha256:6ef6e30f0ea5c384f6d111cf856e024e3086bbdcb1779da3f3b3fbba0aea53d2 AS build
+# 1.26.7 carries ten reachable stdlib advisories (see go.mod).
+FROM golang:1.26.10-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS build
 
 WORKDIR /src
 

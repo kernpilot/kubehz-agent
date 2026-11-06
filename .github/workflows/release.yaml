@@ -54,7 +54,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.26.7"
+  GO_VERSION: "1.26.10"
   # The canonical, anonymously-pullable customer image (spec §1.5). Harbor is
   # only ever a mirror of what this produces.
   IMAGE: ghcr.io/kernpilot/kubehz-agent
@@ -113,6 +113,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      # Go builds the host binary of the managed-state install
+      # (kubehz-agent state-redeem / state-renew run on the machine, not in
+      # the image).
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
 
       # One place decides what version this run publishes, so no later step has
       # to re-derive it from two possible triggers.
@@ -271,9 +279,10 @@ jobs:
 
           kubectl kustomize deploy/ > install.yaml
           kubectl kustomize deploy/managed/ > install-managed.yaml
+          kubectl kustomize deploy/maintenance/ > install-maintenance.yaml
 
           # Fail loudly rather than shipping a manifest that resolves a tag.
-          for f in install.yaml install-managed.yaml; do
+          for f in install.yaml install-managed.yaml install-maintenance.yaml; do
             grep -q "${IMAGE}@${DIGEST}" "${f}" \
               || { echo "::error::${f} is not pinned to ${DIGEST}"; exit 1; }
             ! grep -E "image: .*kubehz-agent:(latest|main|v[0-9])" "${f}" \
@@ -281,7 +290,42 @@ jobs:
           done
 
           printf '%s\n' "${IMAGE}@${DIGEST}" > digest.txt
-          sha256sum install.yaml install-managed.yaml kubehz-agent.spdx.json digest.txt > SHA256SUMS
+
+      # ── Managed state: the host binary and the install script ────────────
+      # The install script (scripts/k3s-state/v1.sh) runs on the customer's
+      # machine. It pins the sha256 of the host binary and of the agent
+      # manifests of THIS release, so it is rendered after them. The api's
+      # configuration pins {version, url, sha256} of the rendered script; the
+      # sha256 is printed below for that.
+      - name: Build the host binary (linux/amd64 + linux/arm64)
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath \
+              -ldflags="-s -w -X github.com/kernpilot/kubehz-agent/internal/buildinfo.Version=${VERSION}" \
+              -o "kubehz-agent-linux-${arch}" ./cmd/kubehz-agent
+          done
+
+      - name: Render the install script and the checksums
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/k3s-state/render.sh "${VERSION}" . > k3s-state-v1.sh
+          sha256sum install.yaml install-managed.yaml install-maintenance.yaml \
+            kubehz-agent-linux-amd64 kubehz-agent-linux-arm64 k3s-state-v1.sh \
+            kubehz-agent.spdx.json digest.txt > SHA256SUMS
+          script_sum=$(sha256sum k3s-state-v1.sh | cut -d' ' -f1)
+          echo "k3s-state-v1.sh sha256: ${script_sum}"
+          {
+            echo "### Managed-state install script"
+            echo
+            echo "| version | url | sha256 |"
+            echo "|---|---|---|"
+            echo "| ${VERSION} | https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/k3s-state-v1.sh | \`${script_sum}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Publish the GitHub Release
         env:
@@ -313,7 +357,12 @@ jobs:
               kubectl apply -f install.yaml          # registered tier: observe + report only
               kubectl apply -f install-managed.yaml  # managed tier: + the acting RBAC
 
-          Both manifests pin the digest above. \`SHA256SUMS\` covers every asset;
+          Managed state (k3s with a managed datastore): \`k3s-state-v1.sh\` is the
+          install script that the dashboard runs with its sha256 checked (it
+          also installs \`kubehz-k3s-uninstall.sh\` on the machine);
+          \`install-maintenance.yaml\` adds the k3s upgrade path.
+
+          The manifests pin the digest above. \`SHA256SUMS\` covers every asset;
           \`kubehz-agent.spdx.json\` is the SBOM that is also attested on the image.
           EOF
 
@@ -323,7 +372,9 @@ jobs:
             gh release create "${VERSION}" --title "${VERSION}" --notes-file "${notes}"
           fi
           gh release upload "${VERSION}" \
-            install.yaml install-managed.yaml kubehz-agent.spdx.json digest.txt SHA256SUMS \
+            install.yaml install-managed.yaml install-maintenance.yaml \
+            kubehz-agent-linux-amd64 kubehz-agent-linux-arm64 k3s-state-v1.sh \
+            kubehz-agent.spdx.json digest.txt SHA256SUMS \
             --clobber
 
       # ── Internal mirror (never on the customer's critical path) ──────────

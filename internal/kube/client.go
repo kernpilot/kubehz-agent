@@ -35,6 +35,12 @@ func inClusterConfig(userAgent string) (*rest.Config, error) {
 	return cfg, nil
 }
 
+// InClusterConfig returns the shared rest.Config (the k3s upgrade executor
+// derives its per-node /version probe from it).
+func InClusterConfig(userAgent string) (*rest.Config, error) {
+	return inClusterConfig(userAgent)
+}
+
 // NewInClusterClientset builds the typed clientset (informers + discovery).
 func NewInClusterClientset(userAgent string) (kubernetes.Interface, error) {
 	cfg, err := inClusterConfig(userAgent)

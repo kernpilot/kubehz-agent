@@ -1,0 +1,100 @@
+# The rights of the agent for k3s maintenance (managed state, opt-in). The
+# agent uses them only when maintenance is on in the dashboard; with
+# maintenance off it removes its admission policy and writes nothing.
+#
+# What the agent can do in namespace system-upgrade:
+#   - read, write and delete Plans (the admission policy, which the agent
+#     writes before any Plan, admits only its two Plan templates there);
+#   - list and delete the upgrade jobs (the cleanup after a failure or an
+#     opt-out);
+#   - read the controller Deployment and change its SCALE only (not its pod);
+#   - read the controller settings, and write its failure record
+#     (ConfigMap kubehz-k3s-upgrade).
+# Cluster-wide: write and delete its own admission policy and binding.
+#
+# Kubernetes RBAC cannot limit "create" to a name: "create" on Plans,
+# ConfigMaps and admission policies is for any name. The admission policy
+# limits the Plans; the other two cannot start a pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubehz-live-agent-maintenance
+  namespace: system-upgrade
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  - apiGroups: [upgrade.cattle.io]
+    resources: [plans]
+    verbs: [get, list, create, update, delete]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [list, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [system-upgrade-controller]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    resourceNames: [system-upgrade-controller]
+    verbs: [update]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [default-controller-env]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [kubehz-k3s-upgrade]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubehz-live-agent-maintenance
+  namespace: system-upgrade
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubehz-live-agent-maintenance
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-live-agent
+    namespace: kubehz-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubehz-live-agent-maintenance
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+rules:
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingadmissionpolicies, validatingadmissionpolicybindings]
+    verbs: [create]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources: [validatingadmissionpolicies, validatingadmissionpolicybindings]
+    resourceNames: [kubehz-k3s-upgrade-plans]
+    verbs: [get, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubehz-live-agent-maintenance
+  labels:
+    app.kubernetes.io/name: kubehz-live-agent
+    app.kubernetes.io/part-of: kubehz
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubehz-live-agent-maintenance
+subjects:
+  - kind: ServiceAccount
+    name: kubehz-live-agent
+    namespace: kubehz-system

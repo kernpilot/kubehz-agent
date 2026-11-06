@@ -7,6 +7,9 @@ kubectl apply -k deploy/
 
 # Managed tier — adds the acting permission for server-gated worker scaling:
 kubectl apply -k deploy/managed/
+
+# Managed state on k3s — adds the k3s upgrade path (opt-in):
+kubectl apply -k deploy/maintenance/
 ```
 
 ## The base/managed RBAC split
@@ -58,6 +61,41 @@ least privilege says an unused write should not exist. Without the overlay a
 If you relocate the pools (`KUBEHZ_MD_NAMESPACE`), move the Role's
 `namespace` in `rbac-managed.yaml` accordingly — the machine-side grants are
 deliberately namespaced Roles.
+
+## The maintenance overlay (managed state, k3s upgrades)
+
+`deploy/maintenance/` is the base **plus** the k3s upgrade path of a
+self-hosted cluster with managed state. Apply it only on such a k3s
+cluster (the install script does it with `--maintenance`). It holds:
+
+1. `system-upgrade.yaml`: the namespace (Pod Security `privileged`), the
+   service account and the RBAC of the system-upgrade-controller v0.20.2,
+   verbatim from upstream.
+2. `system-upgrade-controller.yaml`: the controller settings (job retries
+   off) and its Deployment with **zero replicas**. This file is generated
+   from `internal/k3supgrade/controller.go`; a test keeps the two equal.
+3. `rbac-maintenance.yaml`: the agent's rights. In `system-upgrade`:
+   Plans (get, list, create, update, delete), jobs (list, delete), the
+   controller Deployment (get) and its **scale** (update), the controller
+   settings (get) and the failure record ConfigMap. Cluster-wide: its own
+   admission policy and binding.
+
+The agent cannot change the controller's pod: it can only scale it. It
+scales it to one replica only while maintenance is on and an upgrade runs.
+Before that it writes an admission policy that admits only its two Plan
+templates in `system-upgrade`. With maintenance off it removes the policy
+and writes nothing.
+
+To remove the upgrade path, switch maintenance off in the dashboard first.
+Then delete the three files of the overlay, not the base:
+
+```bash
+kubectl delete -f deploy/maintenance/rbac-maintenance.yaml \
+  -f deploy/maintenance/system-upgrade-controller.yaml \
+  -f deploy/maintenance/system-upgrade.yaml
+```
+
+The Plan CRD stays: the controller made it, and other Plans can use it.
 
 ## Coexistence with the bash heartbeat CronJob (read this first)
 

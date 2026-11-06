@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.26.7"
+  GO_VERSION: "1.26.10"
 
 jobs:
   test:
@@ -54,6 +54,15 @@ jobs:
           grep -q 'node-role.kubernetes.io/control-plane' /tmp/deploy-base.yaml
           grep -q 'name: kubehz-live-agent' /tmp/deploy-base.yaml
           echo "deploy/base renders: $(grep -c '^kind:' /tmp/deploy-base.yaml) objects"
+
+      - name: Render deploy/maintenance (the k3s upgrade overlay)
+        run: |
+          kubectl kustomize deploy/maintenance > /tmp/deploy-maintenance.yaml
+          # The controller must start with zero replicas: only the agent
+          # scales it up, while an upgrade runs.
+          grep -q 'replicas: 0' /tmp/deploy-maintenance.yaml
+          grep -q 'name: kubehz-live-agent-maintenance' /tmp/deploy-maintenance.yaml
+          echo "deploy/maintenance renders: $(grep -c '^kind:' /tmp/deploy-maintenance.yaml) objects"
       - name: go vet
         run: go vet ./...
 
@@ -71,6 +80,32 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Pinned by version and sha256 (the GitHub release asset digest,
+      # verified 2026-11-06), not the runner's own copy, which changes with
+      # the runner image.
+      - name: Install shellcheck v0.11.0
+        run: |
+          set -euo pipefail
+          curl --proto '=https' -fsSLo "${RUNNER_TEMP}/sc.tar.xz" \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  ${RUNNER_TEMP}/sc.tar.xz" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/sc.tar.xz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/shellcheck-v0.11.0" >> "${GITHUB_PATH}"
+
+      - name: shellcheck scripts/
+        run: shellcheck -x scripts/k3s-state/*.sh
+
+      # The uninstall script on a fake machine (no root, stubs for systemctl
+      # and k3s) and the release renderer with fake assets.
+      - name: script tests
+        run: bash scripts/k3s-state/test.sh
 
   image:
     name: build · push image

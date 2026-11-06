@@ -36,6 +36,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/desired"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/inventory"
+	"github.com/kernpilot/kubehz-agent/internal/k3supgrade"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
 	"github.com/kernpilot/kubehz-agent/internal/machineissues"
 	"github.com/kernpilot/kubehz-agent/internal/publisher"
@@ -231,7 +232,27 @@ func (a *Agent) Run(ctx context.Context) error {
 		})
 		dclient := desired.NewClient(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
 		dclient.SetTokenReloader(reloadToken)
-		poller := desired.NewPoller(dclient, exec, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
+
+		// k3s upgrade executor (managed state, design 4.3): acts only on the
+		// /desired stateStore block, only with maintenance on. On every other
+		// cluster the block is absent and it does nothing.
+		reporter := k3supgrade.NewHTTPReporter(a.cfg.APIURL, a.cfg.ClusterID, a.cfg.AgentToken, buildinfo.Version, nil)
+		reporter.SetTokenReloader(reloadToken)
+		var probe k3supgrade.APIServerVersionFunc
+		if rc, err := kube.InClusterConfig("kubehz-agent/" + buildinfo.Version); err == nil {
+			probe = k3supgrade.NewAPIServerProber(rc)
+		} else {
+			a.log.Warn("no in-cluster config for the per-node apiserver probe; a k3s upgrade cannot finish", "error", err.Error())
+		}
+		k3sExec := k3supgrade.New(k3supgrade.Options{
+			Kube:             a.client,
+			Dyn:              a.dyn,
+			Reporter:         reporter,
+			APIServerVersion: probe,
+			Logger:           a.log,
+		})
+
+		poller := desired.NewPoller(dclient, desired.Actors{exec, k3sExec}, a.cfg.DesiredPoll, backoffBase, backoffMax, a.log)
 		go poller.Run(ctx)
 		a.log.Info("desired-state pull loop started",
 			"endpoint", dclient.URL(),

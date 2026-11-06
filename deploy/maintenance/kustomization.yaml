@@ -1,0 +1,24 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# MAINTENANCE overlay (self-hosted with managed state, opt-in) = the
+# read-only base PLUS the k3s upgrade path:
+#
+#   kubectl apply -k deploy/maintenance/
+#
+# - system-upgrade.yaml: the static objects of the system-upgrade-controller
+#   (namespace, service accounts, RBAC), verbatim from upstream v0.20.2.
+# - system-upgrade-controller.yaml: its settings (job retries off) and its
+#   Deployment with ZERO replicas, generated from the agent's templates.
+# - rbac-maintenance.yaml: the agent's rights to write its two Plans and
+#   its admission policy, to clean up, and to scale the controller.
+#
+# Without this overlay the agent cannot upgrade k3s: an upgrade operation
+# fails at once and its report names this overlay. Apply it only on a k3s
+# cluster with managed state; the release publishes it as
+# install-maintenance.yaml.
+resources:
+  - ../base
+  - system-upgrade.yaml
+  - system-upgrade-controller.yaml
+  - rbac-maintenance.yaml

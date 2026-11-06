@@ -5,7 +5,7 @@ VERSION ?= dev
 IMAGE   ?= ghcr.io/kernpilot/kubehz-agent:$(VERSION)
 LDFLAGS := -s -w -X github.com/kernpilot/kubehz-agent/internal/buildinfo.Version=$(VERSION)
 
-.PHONY: all build test race vet fmt fmt-check lint vuln docker tidy clean
+.PHONY: all build test race vet fmt fmt-check lint vuln shellcheck script-test docker tidy clean
 
 all: fmt-check vet test build
 
@@ -32,6 +32,15 @@ lint:
 
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@v1.5.0 ./...
+
+# The managed-state install script must stay shellcheck clean (CI pins v0.11.0).
+SHELLCHECK ?= shellcheck
+shellcheck:
+	$(SHELLCHECK) -x scripts/k3s-state/*.sh
+
+# The uninstall script on a fake machine and the release renderer; no root.
+script-test:
+	bash scripts/k3s-state/test.sh
 
 docker:
 	docker build -t $(IMAGE) --build-arg VERSION=$(VERSION) .
