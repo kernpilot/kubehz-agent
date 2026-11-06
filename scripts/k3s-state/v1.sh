@@ -9,18 +9,21 @@
 #
 # What it does, in order:
 #   1. Checks the machine (root, bash, Linux, systemd; no old k3s etcd data).
-#   2. Installs the kubehz-agent binary (pinned, sha256 checked).
-#   3. Asks for the install ticket at a hidden prompt and redeems it with
+#   2. Installs /usr/local/bin/kubehz-k3s-uninstall.sh (source:
+#      scripts/k3s-state/uninstall.sh), which removes all of this again.
+#   3. Installs the kubehz-agent binary (pinned, sha256 checked).
+#   4. Asks for the install ticket at a hidden prompt and redeems it with
 #      "kubehz-agent state-redeem": the client key is made on this machine
 #      and never leaves it.
-#   4. Installs k3s (pinned, sha256 checked) with the managed datastore, no
+#   5. Installs k3s (pinned, sha256 checked) with the managed datastore, no
 #      flannel, no network policy controller, no traefik, no servicelb.
-#   5. Installs Cilium (pinned chart, sha256 checked) through the k3s Helm
+#   6. Installs Cilium (pinned chart, sha256 checked) through the k3s Helm
 #      controller, and the static SSO role bindings.
-#   6. Recovery (--recovery): removes the old Node object and its node
+#   7. Recovery (--recovery): removes the old Node object and its node
 #      password Secret, then restarts k3s.
-#   7. Installs the in-cluster kubehz-agent and its registration.
-#   8. Installs the certificate renewal timer (kubehz-agent state-renew,
+#   8. Installs the in-cluster kubehz-agent and its registration, and keeps
+#      the applied manifest for the uninstall.
+#   9. Installs the certificate renewal timer (kubehz-agent state-renew,
 #      every 5 minutes).
 #
 # The script is static: the same file for every cluster. It never pipes a
@@ -65,7 +68,9 @@ readonly CILIUM_CHART_SHA256="505abff8385811df1a949776fc42e9f10697989a332acc86d6
 
 # ── Paths ────────────────────────────────────────────────────────────────
 readonly STATE_DIR="/etc/kubehz/state"
+readonly AGENT_MANIFEST="/etc/kubehz/kubehz-agent.yaml"
 readonly AGENT_BIN="/usr/local/bin/kubehz-agent"
+readonly UNINSTALL_BIN="/usr/local/bin/kubehz-k3s-uninstall.sh"
 readonly K3S_BIN="/usr/local/bin/k3s"
 readonly K3S_CONFIG="/etc/rancher/k3s/config.yaml"
 readonly K3S_KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
@@ -182,6 +187,16 @@ check_machine() {
 	if [[ "${AGENT_VERSION}" == @* || "${K3S_INSTALLER_SHA256}" == @* ]]; then
 		die "this is the unrendered script from the source tree; download the script of a kubehz-agent release"
 	fi
+}
+
+# install_uninstall_script writes kubehz-k3s-uninstall.sh. The release
+# workflow (scripts/k3s-state/render.sh) puts the content of
+# scripts/k3s-state/uninstall.sh in place of the line below.
+install_uninstall_script() {
+	cat >"${WORK}/uninstall.sh" <<'KUBEHZ_UNINSTALL_EOF'
+@KUBEHZ_UNINSTALL_SCRIPT@
+KUBEHZ_UNINSTALL_EOF
+	install -m 0700 -o root -g root "${WORK}/uninstall.sh" "${UNINSTALL_BIN}"
 }
 
 install_agent_binary() {
@@ -391,6 +406,9 @@ install_agent() {
 		-e "s|KUBEHZ_API_URL_PLACEHOLDER|${API_URL}|g" \
 		-e "s|CLUSTER_ID_PLACEHOLDER|${CFG[CLUSTER_ID]}|g" \
 		"${WORK}/agent.yaml"
+	# The uninstall deletes what this manifest applied.
+	install -d -m 0700 "$(dirname "${AGENT_MANIFEST}")"
+	install -m 0600 "${WORK}/agent.yaml" "${AGENT_MANIFEST}"
 	kubectl_k3s create namespace kubehz-system --dry-run=client -o yaml | kubectl_k3s apply -f - >/dev/null
 	if [[ "${CFG[HAS_AGENT_TOKEN]:-0}" == "1" && -f "${STATE_DIR}/agent-token" ]]; then
 		kubectl_k3s -n kubehz-system create secret generic kubehz-agent \
@@ -439,6 +457,7 @@ main() {
 	trap cleanup EXIT
 	trap 'on_error ${LINENO}' ERR
 
+	install_uninstall_script
 	install_agent_binary
 	redeem
 	read_install_env
@@ -451,6 +470,7 @@ main() {
 
 	log "Done: cluster ${CFG[CLUSTER_ID]}, k3s ${CFG[K3S_VERSION]}"
 	log "Admin kubeconfig: ${K3S_KUBECONFIG} (root only)"
+	log "Uninstall: sudo ${UNINSTALL_BIN}"
 	if ((!MAINTENANCE)); then
 		log "k3s upgrades from the dashboard need the maintenance path: run the script again with --maintenance"
 	fi

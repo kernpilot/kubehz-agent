@@ -103,7 +103,7 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/k3supgrade` | managed state: the k3s upgrade executor (two system-upgrade-controller Plans, admission policy, failure record, per-server report) |
 | `internal/staterenew` | managed state, HOST side: `state-redeem` (install ticket) and `state-renew` (datastore client certificate renewal, signed requests) |
 | `internal/buildinfo` | build-stamped version |
-| `scripts/k3s-state/` | the managed-state install script (`v1.sh`, bash) and its release renderer |
+| `scripts/k3s-state/` | the managed-state install script (`v1.sh`, bash), the uninstall script it installs (`uninstall.sh`), the release renderer and the script tests (`test.sh`) |
 | `deploy/` | base (read-only) + `managed/` overlay (acting RBAC) + `maintenance/` overlay (k3s upgrades, managed state) — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
 
 The debounce policy is a **pure function** (`publisher.decide`) — no timers in the
@@ -395,7 +395,24 @@ script, checks its sha256 and runs it with bash. The script:
   never leaves it);
 - installs k3s and Cilium at pinned versions, each checked by sha256, with
   the datastore files read through `/etc/kubehz/state/current`;
-- installs the in-cluster agent and the renewal timer.
+- installs the in-cluster agent and the renewal timer;
+- installs `/usr/local/bin/kubehz-k3s-uninstall.sh` (source
+  `scripts/k3s-state/uninstall.sh`, embedded in the release copy) as its
+  first step.
+
+**The uninstall** (`sudo kubehz-k3s-uninstall.sh`, the dashboard shows the
+command) stops and removes the renewal timer and service. On the last
+server, it removes the in-cluster agent and its registration: the
+manifest that the install applied (kept as `/etc/kubehz/kubehz-agent.yaml`),
+namespace `kubehz-system` and the agent's admission policy. When other
+servers are in the cluster or the apiserver does not answer, the in-cluster
+agent stays. Then it removes `/etc/kubehz/state` and the agent binary, runs
+`k3s-uninstall.sh` (or `k3s-agent-uninstall.sh` on an agent node) and
+removes itself. Each step skips what is not there, so a second run
+continues after an interruption. The cluster's state on the platform stays
+until the cluster is deleted in the dashboard. `bash
+scripts/k3s-state/test.sh` runs it on a fake machine (no root, stubs for
+systemctl and k3s).
 
 `--recovery` installs a replacement for a lost server: it removes the old
 Node object and its node password Secret, then restarts k3s.

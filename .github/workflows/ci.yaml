@@ -102,6 +102,11 @@ jobs:
       - name: shellcheck scripts/
         run: shellcheck -x scripts/k3s-state/*.sh
 
+      # The uninstall script on a fake machine (no root, stubs for systemctl
+      # and k3s) and the release renderer with fake assets.
+      - name: script tests
+        run: bash scripts/k3s-state/test.sh
+
   image:
     name: build · push image
     # Publish only from main: never from PRs (no secrets to forks) and never

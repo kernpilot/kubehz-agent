@@ -358,7 +358,8 @@ jobs:
               kubectl apply -f install-managed.yaml  # managed tier: + the acting RBAC
 
           Managed state (k3s with a managed datastore): \`k3s-state-v1.sh\` is the
-          install script that the dashboard runs with its sha256 checked;
+          install script that the dashboard runs with its sha256 checked (it
+          also installs \`kubehz-k3s-uninstall.sh\` on the machine);
           \`install-maintenance.yaml\` adds the k3s upgrade path.
 
           The manifests pin the digest above. \`SHA256SUMS\` covers every asset;
