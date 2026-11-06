@@ -21,11 +21,20 @@
 //
 // A crash at any step leaves "current" on one complete generation, and the
 // next run continues from the state in gen-<n>/meta.json.
+//
+// The first certificate of an install is pending at the api too, until the
+// machine acknowledges it (contract 10.1). The install writes it as gen-1
+// in state "switched", with no previous generation, and starts k3s with
+// it. Then "kubehz-agent state-ack" (Acknowledge) waits for the datastore
+// and sends renew/ack. A run of the timer finishes it as well (step 6).
+//
+// A role agent machine has no certificate: it never runs the renewer.
 package staterenew
 
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -51,7 +60,7 @@ type Host interface {
 type API interface {
 	Check(ctx context.Context, s Signer, req CheckRequest) (CheckResponse, error)
 	Renew(ctx context.Context, s Signer, req RenewRequest) (RenewResponse, error)
-	Ack(ctx context.Context, s Signer) (AckResponse, error)
+	Ack(ctx context.Context, s Signer, req CheckRequest) (AckResponse, error)
 }
 
 // Defaults of the renewer.
@@ -66,6 +75,8 @@ const (
 	// next attempt. Each attempt restarts k3s two times, so the renewer does
 	// not try again at each run of the timer.
 	DefaultRetryAfterSwitchBack = 30 * time.Minute
+	// DefaultAckRetryWait is the wait between two attempts of Acknowledge.
+	DefaultAckRetryWait = 10 * time.Second
 )
 
 // Renewer runs one renewal pass.
@@ -78,6 +89,7 @@ type Renewer struct {
 	ConnectTimeout time.Duration
 	PendingMaxAge  time.Duration
 	RetryAfter     time.Duration
+	AckRetryWait   time.Duration
 	// CommonName is the CSR subject (the api replaces it).
 	CommonName string
 
@@ -101,6 +113,9 @@ func (r *Renewer) defaults() {
 	}
 	if r.RetryAfter <= 0 {
 		r.RetryAfter = DefaultRetryAfterSwitchBack
+	}
+	if r.AckRetryWait <= 0 {
+		r.AckRetryWait = DefaultAckRetryWait
 	}
 	if r.CommonName == "" {
 		r.CommonName = "kubehz-state-client"
@@ -157,10 +172,17 @@ func (r *Renewer) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if na := signer.Cert.NotAfter; !r.Now().Before(na) {
+		// The api refuses a signature of an expired certificate, and k3s
+		// cannot connect with it: only a recovery ticket helps.
+		return fmt.Errorf("the client certificate of %s expired at %s; make a recovery ticket in the dashboard and run the install script with --recovery", genName(cur), na.UTC().Format(time.RFC3339))
+	}
 	version := r.k3sVersion(ctx)
-	// The check also reports the last failure to the platform.
-	chk, err := r.API.Check(ctx, signer, CheckRequest{K3sVersion: version, LastError: r.lastError()})
+	chk, err := r.API.Check(ctx, signer, CheckRequest{K3sVersion: version})
 	if err != nil {
+		if last := r.lastError(); last != "" {
+			return fmt.Errorf("renewal check failed: %w (the last renewal failed: %s)", err, last)
+		}
 		return fmt.Errorf("renewal check failed: %w", err)
 	}
 	if chk.Paused {
@@ -318,6 +340,9 @@ func (r *Renewer) renew(ctx context.Context, signer Signer, cur, n int, m *Meta,
 	if err == nil {
 		err = checkClientCert(cert, key, r.Now())
 	}
+	if err == nil {
+		err = checkIssued(cert, resp.Serial, resp.NotAfter, resp.CAGeneration)
+	}
 	if err != nil {
 		r.abandon(n, m, "the platform answered an unusable certificate: "+err.Error())
 		return fmt.Errorf("renewal answer refused: %w", err)
@@ -335,6 +360,7 @@ func (r *Renewer) renew(ctx context.Context, signer Signer, cur, n int, m *Meta,
 	m.State = StateIssued
 	m.CAGeneration = resp.CAGeneration
 	m.Serial = serialHex(cert)
+	m.NotAfter = cert.NotAfter.UTC()
 	return r.Store.WriteMeta(n, *m)
 }
 
@@ -350,8 +376,10 @@ func (r *Renewer) abandon(n int, m *Meta, why string) {
 
 // finish restarts k3s on the switched generation (unless that already
 // happened), waits for the datastore, and acknowledges or switches back.
+// The first generation of an install (no previous one) is never restarted
+// here: the install script starts k3s with it.
 func (r *Renewer) finish(ctx context.Context, n int, m Meta) error {
-	if m.RestartedAt.IsZero() {
+	if m.RestartedAt.IsZero() && m.Previous > 0 {
 		if err := r.Host.RestartK3s(ctx); err != nil {
 			return fmt.Errorf("restart k3s after the certificate switch: %w; the next run tries again", err)
 		}
@@ -371,10 +399,20 @@ func (r *Renewer) finish(ctx context.Context, n int, m Meta) error {
 	if err != nil {
 		return err
 	}
-	resp, err := r.API.Ack(ctx, signer)
+	resp, err := r.API.Ack(ctx, signer, CheckRequest{K3sVersion: r.k3sVersion(ctx)})
 	if err != nil {
 		if !isPermanent(err) {
 			return fmt.Errorf("acknowledgement failed; the next run sends it again: %w", err)
+		}
+		if m.Previous == 0 {
+			// The first certificate of an install. The api acknowledges the
+			// same serial again, so a refusal is final: the machine was
+			// revoked (for example by a second redemption of its ticket), or
+			// the pending certificate expired. Keep the files: the
+			// uninstall removes them.
+			why := "the platform refused the acknowledgement of the first certificate: " + err.Error()
+			r.setLastError(why)
+			return fmt.Errorf("%w; remove this install (sudo kubehz-k3s-uninstall.sh), then install again with a new ticket", &ackRefusedError{msg: why, err: err})
 		}
 		// A refused acknowledgement can be a repeat: the first one reached
 		// the api, but the answer was lost. Then the new serial is already
@@ -400,6 +438,62 @@ func (r *Renewer) finish(ctx context.Context, n int, m Meta) error {
 	r.prune(n, m.Previous)
 	r.Log.Info("datastore client certificate renewed", "generation", n, "serial", m.Serial)
 	return nil
+}
+
+// ackRefusedError is a final refusal of a first certificate.
+type ackRefusedError struct {
+	msg string
+	err error
+}
+
+func (e *ackRefusedError) Error() string { return e.msg }
+func (e *ackRefusedError) Unwrap() error { return e.err }
+
+// Acknowledge finishes an install: the first certificate (gen-1, no
+// previous generation) is pending at the api until this machine
+// acknowledges it (contract 10.1). The install script runs it after k3s
+// started with that certificate. It waits for the datastore and sends
+// renew/ack, signed with the certificate. It tries again after a transient
+// failure until ctx ends, and stops at a final refusal. A certificate that
+// is acknowledged already is a success; a second ack is not sent.
+//
+// It never redeems: a second redemption of the same ticket would revoke
+// this machine.
+func (r *Renewer) Acknowledge(ctx context.Context) error {
+	r.defaults()
+	cur, err := r.Store.Current()
+	if err != nil {
+		return fmt.Errorf("find the current certificate in %s: %w; run the install first", r.Store.Dir, err)
+	}
+	for {
+		m, err := r.Store.ReadMeta(cur)
+		if err != nil {
+			return err
+		}
+		switch {
+		case m.State == StateAcked:
+			r.Log.Info("the datastore client certificate is acknowledged", "generation", cur, "serial", m.Serial)
+			return nil
+		case m.State != StateSwitched || m.Previous != 0:
+			return fmt.Errorf("%s is not the first certificate of an install (state %q, previous %d); the renewal timer finishes it", genName(cur), m.State, m.Previous)
+		}
+		err = r.finish(ctx, cur, m)
+		if err == nil {
+			return nil
+		}
+		var refused *ackRefusedError
+		if errors.As(err, &refused) {
+			return err
+		}
+		r.Log.Warn("the acknowledgement did not finish; trying again", "error", err.Error(), "wait", r.AckRetryWait.String())
+		t := time.NewTimer(r.AckRetryWait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return fmt.Errorf("%w; run the install script again: it continues with the same certificate", err)
+		case <-t.C:
+		}
+	}
 }
 
 // switchBack returns to the previous generation. It does not when the CA

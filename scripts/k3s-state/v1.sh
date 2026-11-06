@@ -2,12 +2,15 @@
 # kubehz: k3s with managed state, install script v1.
 #
 # This script installs a k3s SERVER whose datastore is a managed kine on
-# the kubehz platform. The dashboard shows the command that downloads this
-# file, checks its sha256, and then runs it:
+# the kubehz platform, or (--role agent) a k3s AGENT node that joins such a
+# server. The dashboard shows the command that downloads this file, checks
+# its sha256, and then runs it:
 #
 #   curl -sfLo kubehz-k3s.sh <url> && echo "<sha256>  kubehz-k3s.sh" | sha256sum -c && sudo bash kubehz-k3s.sh
 #
-# What it does, in order:
+# The ticket sets the role. For an agent ticket, add "--role agent".
+#
+# What it does for a server, in order:
 #   1. Checks the machine (root, bash, Linux, systemd; no old k3s etcd data).
 #   2. Installs /usr/local/bin/kubehz-k3s-uninstall.sh (source:
 #      scripts/k3s-state/uninstall.sh), which removes all of this again.
@@ -19,12 +22,19 @@
 #      flannel, no network policy controller, no traefik, no servicelb.
 #   6. Installs Cilium (pinned chart, sha256 checked) through the k3s Helm
 #      controller, and the static SSO role bindings.
-#   7. Recovery (--recovery): removes the old Node object and its node
+#   7. Acknowledges the client certificate ("kubehz-agent state-ack"): the
+#      platform keeps the first certificate pending until k3s runs with it.
+#   8. Recovery (--recovery): removes the old Node object and its node
 #      password Secret, then restarts k3s.
-#   8. Installs the in-cluster kubehz-agent and its registration, and keeps
+#   9. Installs the in-cluster kubehz-agent and its registration, and keeps
 #      the applied manifest for the uninstall.
-#   9. Installs the certificate renewal timer (kubehz-agent state-renew,
+#  10. Installs the certificate renewal timer (kubehz-agent state-renew,
 #      every 5 minutes).
+#
+# An agent node gets no datastore identity: steps 1 to 3, then the
+# redemption WITHOUT a key or CSR (the answer has the k3s token and the
+# server URL), then k3s as an agent of that server. No Cilium (the server
+# installs it), no in-cluster agent, no certificate, no renewal timer.
 #
 # The script is static: the same file for every cluster. It never pipes a
 # download into a shell, and every download is checked against a pinned
@@ -71,16 +81,21 @@ readonly STATE_DIR="/etc/kubehz/state"
 readonly AGENT_MANIFEST="/etc/kubehz/kubehz-agent.yaml"
 readonly AGENT_BIN="/usr/local/bin/kubehz-agent"
 readonly UNINSTALL_BIN="/usr/local/bin/kubehz-k3s-uninstall.sh"
+readonly UNIT_DIR="/etc/systemd/system"
 readonly K3S_BIN="/usr/local/bin/k3s"
-readonly K3S_CONFIG="/etc/rancher/k3s/config.yaml"
-readonly K3S_KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+readonly K3S_CONFIG_DIR="/etc/rancher/k3s"
+readonly K3S_CONFIG="${K3S_CONFIG_DIR}/config.yaml"
+readonly K3S_KUBECONFIG="${K3S_CONFIG_DIR}/k3s.yaml"
 readonly K3S_SERVER_DIR="/var/lib/rancher/k3s/server"
 readonly K3S_MANIFESTS="${K3S_SERVER_DIR}/manifests"
 readonly K3S_CHARTS="${K3S_SERVER_DIR}/static/charts"
+# The k3s installer names the service of an agent "k3s-agent".
+readonly K3S_AGENT_SERVICE="k3s-agent"
 
 # ── Options ──────────────────────────────────────────────────────────────
 API_URL="https://api.kubehz.cloud"
 LABEL=""
+ROLE="server"
 RECOVERY=0
 MAINTENANCE=0
 
@@ -97,15 +112,20 @@ usage() {
 	cat <<'EOF'
 Usage: sudo bash kubehz-k3s.sh [options]
 
-Installs a k3s server with a managed datastore on the kubehz platform.
-The script asks for the install ticket from the dashboard.
+Installs a k3s server with a managed datastore on the kubehz platform, or
+a k3s agent node that joins such a server. The script asks for the install
+ticket from the dashboard.
 
 Options:
+  --role ROLE        server (default) or agent: the role of the ticket. An
+                     agent node joins the k3s server of its ticket. It gets
+                     no datastore certificate and no renewal timer.
   --recovery         Install a replacement for a lost server. Use a recovery
-                     ticket. The old server must stay off.
+                     ticket. The old server must stay off. Server only.
   --maintenance      Also install the k3s upgrade path (the system-upgrade-
                      controller with zero replicas and the agent's rights to
-                     run upgrades that you start in the dashboard).
+                     run upgrades that you start in the dashboard). Server
+                     only.
   --label NAME       Machine label in the dashboard (default: the host name).
   --api-url URL      kubehz api (default: https://api.kubehz.cloud).
   -h, --help         Show this text.
@@ -117,6 +137,11 @@ parse_args() {
 		case "$1" in
 		--recovery) RECOVERY=1 ;;
 		--maintenance) MAINTENANCE=1 ;;
+		--role)
+			(($# > 1)) || die "--role needs a value (server or agent)"
+			ROLE="$2"
+			shift
+			;;
 		--label)
 			(($# > 1)) || die "--label needs a value"
 			LABEL="$2"
@@ -137,6 +162,14 @@ parse_args() {
 	done
 	[[ "${API_URL}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] ||
 		die "api URL '${API_URL}' is not https://<host>[:port]"
+	case "${ROLE}" in
+	server) ;;
+	agent)
+		((!RECOVERY)) || die "--recovery is for a server; an agent ticket is an install ticket"
+		((!MAINTENANCE)) || die "--maintenance is for a server; the server installs the upgrade path for the whole cluster"
+		;;
+	*) die "role '${ROLE}' is not server or agent; use the role of the ticket" ;;
+	esac
 	if [[ -z "${LABEL}" ]]; then
 		LABEL="$(uname -n | cut -d. -f1 | tr '[:upper:]' '[:lower:]')"
 	fi
@@ -181,7 +214,7 @@ check_machine() {
 	*) die "machine architecture $(uname -m) is not supported (amd64 and arm64 only)" ;;
 	esac
 	readonly ARCH
-	if [[ -e "${K3S_SERVER_DIR}/db/etcd" ]]; then
+	if [[ "${ROLE}" == "server" && -e "${K3S_SERVER_DIR}/db/etcd" ]]; then
 		die "this machine has embedded etcd data of an earlier k3s (${K3S_SERVER_DIR}/db/etcd); k3s would use it instead of the managed datastore. Use a clean machine, or uninstall k3s and remove ${K3S_SERVER_DIR} first"
 	fi
 	if [[ "${AGENT_VERSION}" == @* || "${K3S_INSTALLER_SHA256}" == @* ]]; then
@@ -207,8 +240,27 @@ install_agent_binary() {
 	install -m 0755 -o root -g root "${WORK}/kubehz-agent" "${AGENT_BIN}"
 }
 
+# redeemed_before: a run before redeemed the ticket. A server has the
+# symlink "current"; an agent node has no certificate, only the k3s token.
+# install.env is the last file that a redemption writes. A machine that
+# redeemed a ticket of the other role stops here, before a redemption.
+redeemed_before() {
+	[[ -f "${STATE_DIR}/install.env" ]] || return 1
+	local installed
+	installed="$(sed -n 's/^ROLE=//p' "${STATE_DIR}/install.env")"
+	[[ "${installed:-server}" == "${ROLE}" ]] ||
+		die "this machine redeemed a ${installed:-server} ticket; run the script with --role ${installed:-server}"
+	if [[ "${ROLE}" == "agent" ]]; then
+		[[ -f "${STATE_DIR}/k3s-token" ]]
+	else
+		[[ -L "${STATE_DIR}/current" ]]
+	fi
+}
+
 redeem() {
-	if [[ -L "${STATE_DIR}/current" && -f "${STATE_DIR}/install.env" ]]; then
+	# Never redeem twice: a second redemption of the same ticket revokes
+	# the certificate that this machine has not acknowledged yet.
+	if redeemed_before; then
 		log "The ticket was redeemed before; continuing the install"
 		return
 	fi
@@ -223,7 +275,7 @@ redeem() {
 	log "Redeeming the ticket"
 	# printf is a bash builtin: the ticket is in no argument list and no
 	# environment of another process.
-	local args=(state-redeem --dir "${STATE_DIR}" --api-url "${API_URL}" --label "${LABEL}" --role server)
+	local args=(state-redeem --dir "${STATE_DIR}" --api-url "${API_URL}" --label "${LABEL}" --role "${ROLE}")
 	if ! printf '%s\n' "${ticket}" | "${AGENT_BIN}" "${args[@]}"; then
 		ticket=""
 		die "the ticket was not redeemed (see the message above)"
@@ -237,7 +289,7 @@ read_install_env() {
 	local key value
 	while IFS='=' read -r key value; do
 		case "${key}" in
-		CLUSTER_ID | MACHINE_ID | STATE_ENDPOINT | K3S_VERSION | CLUSTER_CIDR | SERVICE_CIDR | TLS_SANS | HAS_AUTHN_CONFIG | HAS_SSO_BINDINGS | HAS_AGENT_TOKEN)
+		ROLE | CLUSTER_ID | MACHINE_ID | STATE_ENDPOINT | SERVER_URL | K3S_VERSION | CLUSTER_CIDR | SERVICE_CIDR | TLS_SANS | HAS_AUTHN_CONFIG | HAS_SSO_BINDINGS | HAS_AGENT_TOKEN)
 			CFG["${key}"]="${value}"
 			;;
 		"") ;;
@@ -245,10 +297,20 @@ read_install_env() {
 		esac
 	done <"${STATE_DIR}/install.env"
 
-	[[ "${CFG[CLUSTER_ID]:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$ ]] || die "install.env: cluster id is not valid"
-	[[ "${CFG[STATE_ENDPOINT]:-}" =~ ^https://[a-z0-9.-]+:[0-9]{1,5}/?$ ]] || die "install.env: datastore endpoint is not valid"
+	[[ "${CFG[ROLE]:-server}" == "${ROLE}" ]] ||
+		die "this machine redeemed a ${CFG[ROLE]:-server} ticket; run the script with --role ${CFG[ROLE]:-server}"
 	[[ -n "${CFG[K3S_VERSION]:-}" ]] || CFG[K3S_VERSION]="${K3S_DEFAULT}"
 	[[ "${CFG[K3S_VERSION]}" =~ ^v1\.[0-9]{1,3}\.[0-9]{1,3}\+k3s[0-9]{1,3}$ ]] || die "install.env: k3s version is not valid"
+	if [[ "${ROLE}" == "agent" ]]; then
+		# The api's rule for the server URL of an agent ticket.
+		[[ "${CFG[SERVER_URL]:-}" =~ ^https://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?$ ]] ||
+			die "install.env: k3s server URL is not valid"
+		[[ -z "${CFG[STATE_ENDPOINT]:-}" ]] || die "install.env: an agent node has no datastore endpoint"
+		return 0
+	fi
+	[[ -z "${CFG[SERVER_URL]:-}" ]] || die "install.env: a server has no k3s server URL"
+	[[ "${CFG[CLUSTER_ID]:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$ ]] || die "install.env: cluster id is not valid"
+	[[ "${CFG[STATE_ENDPOINT]:-}" =~ ^https://[a-z0-9.-]+:[0-9]{1,5}/?$ ]] || die "install.env: datastore endpoint is not valid"
 	[[ -n "${CFG[CLUSTER_CIDR]:-}" ]] || CFG[CLUSTER_CIDR]="10.42.0.0/16"
 	[[ -n "${CFG[SERVICE_CIDR]:-}" ]] || CFG[SERVICE_CIDR]="10.43.0.0/16"
 	local cidr
@@ -272,7 +334,7 @@ k3s_sha256() {
 
 write_k3s_config() {
 	local endpoint="${CFG[STATE_ENDPOINT]%/}"
-	install -d -m 0755 /etc/rancher/k3s
+	install -d -m 0755 "${K3S_CONFIG_DIR}"
 	{
 		echo "# Written by the kubehz install script ${AGENT_VERSION}. The datastore files are"
 		echo "# read through the symlink ${STATE_DIR}/current, which the renewal timer switches."
@@ -341,7 +403,9 @@ EOF
 	fi
 }
 
-install_k3s() {
+# download_k3s installs the pinned k3s binary and downloads the pinned k3s
+# installer to ${WORK}/k3s-install.sh.
+download_k3s() {
 	local version="${CFG[K3S_VERSION]}" sum asset="k3s"
 	sum="$(k3s_sha256 "${version}")" ||
 		die "this script does not pin k3s ${version}; run the install script version that the dashboard shows"
@@ -350,6 +414,10 @@ install_k3s() {
 	download "https://github.com/k3s-io/k3s/releases/download/${version/+/%2B}/${asset}" "${WORK}/k3s" "${sum}"
 	download "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_INSTALLER_REF}/install.sh" "${WORK}/k3s-install.sh" "${K3S_INSTALLER_SHA256}"
 	install -m 0755 -o root -g root "${WORK}/k3s" "${K3S_BIN}"
+}
+
+install_k3s() {
+	download_k3s
 	write_k3s_config
 	write_cilium_chart
 	# The installer reads the flags from ${K3S_CONFIG}. It does not start
@@ -358,6 +426,43 @@ install_k3s() {
 	INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="server" sh "${WORK}/k3s-install.sh"
 	systemctl restart --no-block k3s
 	wait_apiserver
+}
+
+# write_k3s_agent_config: an agent node joins the k3s server of its ticket
+# with the k3s token. It has no datastore settings.
+write_k3s_agent_config() {
+	install -d -m 0755 "${K3S_CONFIG_DIR}"
+	{
+		echo "# Written by the kubehz install script ${AGENT_VERSION}: a k3s agent node."
+		echo "server: \"${CFG[SERVER_URL]}\""
+		echo "token-file: ${STATE_DIR}/k3s-token"
+	} >"${K3S_CONFIG}.tmp"
+	chmod 0600 "${K3S_CONFIG}.tmp"
+	mv -f -- "${K3S_CONFIG}.tmp" "${K3S_CONFIG}"
+}
+
+# install_k3s_agent installs k3s as an agent of the server in install.env.
+# The installer names the service k3s-agent and the uninstaller
+# k3s-agent-uninstall.sh, which kubehz-k3s-uninstall.sh runs.
+install_k3s_agent() {
+	download_k3s
+	write_k3s_agent_config
+	INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="agent" sh "${WORK}/k3s-install.sh"
+	systemctl restart --no-block "${K3S_AGENT_SERVICE}"
+	wait_agent
+}
+
+# wait_agent: the k3s agent service becomes active when it joined the
+# server (the unit is of Type=notify).
+wait_agent() {
+	local i
+	for ((i = 0; i < 60; i++)); do
+		if systemctl is-active --quiet "${K3S_AGENT_SERVICE}"; then
+			return 0
+		fi
+		sleep 5
+	done
+	die "the k3s agent did not join ${CFG[SERVER_URL]} in 5 minutes; see 'journalctl -u ${K3S_AGENT_SERVICE}' (check that this machine reaches the server), then run the script again"
 }
 
 wait_apiserver() {
@@ -421,9 +526,20 @@ install_agent() {
 	kubectl_k3s apply -f "${WORK}/agent.yaml" >/dev/null
 }
 
+# acknowledge_certificate: the platform keeps the first client certificate
+# pending until k3s runs with it. "state-ack" waits for the datastore, sends
+# the acknowledgement signed with the certificate, and tries again after a
+# transient failure (up to 5 minutes). It never redeems the ticket again: a
+# second redemption revokes this machine.
+acknowledge_certificate() {
+	log "Acknowledging the datastore client certificate"
+	"${AGENT_BIN}" state-ack --dir "${STATE_DIR}" --kubeconfig "${K3S_KUBECONFIG}" ||
+		die "the platform did not acknowledge the client certificate (see the message above). Run this script again: it continues with the same certificate. Do not redeem the ticket again"
+}
+
 install_renew_timer() {
 	log "Installing the certificate renewal timer"
-	cat >/etc/systemd/system/kubehz-state-renew.service <<EOF
+	cat >"${UNIT_DIR}/kubehz-state-renew.service" <<EOF
 [Unit]
 Description=kubehz: renew the datastore client certificate of k3s
 After=network-online.target k3s.service
@@ -433,7 +549,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${AGENT_BIN} state-renew --dir ${STATE_DIR}
 EOF
-	cat >/etc/systemd/system/kubehz-state-renew.timer <<'EOF'
+	cat >"${UNIT_DIR}/kubehz-state-renew.timer" <<'EOF'
 [Unit]
 Description=kubehz: renew the datastore client certificate of k3s every 5 minutes
 
@@ -445,9 +561,17 @@ RandomizedDelaySec=30s
 [Install]
 WantedBy=timers.target
 EOF
-	chmod 0644 /etc/systemd/system/kubehz-state-renew.service /etc/systemd/system/kubehz-state-renew.timer
+	chmod 0644 "${UNIT_DIR}/kubehz-state-renew.service" "${UNIT_DIR}/kubehz-state-renew.timer"
 	systemctl daemon-reload
 	systemctl enable --now kubehz-state-renew.timer
+}
+
+# main_agent installs an agent node: no datastore identity, so no
+# certificate, no acknowledgement and no renewal timer (contract 10.5).
+main_agent() {
+	install_k3s_agent
+	log "Done: agent node ${LABEL} (machine ${CFG[MACHINE_ID]:-}) joined ${CFG[SERVER_URL]}, k3s ${CFG[K3S_VERSION]}"
+	log "Uninstall: sudo ${UNINSTALL_BIN}"
 }
 
 main() {
@@ -461,7 +585,12 @@ main() {
 	install_agent_binary
 	redeem
 	read_install_env
+	if [[ "${ROLE}" == "agent" ]]; then
+		main_agent
+		return
+	fi
 	install_k3s
+	acknowledge_certificate
 	if ((RECOVERY)); then
 		recover_node
 	fi

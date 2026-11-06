@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -24,12 +25,11 @@ const (
 
 const maxResponse = 1 << 20
 
-// CheckRequest is the body of renew/check. The contract does not name a
-// body; K3sVersion is the local k3s version that design 4.4 step 4 needs
-// for a rollback, and LastError is the last failure of this renewer.
+// CheckRequest is the body of renew/check and renew/ack: the local k3s
+// version (design 4.4 step 4). The api refuses any other field, so the last
+// failure of this renewer stays on the host (file last-error).
 type CheckRequest struct {
 	K3sVersion string `json:"k3sVersion,omitempty"`
-	LastError  string `json:"lastError,omitempty"`
 }
 
 // CheckResponse is the answer of renew/check.
@@ -39,8 +39,7 @@ type CheckResponse struct {
 	Paused bool   `json:"paused"`
 }
 
-// RenewRequest is the body of renew. K3sVersion is not in the contract yet
-// (design 4.4 step 4).
+// RenewRequest is the body of renew.
 type RenewRequest struct {
 	CSR        string `json:"csr"`
 	K3sVersion string `json:"k3sVersion,omitempty"`
@@ -48,8 +47,10 @@ type RenewRequest struct {
 
 // RenewResponse is the answer of renew: a PENDING certificate.
 type RenewResponse struct {
-	Certificate  string `json:"certificate"`
-	CAGeneration int64  `json:"caGeneration"`
+	Certificate  string    `json:"certificate"`
+	CAGeneration int64     `json:"caGeneration"`
+	Serial       string    `json:"serial"`
+	NotAfter     time.Time `json:"notAfter"`
 }
 
 // AckResponse is the answer of renew/ack.
@@ -57,19 +58,27 @@ type AckResponse struct {
 	Serial string `json:"serial"`
 }
 
-// RedeemRequest is the body of redeem.
+// RedeemRequest is the body of redeem. CSR is empty for role agent: the
+// api refuses a CSR from an agent machine (contract 10.5).
 type RedeemRequest struct {
 	Ticket       string `json:"ticket"`
-	CSR          string `json:"csr"`
+	CSR          string `json:"csr,omitempty"`
 	MachineLabel string `json:"machineLabel"`
 	Role         string `json:"role"`
 }
 
-// RedeemResponse is the answer of redeem. AgentToken is not in the build
-// contract yet: the install needs it to register the in-cluster agent.
+// RedeemResponse is the answer of redeem. The api answers null for the
+// certificate fields, ServingCA and Endpoint of role agent; a null decodes
+// to the zero value here. Serial can also be null for role server.
+// AgentToken is not in the api contract yet: the install needs it to
+// register the in-cluster agent, and waits for the Secret without it.
 type RedeemResponse struct {
 	MachineID     string        `json:"machineId"`
+	Kind          string        `json:"kind"`
 	Certificate   string        `json:"certificate"`
+	Serial        string        `json:"serial"`
+	NotAfter      time.Time     `json:"notAfter"`
+	CAGeneration  int64         `json:"caGeneration"`
 	ServingCA     string        `json:"servingCA"`
 	Endpoint      string        `json:"endpoint"`
 	K3sToken      string        `json:"k3sToken"`
@@ -78,13 +87,18 @@ type RedeemResponse struct {
 }
 
 // InstallConfig is the stored install configuration (design 4.2 step 3).
-// The build contract names the field but not its shape; this is the shape
-// the install reads. Every field is optional except ClusterID.
+// The api sends k3sVersion, ciliumVersion, clusterCidr, serviceCidr,
+// serverFlags and serverUrl; the install reads the fields below. ServerURL
+// is the k3s server that a role agent machine joins (null for role server).
+// ClusterID, TLSSANs, AuthenticationConfig and RoleBindings are not in the
+// api contract yet; the install uses them when they come. The cluster id of
+// a server comes from its client certificate.
 type InstallConfig struct {
-	ClusterID            string        `json:"clusterId"`
+	ClusterID            string        `json:"clusterId,omitempty"`
 	K3sVersion           string        `json:"k3sVersion,omitempty"`
 	ClusterCIDR          string        `json:"clusterCidr,omitempty"`
 	ServiceCIDR          string        `json:"serviceCidr,omitempty"`
+	ServerURL            string        `json:"serverUrl,omitempty"`
 	TLSSANs              []string      `json:"tlsSans,omitempty"`
 	AuthenticationConfig string        `json:"authenticationConfig,omitempty"`
 	RoleBindings         []RoleBinding `json:"roleBindings,omitempty"`
@@ -97,18 +111,24 @@ type RoleBinding struct {
 	Groups      []string `json:"groups"`
 }
 
-// StatusError is a non-2xx answer of the api.
+// StatusError is a non-2xx answer of the api. Code is the api's stable
+// error code (for example STATE_TICKET_USED), when the answer has one.
 type StatusError struct {
 	Path   string
 	Status int
+	Code   string
 	Detail string
 }
 
 func (e *StatusError) Error() string {
-	if e.Detail != "" {
-		return fmt.Sprintf("%s answered HTTP %d: %s", e.Path, e.Status, e.Detail)
+	s := fmt.Sprintf("%s answered HTTP %d", e.Path, e.Status)
+	if e.Code != "" {
+		s += " " + e.Code
 	}
-	return fmt.Sprintf("%s answered HTTP %d", e.Path, e.Status)
+	if e.Detail != "" {
+		s += ": " + e.Detail
+	}
+	return s
 }
 
 // Permanent reports whether a retry of the same request cannot succeed.
@@ -131,7 +151,8 @@ type Client struct {
 }
 
 // NewClient builds a Client for apiURL (https; http only for a loopback
-// host). httpClient may be nil.
+// host; no path, so that the request path is the signed path). httpClient
+// may be nil.
 func NewClient(apiURL, clusterID, userAgent string, httpClient *http.Client) (*Client, error) {
 	u, err := checkAPIURL(apiURL)
 	if err != nil {
@@ -159,6 +180,11 @@ func checkAPIURL(raw string) (*url.URL, error) {
 	default:
 		return nil, fmt.Errorf("api URL %q must use https", raw)
 	}
+	// The api checks the signed path against the request path (contract
+	// 10.3). A path of the api URL would be in the request path only.
+	if u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.User != nil {
+		return nil, fmt.Errorf("api URL %q must be https://<host>[:<port>], with no path, query or user", raw)
+	}
 	return u, nil
 }
 
@@ -174,10 +200,11 @@ func (c *Client) Renew(ctx context.Context, s Signer, req RenewRequest) (RenewRe
 	return out, c.do(ctx, &s, pathRenew, req, &out)
 }
 
-// Ack calls renew/ack, signed with the NEW key.
-func (c *Client) Ack(ctx context.Context, s Signer) (AckResponse, error) {
+// Ack calls renew/ack, signed with the NEW key. It acknowledges a renewed
+// certificate and the first certificate of an install.
+func (c *Client) Ack(ctx context.Context, s Signer, req CheckRequest) (AckResponse, error) {
 	var out AckResponse
-	return out, c.do(ctx, &s, pathAck, struct{}{}, &out)
+	return out, c.do(ctx, &s, pathAck, req, &out)
 }
 
 // Redeem calls redeem. The ticket is in the body; nothing logs the body.
@@ -192,7 +219,7 @@ func (c *Client) do(ctx context.Context, s *Signer, path string, in, out any) er
 		return fmt.Errorf("encode %s request: %w", path, err)
 	}
 	u := *c.base
-	u.Path = strings.TrimRight(u.Path, "/") + path
+	u.Path = path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build %s request: %w", path, err)
@@ -201,7 +228,9 @@ func (c *Client) do(ctx context.Context, s *Signer, path string, in, out any) er
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
 	if s != nil {
-		jws, err := s.Sign(http.MethodPost, u.Path, body, c.clusterID, c.now())
+		// The signed path is the route path: with /api, without a query
+		// (contract 10.3). It is the whole request path (checkAPIURL).
+		jws, err := s.Sign(http.MethodPost, path, body, c.clusterID, c.now())
 		if err != nil {
 			return fmt.Errorf("sign %s request: %w", path, err)
 		}
@@ -217,7 +246,8 @@ func (c *Client) do(ctx context.Context, s *Signer, path string, in, out any) er
 		return fmt.Errorf("read %s answer: %w", path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &StatusError{Path: path, Status: resp.StatusCode, Detail: problemDetail(raw)}
+		code, detail := problemDetail(raw)
+		return &StatusError{Path: path, Status: resp.StatusCode, Code: code, Detail: detail}
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("decode %s answer: %w", path, err)
@@ -225,27 +255,59 @@ func (c *Client) do(ctx context.Context, s *Signer, path string, in, out any) er
 	return nil
 }
 
-// problemDetail takes the title/detail of a problem response, one line,
-// bounded. It never echoes a request body.
-func problemDetail(raw []byte) string {
+// errorCode returns the api's error code of err, or "".
+func errorCode(err error) string {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	return ""
+}
+
+// problemDetail takes the code and the message of an error answer, one
+// line, bounded. The api sends {statusCode, data: {code, message, help}};
+// a problem response {title, detail} also works. It never echoes a
+// request body.
+func problemDetail(raw []byte) (string, string) {
 	var p struct {
 		Title   string `json:"title"`
 		Detail  string `json:"detail"`
 		Message string `json:"message"`
+		Code    string `json:"code"`
+		Data    struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"data"`
 	}
 	if json.Unmarshal(raw, &p) != nil {
-		return ""
+		return "", ""
 	}
-	d := p.Detail
-	if d == "" {
-		d = p.Message
+	clean := func(s string, n int) string {
+		s = strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return ' '
+			}
+			return r
+		}, s)
+		if r := []rune(s); len(r) > n {
+			s = string(r[:n]) + "…"
+		}
+		return s
 	}
-	if d == "" {
-		d = p.Title
+	code := p.Data.Code
+	if code == "" {
+		code = p.Code
 	}
-	d = strings.ReplaceAll(d, "\n", " ")
-	if r := []rune(d); len(r) > 200 {
-		d = string(r[:200]) + "…"
+	if !errorCodeRE.MatchString(code) {
+		code = ""
 	}
-	return d
+	d := p.Data.Message
+	for _, alt := range []string{p.Detail, p.Message, p.Title} {
+		if d == "" {
+			d = alt
+		}
+	}
+	return code, clean(d, 200)
 }
+
+var errorCodeRE = regexp.MustCompile(`^[A-Z][A-Z0-9_]{1,63}$`)

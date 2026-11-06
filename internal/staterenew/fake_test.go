@@ -1,6 +1,7 @@
 package staterenew
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -27,7 +28,10 @@ import (
 	"time"
 )
 
-const testCluster = "c1"
+const (
+	testCluster = "c1"
+	testMachine = "m-1"
+)
 
 var errCrash = errors.New("simulated crash")
 
@@ -49,7 +53,7 @@ func newTestCA(t *testing.T, gen int64) *testCA {
 		SerialNumber:          big.NewInt(gen),
 		Subject:               pkix.Name{CommonName: fmt.Sprintf("test client CA g%d", gen)},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotAfter:              time.Now().Add(60 * 24 * time.Hour),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign,
@@ -63,13 +67,19 @@ func newTestCA(t *testing.T, gen int64) *testCA {
 }
 
 type pendingCert struct {
-	pem    string
-	serial string
-	caGen  int64
+	pem      string
+	serial   string
+	caGen    int64
+	notAfter time.Time
 }
 
-// fakeAPI is the machine side of the kubehz api (build contract 4.2 and
-// 4.3). It verifies every signed request as the api must.
+// fakeAPI is the machine side of the kubehz api (build contract 4.2, 4.3
+// and 10). It enforces what the api enforces: strict request bodies, the
+// signed method, path (the raw request path, without the query) and body,
+// the role rules of a redemption, a first certificate that stays pending
+// until it is acknowledged, an ack that answers the same serial again, and
+// the revocation of an unacknowledged machine when its ticket is redeemed
+// a second time.
 type fakeAPI struct {
 	t   *testing.T
 	mu  sync.Mutex
@@ -77,18 +87,25 @@ type fakeAPI struct {
 
 	active  string                  // serial of the active machine certificate
 	pending map[string]*pendingCert // by public key and CA generation
+	revoked bool                    // the machine is revoked
 
 	due, paused bool
 	dropRenew   int // renew answers to lose (the request is processed)
 	ackStatus   int // answer every ack with this status (0: normal)
+	ackFailures int // answer this many acks with 503 first
 
-	csrs   []string
-	checks []CheckRequest
-	acks   int
-	jti    map[string]bool
+	csrs      []string
+	checks    []CheckRequest
+	ackBodies []CheckRequest
+	acks      int
+	signed    []string // the signed path of each signed request
+	jti       map[string]bool
 
-	redeemed []RedeemRequest
-	redeem   func(req RedeemRequest, pub any) (RedeemResponse, int)
+	ticketRole string // the role of testTicket ("" is server)
+	ticketUsed bool
+	redeemed   []RedeemRequest
+	redeemRaw  []map[string]any
+	redeem     func(req RedeemRequest, pub any) (RedeemResponse, int)
 }
 
 func newFakeAPI(t *testing.T) (*fakeAPI, *httptest.Server) {
@@ -108,15 +125,23 @@ func (a *fakeAPI) rotateCA() {
 	a.pending = map[string]*pendingCert{} // a CA rotation drops every pending certificate
 }
 
-// issue signs a client certificate for pub with the newest CA.
+// issue signs a server client certificate for pub with the newest CA. The
+// subject is the api's: O the cluster, OU the role, CN the machine.
 func (a *fakeAPI) issue(pub any) (string, string) {
+	c := a.issuePending(pub)
+	return c.pem, c.serial
+}
+
+func (a *fakeAPI) issuePending(pub any) *pendingCert {
 	ca := a.ca()
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))
+	// The api's notAfter has milliseconds; the certificate has seconds.
+	notAfter := time.Now().Add(30*24*time.Hour + 123*time.Millisecond)
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "system:kine:" + testCluster},
+		Subject:      pkix.Name{Organization: []string{testCluster}, OrganizationalUnit: []string{RoleServer}, CommonName: testMachine},
 		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(30 * 24 * time.Hour),
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
@@ -124,13 +149,41 @@ func (a *fakeAPI) issue(pub any) (string, string) {
 	if err != nil {
 		a.t.Fatal(err)
 	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), serial.Text(16)
+	return &pendingCert{
+		pem:      string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		serial:   serial.Text(16),
+		caGen:    ca.gen,
+		notAfter: notAfter.UTC(),
+	}
 }
 
-func (a *fakeAPI) problem(w http.ResponseWriter, status int, detail string) {
-	w.Header().Set("Content-Type", "application/problem+json")
+func (a *fakeAPI) pendingKey(pub any) string {
+	pubDER, _ := x509.MarshalPKIXPublicKey(pub)
+	return fmt.Sprintf("%x/%d", sha256.Sum256(pubDER), a.ca().gen)
+}
+
+// problem writes an error as the api does: the h3 envelope with
+// {code, message, help} under data.
+func (a *fakeAPI) problem(w http.ResponseWriter, status int, code, msg string) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": status, "detail": detail})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"statusCode":    status,
+		"statusMessage": msg,
+		"message":       msg,
+		"data":          map[string]any{"code": code, "message": msg, "help": "test help"},
+	})
+}
+
+// strictJSON decodes like the api's .strict() schemas: an unknown field is
+// an error. An empty body is {}.
+func strictJSON(body []byte, v any) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 // verify checks the signed request and returns the signing certificate.
@@ -168,17 +221,23 @@ func (a *fakeAPI) verify(r *http.Request, body []byte) (*x509.Certificate, error
 	if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
 		return nil, fmt.Errorf("chain: %w", err)
 	}
+	if len(cert.Subject.Organization) != 1 || cert.Subject.Organization[0] != testCluster {
+		return nil, errors.New("subject names another cluster")
+	}
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
 	pub := cert.PublicKey.(*ecdsa.PublicKey)
 	if len(sig) != 64 || !ecdsa.Verify(pub, digest[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])) {
 		return nil, errors.New("bad signature")
 	}
+	// The api compares the signed path with its request path: the raw
+	// path with /api, without the query.
+	reqPath, _, _ := strings.Cut(r.RequestURI, "?")
 	sum := sha256.Sum256(body)
 	switch {
 	case p.Method != r.Method:
 		return nil, errors.New("method mismatch")
-	case p.Path != r.URL.Path:
-		return nil, errors.New("path mismatch")
+	case p.Path != reqPath:
+		return nil, fmt.Errorf("path mismatch: signed %q, request %q", p.Path, reqPath)
 	case p.BodySHA256 != hex.EncodeToString(sum[:]):
 		return nil, errors.New("body hash mismatch")
 	case p.ClusterID != testCluster:
@@ -189,6 +248,7 @@ func (a *fakeAPI) verify(r *http.Request, body []byte) (*x509.Certificate, error
 		return nil, errors.New("jti replayed or malformed")
 	}
 	a.jti[p.JTI] = true
+	a.signed = append(a.signed, p.Path)
 	return cert, nil
 }
 
@@ -202,56 +262,80 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cert, err := a.verify(r, body)
 	if err != nil {
-		a.problem(w, http.StatusUnauthorized, "signature: "+err.Error())
+		a.problem(w, http.StatusUnauthorized, "STATE_SIGNATURE_INVALID", "signature: "+err.Error())
+		return
+	}
+	if a.revoked {
+		a.problem(w, http.StatusForbidden, "STATE_MACHINE_REVOKED", "the machine is revoked")
 		return
 	}
 	serial := cert.SerialNumber.Text(16)
 	switch r.URL.Path {
 	case pathCheck:
-		if serial != a.active {
-			a.problem(w, http.StatusForbidden, "serial is not active")
-			return
-		}
 		var req CheckRequest
-		_ = json.Unmarshal(body, &req)
-		a.checks = append(a.checks, req)
-		_ = json.NewEncoder(w).Encode(CheckResponse{Due: a.due, Paused: a.paused, Reason: "test"})
-	case pathRenew:
-		if serial != a.active {
-			a.problem(w, http.StatusForbidden, "serial is not active")
+		if err := strictJSON(body, &req); err != nil {
+			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
 			return
 		}
+		if serial != a.active {
+			a.problem(w, http.StatusForbidden, "STATE_MACHINE_UNKNOWN", "serial is not active")
+			return
+		}
+		a.checks = append(a.checks, req)
+		_ = json.NewEncoder(w).Encode(CheckResponse{Due: a.due, Paused: a.paused, Reason: "not-due"})
+	case pathRenew:
 		var req RenewRequest
-		_ = json.Unmarshal(body, &req)
+		if err := strictJSON(body, &req); err != nil {
+			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
+			return
+		}
+		if serial != a.active {
+			a.problem(w, http.StatusForbidden, "STATE_MACHINE_UNKNOWN", "serial is not active")
+			return
+		}
 		a.csrs = append(a.csrs, req.CSR)
 		block, _ := pem.Decode([]byte(req.CSR))
 		if block == nil {
-			a.problem(w, http.StatusBadRequest, "no CSR")
+			a.problem(w, http.StatusBadRequest, "STATE_CSR_INVALID", "no CSR")
 			return
 		}
 		csr, err := x509.ParseCertificateRequest(block.Bytes)
 		if err != nil || csr.CheckSignature() != nil {
-			a.problem(w, http.StatusBadRequest, "bad CSR")
+			a.problem(w, http.StatusBadRequest, "STATE_CSR_INVALID", "bad CSR")
 			return
 		}
-		pubDER, _ := x509.MarshalPKIXPublicKey(csr.PublicKey)
-		k := fmt.Sprintf("%x/%d", sha256.Sum256(pubDER), a.ca().gen)
+		k := a.pendingKey(csr.PublicKey)
 		pc := a.pending[k]
 		if pc == nil {
-			c, s := a.issue(csr.PublicKey)
-			pc = &pendingCert{pem: c, serial: s, caGen: a.ca().gen}
+			pc = a.issuePending(csr.PublicKey)
 			a.pending = map[string]*pendingCert{k: pc} // one pending certificate per machine
 		}
 		if a.dropRenew > 0 {
 			a.dropRenew--
-			a.problem(w, http.StatusBadGateway, "lost")
+			a.problem(w, http.StatusBadGateway, "SEED_UNAVAILABLE", "lost")
 			return
 		}
-		_ = json.NewEncoder(w).Encode(RenewResponse{Certificate: pc.pem, CAGeneration: pc.caGen})
+		_ = json.NewEncoder(w).Encode(RenewResponse{Certificate: pc.pem, CAGeneration: pc.caGen, Serial: pc.serial, NotAfter: pc.notAfter})
 	case pathAck:
 		a.acks++
+		var req CheckRequest
+		if err := strictJSON(body, &req); err != nil {
+			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
+			return
+		}
+		a.ackBodies = append(a.ackBodies, req)
 		if a.ackStatus != 0 {
-			a.problem(w, a.ackStatus, "ack refused")
+			a.problem(w, a.ackStatus, "TEST_ACK_REFUSED", "ack refused")
+			return
+		}
+		if a.ackFailures > 0 {
+			a.ackFailures--
+			a.problem(w, http.StatusServiceUnavailable, "STATE_RENEW_UNAVAILABLE", "limiter unavailable")
+			return
+		}
+		// A second ack of the active serial answers the same result.
+		if serial == a.active {
+			_ = json.NewEncoder(w).Encode(AckResponse{Serial: serial})
 			return
 		}
 		for k, pc := range a.pending {
@@ -262,35 +346,103 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		a.problem(w, http.StatusConflict, "no pending certificate for this serial")
+		a.problem(w, http.StatusForbidden, "STATE_MACHINE_UNKNOWN", "not the pending serial of this machine")
 	default:
-		a.problem(w, http.StatusNotFound, "no route")
+		a.problem(w, http.StatusNotFound, "NOT_FOUND", "no route")
 	}
 }
 
 func (a *fakeAPI) serveRedeem(w http.ResponseWriter, r *http.Request, body []byte) {
 	if r.Header.Get(SignatureHeader) != "" {
-		a.problem(w, http.StatusBadRequest, "redeem is not signed")
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "redeem is not signed")
 		return
 	}
 	var req RedeemRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		a.problem(w, http.StatusBadRequest, "bad body")
+	if err := strictJSON(body, &req); err != nil {
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
 		return
 	}
+	var raw map[string]any
+	_ = json.Unmarshal(body, &raw)
 	a.redeemed = append(a.redeemed, req)
-	block, _ := pem.Decode([]byte(req.CSR))
-	csr, err := x509.ParseCertificateRequest(block.Bytes)
-	if err != nil {
-		a.problem(w, http.StatusBadRequest, "bad CSR")
+	a.redeemRaw = append(a.redeemRaw, raw)
+	if req.Ticket != testTicket {
+		a.problem(w, http.StatusUnauthorized, "STATE_TICKET_INVALID", "the ticket is not valid")
 		return
 	}
-	resp, status := a.redeem(req, csr.PublicKey)
+	if a.ticketUsed {
+		// A second redemption revokes a machine that did not acknowledge
+		// its first certificate.
+		if a.active == "" {
+			a.revoked = true
+		}
+		a.problem(w, http.StatusConflict, "STATE_TICKET_USED", "the ticket is used")
+		return
+	}
+	role := a.ticketRole
+	if role == "" {
+		role = RoleServer
+	}
+	_, hasCSR := raw["csr"]
+	switch {
+	case req.Role != role:
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "the role is not the role of the ticket")
+		return
+	case role == RoleAgent && hasCSR:
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "an agent machine sends no CSR")
+		return
+	case role == RoleServer && !hasCSR:
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "a server machine needs a CSR")
+		return
+	}
+	var pub any
+	if role == RoleServer {
+		block, _ := pem.Decode([]byte(req.CSR))
+		if block == nil {
+			a.problem(w, http.StatusBadRequest, "STATE_CSR_INVALID", "no CSR")
+			return
+		}
+		csr, err := x509.ParseCertificateRequest(block.Bytes)
+		if err != nil {
+			a.problem(w, http.StatusBadRequest, "STATE_CSR_INVALID", "bad CSR")
+			return
+		}
+		pub = csr.PublicKey
+	}
+	resp, status := a.redeem(req, pub)
 	if status != 0 {
-		a.problem(w, status, "ticket refused")
+		a.problem(w, status, "TEST_REFUSED", "ticket refused")
 		return
 	}
-	_ = json.NewEncoder(w).Encode(resp)
+	a.ticketUsed = true
+	_ = json.NewEncoder(w).Encode(wireRedeem(resp))
+}
+
+// wireRedeem encodes a redeem answer as the api does: null for the absent
+// certificate fields, serving CA, endpoint and server URL, and the install
+// configuration fields that the install does not read.
+func wireRedeem(resp RedeemResponse) map[string]any {
+	b, _ := json.Marshal(resp)
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	for _, k := range []string{"certificate", "serial", "servingCA", "endpoint"} {
+		if m[k] == "" {
+			m[k] = nil
+		}
+	}
+	if resp.NotAfter.IsZero() {
+		m["notAfter"] = nil
+	}
+	if resp.CAGeneration == 0 {
+		m["caGeneration"] = nil
+	}
+	ic, _ := m["installConfig"].(map[string]any)
+	if _, ok := ic["serverUrl"]; !ok {
+		ic["serverUrl"] = nil
+	}
+	ic["ciliumVersion"] = "1.20.1"
+	ic["serverFlags"] = []string{"--flannel-backend=none"}
+	return m
 }
 
 // fakeHost is a k3s server: it records the generation that each restart
@@ -298,9 +450,11 @@ func (a *fakeAPI) serveRedeem(w http.ResponseWriter, r *http.Request, body []byt
 type fakeHost struct {
 	store    Store
 	restarts []int
+	waits    int
 	connect  func(gen int) error
 	plans    bool
 	plansErr error
+	started  bool // k3s runs already (the install started it)
 }
 
 func (h *fakeHost) K3sVersion(context.Context) (string, error) { return "v1.34.2+k3s1", nil }
@@ -315,21 +469,33 @@ func (h *fakeHost) RestartK3s(context.Context) error {
 }
 
 func (h *fakeHost) WaitDatastore(context.Context, time.Duration) error {
-	if len(h.restarts) == 0 {
-		return errors.New("k3s never restarted")
+	h.waits++
+	gen := 0
+	switch {
+	case len(h.restarts) > 0:
+		gen = h.restarts[len(h.restarts)-1]
+	case h.started:
+		cur, err := h.store.Current()
+		if err != nil {
+			return err
+		}
+		gen = cur
+	default:
+		return errors.New("k3s never started")
 	}
 	if h.connect == nil {
 		return nil
 	}
-	return h.connect(h.restarts[len(h.restarts)-1])
+	return h.connect(gen)
 }
 
 func (h *fakeHost) UpgradeInProgress(context.Context) (bool, error) { return h.plans, h.plansErr }
 
-// renewEnv is one machine with an installed generation 1.
+// renewEnv is one machine with an installed, acknowledged generation 1.
 type renewEnv struct {
 	t     *testing.T
 	api   *fakeAPI
+	srv   *httptest.Server
 	host  *fakeHost
 	store Store
 	now   time.Time
@@ -359,15 +525,22 @@ func newRenewEnv(t *testing.T) *renewEnv {
 	if err := store.Switch(1); err != nil {
 		t.Fatal(err)
 	}
+	return newEnvOn(t, api, srv, store)
+}
+
+// newEnvOn is a renewEnv for an existing state folder.
+func newEnvOn(t *testing.T, api *fakeAPI, srv *httptest.Server, store Store) *renewEnv {
+	t.Helper()
 	client, err := NewClient(srv.URL, testCluster, "test", srv.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &renewEnv{t: t, api: api, store: store, host: &fakeHost{store: store}, now: time.Now().UTC().Truncate(time.Second)}
+	e := &renewEnv{t: t, api: api, srv: srv, store: store, host: &fakeHost{store: store}, now: time.Now().UTC().Truncate(time.Second)}
 	e.r = &Renewer{
 		Store: store, API: client, Host: e.host,
-		Now: func() time.Time { return e.now },
-		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Now:          func() time.Time { return e.now },
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		AckRetryWait: time.Millisecond,
 	}
 	return e
 }

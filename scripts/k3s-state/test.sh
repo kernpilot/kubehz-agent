@@ -2,7 +2,9 @@
 # Tests of the managed-state scripts:
 #   - uninstall.sh on a fake machine (KUBEHZ_UNINSTALL_ROOT), with stubs for
 #     systemctl, k3s and the k3s uninstall scripts;
-#   - render.sh with fake release assets.
+#   - render.sh with fake release assets;
+#   - the rendered v1.sh on a fake machine (its paths moved into a folder),
+#     as a server and as an agent node, and the installed uninstall after it.
 #
 #   bash scripts/k3s-state/test.sh
 #
@@ -247,6 +249,288 @@ rm -f "${assets}/install.yaml"
 if bash "${here}/render.sh" v9.8.7 "${assets}" >/dev/null 2>&1; then
 	fail "render.sh passed without install.yaml"
 fi
+
+# ── v1.sh (the install) ──────────────────────────────────────────────────
+#
+# The rendered script runs on a fake machine: a copy with its absolute paths
+# (the readonly block) moved into ${iroot} and the root check removed.
+# Stubs stand for systemctl, sleep, curl and install (no chown), the
+# kubehz-agent binary (state-redeem writes what the Go redeemer writes),
+# k3s and the k3s installer (which writes an uninstaller as the real one
+# does). download() copies the fake assets. Every call goes to ${ilog}.
+
+for f in kubehz-agent-linux-amd64 kubehz-agent-linux-arm64 install.yaml install-maintenance.yaml; do
+	printf '%s\n' "${f}" >"${assets}/${f}"
+done
+bash "${here}/render.sh" v9.8.7 "${assets}" >"${tmp}/v1-rendered.sh"
+
+istubs="${tmp}/istubs"
+fakes="${tmp}/fakes"
+ilog="${tmp}/install.log"
+mkdir -p "${istubs}" "${fakes}"
+
+cat >"${istubs}/systemctl" <<EOF
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "\$*" >>"${ilog}"
+if [[ "\$1" == "is-active" ]]; then exit "\$(cat "${tmp}/agent-active-rc")"; fi
+exit 0
+EOF
+printf '#!/usr/bin/env bash\nexit 0\n' >"${istubs}/sleep"
+cat >"${istubs}/curl" <<EOF
+#!/usr/bin/env bash
+printf 'curl %s\n' "\$*" >>"${ilog}"
+exit 1
+EOF
+# install without -o/-g: the tests do not run as root.
+cat >"${istubs}/install" <<'EOF'
+#!/usr/bin/env bash
+args=()
+while (($# > 0)); do
+	case "$1" in
+	-o | -g) shift ;;
+	*) args+=("$1") ;;
+	esac
+	shift
+done
+exec /usr/bin/install "${args[@]}"
+EOF
+chmod +x "${istubs}"/*
+
+# The kubehz-agent binary. state-redeem reads the ticket from stdin and
+# writes the files of the Go redeemer for the role (internal/staterenew,
+# TestRedeemAgent and TestRedeemWritesTheStateFolder).
+cat >"${fakes}/kubehz-agent" <<EOF
+#!/usr/bin/env bash
+printf 'kubehz-agent %s\n' "\$*" >>"${ilog}"
+case "\$1" in
+state-redeem)
+	dir="" role=""
+	while ((\$# > 0)); do
+		case "\$1" in
+		--dir) dir="\$2"; shift ;;
+		--role) role="\$2"; shift ;;
+		esac
+		shift
+	done
+	read -r ticket
+	[[ "\${ticket}" == "test-ticket" ]] || exit 1
+	mkdir -p "\${dir}"
+	: >"\${dir}/.lock"
+	printf 'K10token\n' >"\${dir}/k3s-token"
+	if [[ "\${role}" == "agent" ]]; then
+		printf 'ROLE=agent\nMACHINE_ID=m-2\nSERVER_URL=https://k3s.example.com:6443\nK3S_VERSION=v1.37.2+k3s1\n' >"\${dir}/install.env"
+	else
+		mkdir -p "\${dir}/gen-1"
+		echo key >"\${dir}/gen-1/client.key"
+		echo '{}' >"\${dir}/renew.json"
+		ln -s gen-1 "\${dir}/current"
+		printf 'ROLE=server\nCLUSTER_ID=c1\nMACHINE_ID=m-1\nSTATE_ENDPOINT=https://abc.state.kubehz.cloud:2379\nK3S_VERSION=v1.37.2+k3s1\nCLUSTER_CIDR=10.42.0.0/16\nSERVICE_CIDR=10.43.0.0/16\nTLS_SANS=\nHAS_AUTHN_CONFIG=0\nHAS_SSO_BINDINGS=0\nHAS_AGENT_TOKEN=0\n' >"\${dir}/install.env"
+	fi
+	;;
+state-ack) exit "\$(cat "${tmp}/ack-rc")" ;;
+esac
+EOF
+# k3s: kubectl answers ready, a node list, and no agent Secret.
+cat >"${fakes}/k3s" <<EOF
+#!/usr/bin/env bash
+printf 'k3s %s\n' "\$*" >>"${ilog}"
+case " \$* " in
+*" get secret "*) exit 1 ;;
+*" get nodes "*) printf 'node/%s\n' "${self_node}" ;;
+*" -o yaml "*) printf 'kind: Namespace\n' ;;
+*" -f - "*) cat >/dev/null ;;
+esac
+exit 0
+EOF
+
+# install_rendered: a fresh fake machine ${iroot} and the test copy of the
+# rendered script ${icopy}.
+install_rendered() {
+	iroot="$(mktemp -d "${tmp}/imachine.XXXXXX")"
+	icopy="${tmp}/v1-test.sh"
+	: >"${ilog}"
+	printf '0\n' >"${tmp}/ack-rc"
+	printf '0\n' >"${tmp}/agent-active-rc"
+	mkdir -p "${tmp}/worktmp" "${iroot}/usr/local/bin" "${iroot}/etc/systemd/system"
+	# The last line calls main. The embedded uninstall script has its own
+	# call of main, which must stay.
+	[[ "$(tail -n1 "${tmp}/v1-rendered.sh")" == 'main "$@"' ]] || fail "the rendered script does not end with the call of main"
+	sed -E \
+		-e "s|^(readonly [A-Z0-9_]+=\")/|\\1${iroot}/|" \
+		-e 's|\[\[ "\$\{EUID\}" -eq 0 \]\]|true|' \
+		-e '$d' \
+		"${tmp}/v1-rendered.sh" >"${icopy}"
+	# Each edit must hit (a missed anchor would test the real paths).
+	local moved mains
+	moved="$(grep -cE "^readonly [A-Z0-9_]+=\"${iroot}/" "${icopy}")" || true
+	[[ "${moved}" == 8 ]] || fail "the test copy moved ${moved} paths, want 8"
+	# shellcheck disable=SC2016 # a literal string
+	grep -qF '"${EUID}" -eq 0' "${icopy}" && fail "the root check is still in the test copy"
+	mains="$(grep -cx 'main "$@"' "${tmp}/v1-rendered.sh")" || true
+	[[ "$(grep -cx 'main "$@"' "${icopy}")" == "$((mains - 1))" ]] || fail "the test copy did not lose exactly the last call of main"
+	# The k3s installer: writes the unit and the uninstaller of the role, as
+	# the real one does. The uninstaller removes what k3s-uninstall.sh and
+	# k3s-agent-uninstall.sh remove.
+	cat >"${fakes}/k3s-install.sh" <<EOF
+#!/bin/sh
+printf 'k3s-install INSTALL_K3S_EXEC=%s SKIP_START=%s SKIP_DOWNLOAD=%s\n' "\${INSTALL_K3S_EXEC}" "\${INSTALL_K3S_SKIP_START}" "\${INSTALL_K3S_SKIP_DOWNLOAD}" >>"${ilog}"
+name=k3s
+[ "\${INSTALL_K3S_EXEC}" = agent ] && name=k3s-agent
+mkdir -p "${iroot}/etc/systemd/system" "${iroot}/usr/local/bin"
+echo '[Unit]' >"${iroot}/etc/systemd/system/\${name}.service"
+cat >"${iroot}/usr/local/bin/\${name}-uninstall.sh" <<UNINSTALL
+#!/bin/sh
+printf '%s-uninstall.sh\\\\n' "\${name}" >>"${ilog}"
+rm -rf "${iroot}/etc/rancher/k3s" "${iroot}/var/lib/rancher/k3s" "${iroot}/usr/local/bin/k3s" "${iroot}/etc/systemd/system/\${name}.service"
+rm -f "${iroot}/usr/local/bin/\${name}-uninstall.sh"
+UNINSTALL
+chmod +x "${iroot}/usr/local/bin/\${name}-uninstall.sh"
+EOF
+}
+
+# run_install ARGS...: runs main of the test copy with the ticket on stdin.
+# Sets ${rc} and ${out}.
+run_install() {
+	rc=0
+	# shellcheck disable=SC2016 # the inner script expands its own variables
+	out="$(printf 'test-ticket\n' | env -i PATH="${istubs}:/usr/bin:/bin" HOME="${tmp}" TMPDIR="${tmp}/worktmp" \
+		FAKES="${fakes}" ILOG="${ilog}" bash -c '
+			source "$0"
+			download() {
+				printf "download %s\n" "$1" >>"${ILOG}"
+				case "$1" in
+				*/kubehz-agent-linux-*) cp -- "${FAKES}/kubehz-agent" "$2" ;;
+				*/k3s-io/k3s/*/install.sh) cp -- "${FAKES}/k3s-install.sh" "$2" ;;
+				*/releases/download/*/k3s | */releases/download/*/k3s-arm64) cp -- "${FAKES}/k3s" "$2" ;;
+				*/cilium-*.tgz) printf "chart\n" >"$2" ;;
+				*/install.yaml | */install-maintenance.yaml) printf "kind: List\n" >"$2" ;;
+				*) printf "unexpected download %s\n" "$1" >&2; return 1 ;;
+				esac
+			}
+			main "$@"
+		' "${icopy}" "$@" 2>&1)" || rc=$?
+}
+
+# iline PATTERN: the number of the first line of the install log that
+# matches PATTERN, or 0.
+iline() {
+	local n
+	n="$(grep -n -m1 -e "$1" "${ilog}" | cut -d: -f1)" || true
+	printf '%s' "${n:-0}"
+}
+
+# run_uninstall: runs the uninstall script that the install wrote.
+run_uninstall() {
+	rc=0
+	out="$(env -i PATH="${stubs}:/usr/bin:/bin" HOME="${tmp}" KUBEHZ_UNINSTALL_ROOT="${iroot}" \
+		bash "${iroot}/usr/local/bin/kubehz-k3s-uninstall.sh" 2>&1)" || rc=$?
+}
+
+# assert_clean: no file and no link is left on the fake machine, and no
+# work folder.
+assert_clean() {
+	local left
+	left="$(find "${iroot}" -mindepth 1 ! -type d)"
+	[[ -z "${left}" ]] || fail "the uninstall left files: ${left//${iroot}/}"
+	left="$(find "${tmp}/worktmp" -mindepth 1)"
+	[[ -z "${left}" ]] || fail "the install left its work folder: ${left}"
+}
+
+current="an agent node: no CSR flow, no certificate, no acknowledgement, no renewal timer"
+install_rendered
+run_install --role agent --label agent-1
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+grep -q '^kubehz-agent state-redeem .* --label agent-1 --role agent$' "${ilog}" ||
+	fail "the ticket was not redeemed with --role agent: $(grep state-redeem "${ilog}")"
+grep -q '^kubehz-agent state-\(ack\|renew\)' "${ilog}" && fail "an agent ran $(grep '^kubehz-agent state-' "${ilog}")"
+for unit in kubehz-state-renew.service kubehz-state-renew.timer; do
+	[[ -e "${iroot}/etc/systemd/system/${unit}" ]] && fail "an agent has ${unit}"
+done
+grep -q 'kubehz-state-renew' "${ilog}" && fail "systemctl touched the renewal timer: $(grep kubehz-state-renew "${ilog}")"
+grep -qx 'k3s-install INSTALL_K3S_EXEC=agent SKIP_START=true SKIP_DOWNLOAD=true' "${ilog}" ||
+	fail "k3s was not installed as an agent: $(grep k3s-install "${ilog}")"
+grep -qx 'systemctl restart --no-block k3s-agent' "${ilog}" || fail "the k3s-agent service was not started"
+grep -qx 'systemctl is-active --quiet k3s-agent' "${ilog}" || fail "the install did not wait for the agent"
+grep -q '^k3s ' "${ilog}" && fail "kubectl ran on an agent node: $(grep '^k3s ' "${ilog}")"
+grep -q 'cilium' "${ilog}" && fail "an agent downloaded Cilium"
+cfg="${iroot}/etc/rancher/k3s/config.yaml"
+if [[ -f "${cfg}" ]]; then
+	grep -qx 'server: "https://k3s.example.com:6443"' "${cfg}" || fail "config.yaml does not name the server: $(cat "${cfg}")"
+	grep -qx "token-file: ${iroot}/etc/kubehz/state/k3s-token" "${cfg}" || fail "config.yaml does not name the token file"
+	grep -q 'datastore' "${cfg}" && fail "an agent's config.yaml has datastore settings"
+	[[ "$(stat -c %a "${cfg}")" == 600 ]] || fail "config.yaml mode $(stat -c %a "${cfg}")"
+else
+	fail "no ${cfg}"
+fi
+state_files="$(cd "${iroot}/etc/kubehz/state" && find . -mindepth 1 | LC_ALL=C sort | tr '\n' ' ')"
+[[ "${state_files}" == "./.lock ./install.env ./k3s-token " ]] || fail "an agent's state folder holds: ${state_files}"
+[[ -e "${iroot}/etc/kubehz/kubehz-agent.yaml" ]] && fail "an agent applied the in-cluster agent"
+[[ -e "${iroot}/var/lib/rancher/k3s/server" ]] && fail "an agent wrote server manifests"
+grep -q 'joined https://k3s.example.com:6443' <<<"${out}" || fail "the output does not name the server: ${out}"
+
+current="an agent node: a second run does not redeem again, a run as server stops"
+: >"${ilog}"
+run_install --role agent --label agent-1
+[[ "${rc}" == 0 ]] || fail "second run: exit ${rc}: ${out}"
+grep -q 'state-redeem' "${ilog}" && fail "the second run redeemed again"
+: >"${ilog}"
+run_install --label agent-1
+[[ "${rc}" != 0 ]] || fail "a run as server on an agent node passed"
+grep -q 'run the script with --role agent' <<<"${out}" || fail "the error does not name the role: ${out}"
+
+current="an agent node: the uninstall removes everything the install wrote"
+run_uninstall
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+grep -qx 'k3s-agent-uninstall.sh' "${ilog}" || fail "k3s-agent-uninstall.sh did not run"
+assert_clean
+
+current="an agent role refuses the server options"
+install_rendered
+for args in "--role agent --recovery" "--role agent --maintenance" "--role worker"; do
+	# shellcheck disable=SC2086 # the words are separate arguments
+	run_install ${args}
+	[[ "${rc}" != 0 ]] || fail "'${args}' passed"
+done
+grep -q 'state-redeem' "${ilog}" && fail "a refused run redeemed"
+
+current="a server: the certificate is acknowledged after k3s runs, before the agent and the timer"
+install_rendered
+run_install --label server-1
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+grep -q '^kubehz-agent state-redeem .* --role server$' "${ilog}" || fail "the ticket was not redeemed with --role server"
+start="$(iline '^systemctl restart --no-block k3s$')"
+ready="$(iline '^k3s kubectl .* get --raw /readyz$')"
+ack="$(iline "^kubehz-agent state-ack --dir ${iroot}/etc/kubehz/state --kubeconfig ${iroot}/etc/rancher/k3s/k3s.yaml$")"
+apply="$(iline "^k3s kubectl .* apply -f ${tmp}/worktmp/.*/agent.yaml$")"
+timer="$(iline '^systemctl enable --now kubehz-state-renew.timer$')"
+((start > 0 && ready > start)) || fail "k3s did not start and answer (start ${start}, ready ${ready})"
+((ack > ready)) || fail "the acknowledgement is not after k3s answered (ack line ${ack}, ready ${ready})"
+((apply > ack && timer > apply)) || fail "the agent (${apply}) and the timer (${timer}) are not after the acknowledgement (${ack})"
+grep -qx 'k3s-install INSTALL_K3S_EXEC=server SKIP_START=true SKIP_DOWNLOAD=true' "${ilog}" || fail "k3s was not installed as a server"
+[[ -f "${iroot}/etc/systemd/system/kubehz-state-renew.timer" ]] || fail "no renewal timer"
+grep -q '^datastore-certfile: .*/current/client.crt$' "${iroot}/etc/rancher/k3s/config.yaml" || fail "config.yaml has no datastore certificate"
+
+current="a server: the uninstall removes everything the install wrote"
+run_uninstall
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+assert_clean
+
+current="a server: a failed acknowledgement stops the install; the next run acknowledges without a new redemption"
+install_rendered
+printf '1\n' >"${tmp}/ack-rc"
+run_install --label server-1
+[[ "${rc}" != 0 ]] || fail "exit 0 after a failed acknowledgement"
+grep -q 'Do not redeem the ticket again' <<<"${out}" || fail "the error does not say what to do: ${out}"
+[[ -e "${iroot}/etc/systemd/system/kubehz-state-renew.timer" ]] && fail "the timer was installed before the acknowledgement"
+grep -q ' apply -f .*/agent.yaml' "${ilog}" && fail "the in-cluster agent was installed before the acknowledgement"
+printf '0\n' >"${tmp}/ack-rc"
+: >"${ilog}"
+run_install --label server-1
+[[ "${rc}" == 0 ]] || fail "the next run: exit ${rc}: ${out}"
+grep -q 'state-redeem' "${ilog}" && fail "the next run redeemed the ticket again"
+grep -q '^kubehz-agent state-ack ' "${ilog}" || fail "the next run did not acknowledge"
+run_uninstall
+assert_clean
 
 if ((failures > 0)); then
 	printf '%d check(s) failed\n' "${failures}" >&2

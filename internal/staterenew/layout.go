@@ -17,6 +17,7 @@ import (
 // through the symlink "current", which points to one complete generation:
 //
 //	/etc/kubehz/state/
+//	  install.env           what the install script reads (no secret)
 //	  renew.json            renewer settings (api URL, cluster, machine)
 //	  k3s-token             the k3s server token (0600)
 //	  current -> gen-2      switched with ONE rename(2)
@@ -27,6 +28,10 @@ import (
 //	    client.crt          the signed client certificate
 //	    server-ca.crt       the platform serving CA of the datastore endpoint
 //	    meta.json           the generation's state
+//
+// A role agent machine has no datastore identity (contract 10.5): its
+// folder holds only install.env and k3s-token. It has no key, no
+// generation, no "current" and no renew.json.
 const (
 	DefaultDir = "/etc/kubehz/state"
 
@@ -50,7 +55,9 @@ const (
 )
 
 // Generation states. A generation moves keyed -> issued -> switched ->
-// acked, or ends failed.
+// acked, or ends failed. The first generation of an install starts as
+// switched with no previous one: the api keeps its certificate pending
+// until the machine acknowledges it (contract 10.1).
 const (
 	StateKeyed    = "keyed"    // key and CSR written
 	StateIssued   = "issued"   // certificate written, not in use
@@ -59,12 +66,14 @@ const (
 	StateFailed   = "failed"   // abandoned
 )
 
-// Meta is the state of one generation (meta.json).
+// Meta is the state of one generation (meta.json). CAGeneration, Serial
+// and NotAfter come from the api's answer and agree with the certificate.
 type Meta struct {
 	Generation   int       `json:"generation"`
 	State        string    `json:"state"`
 	CAGeneration int64     `json:"caGeneration,omitempty"`
 	Serial       string    `json:"serial,omitempty"`
+	NotAfter     time.Time `json:"notAfter,omitzero"`
 	Previous     int       `json:"previous,omitempty"`
 	CreatedAt    time.Time `json:"createdAt"`
 	RestartedAt  time.Time `json:"restartedAt,omitzero"`
