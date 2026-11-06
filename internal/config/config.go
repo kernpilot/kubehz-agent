@@ -328,6 +328,11 @@ func ReadTokenFile(readFile func(string) ([]byte, error), path string) (string, 
 // can validate a token read from the Secret with the same rule.
 func ValidateToken(tok string) (string, error) { return validateToken(tok) }
 
+// ValidClusterID reports whether id has the CLUSTER_ID shape. The host
+// install (state-redeem) checks the cluster id of the platform's answer
+// with the same rule.
+func ValidClusterID(id string) bool { return clusterIDRE.MatchString(id) }
+
 func validateToken(tok string) (string, error) {
 	tok = strings.TrimSpace(tok)
 	if !agentTokenRE.MatchString(tok) {

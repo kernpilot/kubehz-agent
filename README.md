@@ -100,8 +100,11 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/executor` | the acting side: P3 replica patches, P5 heal deletes, P6 kubelet rolls + every safety rail |
 | `internal/actions` | in-memory action-report store (latest-revision-wins, diff-aware notify, stale-heal prune) |
 | `internal/agent` | wiring: informers → coalescer → sender; poller → executor → actions → beats |
+| `internal/k3supgrade` | managed state: the k3s upgrade executor (two system-upgrade-controller Plans, admission policy, failure record, per-server report) |
+| `internal/staterenew` | managed state, HOST side: `state-redeem` (install ticket) and `state-renew` (datastore client certificate renewal, signed requests) |
 | `internal/buildinfo` | build-stamped version |
-| `deploy/` | base (read-only) + `managed/` overlay (acting RBAC) — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
+| `scripts/k3s-state/` | the managed-state install script (`v1.sh`, bash) and its release renderer |
+| `deploy/` | base (read-only) + `managed/` overlay (acting RBAC) + `maintenance/` overlay (k3s upgrades, managed state) — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
 
 The debounce policy is a **pure function** (`publisher.decide`) — no timers in the
 tested code path — so the whole cadence (debounce / min-gap / periodic) is
@@ -376,6 +379,65 @@ keeps working. Drop the unwedge ClusterRole and only the unwedge is
 disabled — healing itself is unaffected. See
 [deploy/README.md](deploy/README.md).
 
+## Managed state (k3s with a managed datastore)
+
+A self-hosted cluster can keep its state on the kubehz platform: k3s on
+the customer's machine uses a managed kine as its datastore. The agent
+binary has three parts for this.
+
+**The install script** (`scripts/k3s-state/v1.sh`, a release asset as
+`k3s-state-v1.sh`). The dashboard shows a command that downloads the
+script, checks its sha256 and runs it with bash. The script:
+
+- refuses a machine with embedded etcd data of an earlier k3s;
+- asks for the install ticket at a hidden prompt and redeems it with
+  `kubehz-agent state-redeem` (the client key is made on the machine and
+  never leaves it);
+- installs k3s and Cilium at pinned versions, each checked by sha256, with
+  the datastore files read through `/etc/kubehz/state/current`;
+- installs the in-cluster agent and the renewal timer.
+
+`--recovery` installs a replacement for a lost server: it removes the old
+Node object and its node password Secret, then restarts k3s.
+`--maintenance` also applies the maintenance overlay (see below).
+
+**Certificate renewal** (`kubehz-agent state-renew`, a systemd timer every
+5 minutes, on the host). Each key pair is a generation folder
+`/etc/kubehz/state/gen-<n>/`. The renewer asks the api whether a renewal
+is due, makes a new key and CSR, gets a pending certificate (signed
+request, current key), switches the symlink `current` with one rename,
+restarts k3s and waits up to 5 minutes for the datastore. Then it
+acknowledges with the NEW key. If k3s does not connect, it switches back
+and reports the error at the next check. A crash at any step leaves
+`current` on one complete generation; a lost answer is retried with the
+same CSR. The renewer does not restart k3s while the agent's upgrade
+Plans exist.
+
+**k3s upgrades** (`internal/k3supgrade`, in the agent Deployment). The
+platform publishes an upgrade operation in `/desired` (`stateStore`
+block). Only when maintenance is on and the operation is `published` or
+`running`, the agent:
+
+1. writes its admission policy, which admits only its two Plans in
+   namespace `system-upgrade`;
+2. scales the overlay's system-upgrade-controller to one replica (job
+   retries off);
+3. writes the server Plan (concurrency 1, exact version, cordon,
+   control-plane nodes) and the agent Plan (other nodes, `prepare
+   k3s-server`), both labelled with the operation id;
+4. reports each server's kubelet version, the apiserver version on that
+   node and readiness.
+
+A failed operation is recorded in ConfigMap
+`system-upgrade/kubehz-k3s-upgrade` before anything is removed, and the
+agent never writes its Plans again, also after a restart. On a failure, an
+opt-out or a fence, the agent stops the controller first, then deletes the
+Plans and their jobs explicitly. A job whose pod already passed its cordon
+step keeps its pod; the report names the node.
+
+Without the maintenance overlay the agent has the rights it has today, and
+an upgrade operation fails at once with a report that names the overlay.
+
 ## Configuration
 
 | Env | Default | Meaning |
@@ -500,6 +562,10 @@ repository secrets. Without them it prints a line and skips — Harbor is a
 dogfood convenience, so its absence must never hold up a customer release.
 
 ## Follow-ups (later phases)
+
+- **Managed state:** agent (k3s agent) nodes in the install script (v1
+  installs servers only); dual-stack CIDRs; an api route for the renewer to
+  report a switch back at once (today it reports at the next check).
 
 - **Dashboard** live surfaces (nodes capacity/instance-type, workloads card,
   "reported n s ago"). Harden `readyNodeCount` to use the explicit `ready` bool

@@ -27,6 +27,25 @@ type Actor interface {
 	Reconcile(ctx context.Context, doc *Doc) (retry bool)
 }
 
+// Actors runs several Actors on the same document, in order. Each Actor
+// owns its own acting policy; Actors only joins their retry answers: the
+// poller re-runs all of them on the next tick when one asks for it (every
+// Actor is idempotent, so a re-run of a converged one writes nothing).
+type Actors []Actor
+
+// Reconcile implements Actor.
+func (as Actors) Reconcile(ctx context.Context, doc *Doc) (retry bool) {
+	for _, a := range as {
+		if a == nil {
+			continue
+		}
+		if a.Reconcile(ctx, doc) {
+			retry = true
+		}
+	}
+	return retry
+}
+
 // Poller runs the pull loop: conditional GET every interval (+ jitter), acting
 // via the Actor on every non-304 response. Error handling mirrors the
 // heartbeat Sender's discipline: capped exponential backoff, with 401/403

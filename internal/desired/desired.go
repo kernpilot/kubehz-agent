@@ -8,7 +8,10 @@
 // the cluster's own machinery (see internal/executor).
 package desired
 
-import "fmt"
+import (
+	"fmt"
+	"regexp"
+)
 
 // Doc is the 200 body of GET /api/clusters/{id}/desired — wire-identical to
 // kubehz-api (server/api/clusters/[id]/desired.ts, d57c206). Build to exactly
@@ -39,7 +42,74 @@ type Doc struct {
 	// Enabled mirrors execution.healing — the policy numbers are served even
 	// while healing is off, so the agent can pre-arm without acting.
 	Healing Healing `json:"healing"`
+	// StateStore is the managed-state block of a self-hosted k3s cluster
+	// (managed-state build contract 4.4). nil on every other cluster. The
+	// k3s upgrade executor (internal/k3supgrade) acts on it only when
+	// Maintenance is true and the operation is published or running.
+	StateStore *StateStore `json:"stateStore,omitempty"`
 }
+
+// StateStore is the managed-state block of the desired document.
+type StateStore struct {
+	// Enabled is true when the cluster's datastore is managed state.
+	Enabled bool `json:"enabled"`
+	// Maintenance is the customer's opt-in for k3s upgrades. Off: the agent
+	// writes no Plan and removes the Plans it wrote.
+	Maintenance bool `json:"maintenance"`
+	// RenewPaused is true while an upgrade operation runs. The host renewer
+	// gets the same fact from the renewal check; the agent only logs it.
+	RenewPaused bool `json:"renewPaused"`
+	// Fenced is true while the cluster is fenced for a rollback (design 4.4
+	// step 1). The executor then writes nothing and removes its Plans.
+	// Not in the build contract yet: absent means false.
+	Fenced bool `json:"fenced,omitempty"`
+	// Operation is the current upgrade operation, or nil.
+	Operation *Operation `json:"operation,omitempty"`
+}
+
+// Operation is one k3s upgrade operation of the platform.
+type Operation struct {
+	ID            string `json:"id"`
+	TargetVersion string `json:"targetVersion"`
+	// State is pending, dumping, published, running, failed, done or
+	// cancelled. The agent acts only on published and running.
+	State string `json:"state"`
+	// DumpTakenAt is the RFC 3339 time of the logical dump taken for this
+	// operation. The agent does not start an operation whose dump is older
+	// than one hour.
+	DumpTakenAt string `json:"dumpTakenAt,omitempty"`
+}
+
+// Operation states (build contract 4.1).
+const (
+	OperationPending   = "pending"
+	OperationDumping   = "dumping"
+	OperationPublished = "published"
+	OperationRunning   = "running"
+	OperationFailed    = "failed"
+	OperationDone      = "done"
+	OperationCancelled = "cancelled"
+)
+
+// Active reports whether the agent may act on the operation: published or
+// running. Every other state, a future one too, means "write nothing".
+func (o *Operation) Active() bool {
+	return o != nil && (o.State == OperationPublished || o.State == OperationRunning)
+}
+
+// operationIDRE is the shape of an operation id: a valid label value (the
+// executor puts it in a label on each Plan) that is also safe in a URL path.
+var operationIDRE = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$`)
+
+// k3sVersionRE is an exact k3s release version, for example v1.37.2+k3s1.
+// A channel name or a range never matches.
+var k3sVersionRE = regexp.MustCompile(`^v1\.[0-9]{1,3}\.[0-9]{1,3}\+k3s[0-9]{1,3}$`)
+
+// ValidK3sVersion reports whether v is an exact k3s release version.
+func ValidK3sVersion(v string) bool { return k3sVersionRE.MatchString(v) }
+
+// ValidOperationID reports whether id is a valid operation id.
+func ValidOperationID(id string) bool { return operationIDRE.MatchString(id) }
 
 // WorkerPool is one desired pool row.
 type WorkerPool struct {
@@ -106,6 +176,18 @@ func (d *Doc) Validate() error {
 	} {
 		if f.v < 0 || f.v > maxHealingSeconds {
 			return fmt.Errorf("desired doc invalid: healing.%s %d outside 0..%d", f.name, f.v, maxHealingSeconds)
+		}
+	}
+	// The operation id goes into a Plan label and a request path, and the
+	// target version goes into a privileged upgrade job. Both are checked
+	// here, before any acting code sees them.
+	if ss := d.StateStore; ss != nil && ss.Operation != nil {
+		op := ss.Operation
+		if !operationIDRE.MatchString(op.ID) {
+			return fmt.Errorf("desired doc invalid: stateStore.operation.id %q is not a label value (letters, digits, '-', '_', '.'; max 63)", op.ID)
+		}
+		if !k3sVersionRE.MatchString(op.TargetVersion) {
+			return fmt.Errorf("desired doc invalid: stateStore.operation.targetVersion %q is not an exact k3s version (want v1.N.N+k3sN)", op.TargetVersion)
 		}
 	}
 	return nil

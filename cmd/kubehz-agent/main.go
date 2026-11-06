@@ -24,12 +24,33 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/buildinfo"
 	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/kube"
+	"github.com/kernpilot/kubehz-agent/internal/staterenew"
 )
 
 // tokenReadTimeout bounds the one-shot Secret read for the token fallback.
 const tokenReadTimeout = 10 * time.Second
 
 func main() {
+	// Host commands of managed state (run by the install script and the
+	// systemd timer on a k3s server, not in the cluster).
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "state-renew", "state-redeem":
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			var code int
+			if os.Args[1] == "state-renew" {
+				code = staterenew.RenewMain(ctx, os.Args[2:], os.Stderr, buildinfo.Version)
+			} else {
+				code = staterenew.RedeemMain(ctx, os.Args[2:], os.Stdin, os.Stdout, os.Stderr, buildinfo.Version)
+			}
+			stop()
+			os.Exit(code)
+		case "version", "--version":
+			_, _ = os.Stdout.WriteString("kubehz-agent " + buildinfo.Version + "\n")
+			return
+		}
+	}
+
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(log)
 	log.Info("kubehz-agent starting", "version", buildinfo.Version)
