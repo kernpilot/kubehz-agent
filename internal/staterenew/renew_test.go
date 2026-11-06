@@ -22,7 +22,7 @@ func TestRenewNotDue(t *testing.T) {
 	if len(e.api.checks) != 1 || len(e.api.csrs) != 0 || len(e.host.restarts) != 0 {
 		t.Fatalf("checks %d, renewals %d, restarts %v", len(e.api.checks), len(e.api.csrs), e.host.restarts)
 	}
-	if e.api.checks[0].K3sVersion != "v1.34.2+k3s1" {
+	if e.api.checks[0].K3sVersion != "v1.34.2+k3s1" || e.api.checks[0].LastError != "" {
 		t.Fatalf("check body %+v", e.api.checks[0])
 	}
 }
@@ -148,13 +148,15 @@ func TestRenewSwitchBack(t *testing.T) {
 	}
 	e.assertComplete()
 
-	// The next run waits. The failure stays on the host: the api's check
-	// body has no field for it (the strict fake refuses unknown fields).
+	// The next run waits, and its check reports the failure.
 	if err := e.r.Run(bg); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(readFile(t, e.store.Dir, lastErrorFile), "did not connect") {
 		t.Fatal("the last error is not kept on the host")
+	}
+	if last := e.api.checks[len(e.api.checks)-1].LastError; !strings.Contains(last, "did not connect") {
+		t.Fatalf("the check reports lastError %q", last)
 	}
 	if len(e.host.restarts) != 2 {
 		t.Fatal("tried again before the wait passed")
@@ -174,6 +176,53 @@ func TestRenewSwitchBack(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.store.Dir, lastErrorFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("last error kept after a successful renewal")
+	}
+	e.api.due = false
+	if err := e.r.Run(bg); err != nil {
+		t.Fatal(err)
+	}
+	if last := e.api.checks[len(e.api.checks)-1].LastError; last != "" {
+		t.Fatalf("a check after a successful renewal reports %q", last)
+	}
+}
+
+// The check sends the error of the last run, and none after a run that was
+// fine. A failed check is reported by the next check.
+func TestRenewReportsTheLastError(t *testing.T) {
+	e := newRenewEnv(t)
+	e.api.checkFails = 1
+	if err := e.r.Run(bg); err == nil {
+		t.Fatal("a failed check passed")
+	}
+	if err := e.r.Run(bg); err != nil {
+		t.Fatal(err)
+	}
+	if last := e.api.checks[1].LastError; !strings.Contains(last, "renewal check failed") || !strings.Contains(last, "STATE_RENEW_UNAVAILABLE") {
+		t.Fatalf("second check reports %q", last)
+	}
+	if err := e.r.Run(bg); err != nil {
+		t.Fatal(err)
+	}
+	if last := e.api.checks[2].LastError; last != "" {
+		t.Fatalf("the run after a fine run reports %q", last)
+	}
+
+	// No secret and at most 512 characters, also when an error text has
+	// one (the fake api refuses more than 512).
+	e.r.setLastError("k3s said: token K10abcdef0123456789::server:secret1 and khz_agt_" + strings.Repeat("ab", 32) +
+		" -----BEGIN EC PRIVATE KEY-----\nMHcCAQEE\n-----END EC PRIVATE KEY----- " + strings.Repeat("é", 600))
+	e.api.checkFails = 0
+	if err := e.r.Run(bg); err != nil {
+		t.Fatal(err)
+	}
+	last := e.api.checks[3].LastError
+	for _, secret := range []string{"secret1", "abababab", "MHcCAQEE", "é"} {
+		if strings.Contains(last, secret) {
+			t.Fatalf("lastError has %q: %q", secret, last)
+		}
+	}
+	if len(last) > 512 || !strings.HasPrefix(last, "k3s said: token K10[removed] and khz_[removed] [PEM removed]") {
+		t.Fatalf("lastError (%d bytes) %q", len(last), last)
 	}
 }
 

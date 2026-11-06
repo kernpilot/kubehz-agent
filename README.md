@@ -387,9 +387,9 @@ binary has three parts for this.
 
 **The install script** (`scripts/k3s-state/v1.sh`, a release asset as
 `k3s-state-v1.sh`). The dashboard shows a command that downloads the
-script, checks its sha256 and runs it with bash. The ticket has a role,
-and the script must run with the same role: `--role server` (the default)
-or `--role agent`.
+script, checks its sha256 and runs it with bash. The command has the
+options of the ticket: `--role agent` for an agent ticket and `--recovery`
+for a recovery ticket. Without them, the script installs a server.
 
 For a server, the script:
 
@@ -397,12 +397,25 @@ For a server, the script:
 - asks for the install ticket at a hidden prompt and redeems it with
   `kubehz-agent state-redeem` (the client key is made on the machine and
   never leaves it);
-- installs k3s and Cilium at pinned versions, each checked by sha256, with
-  the datastore files read through `/etc/kubehz/state/current`;
+- on an install (not a recovery), makes the kubehz agent token of the
+  cluster on the machine (`khz_agt_` and 64 hex digits from the system's
+  random source, file mode 0600) and sends only its sha256 with the
+  redemption. If the cluster has an agent token already (another server
+  made it), the api refuses the hash and leaves the ticket unused, and the
+  redemption goes on without one;
+- installs k3s at a pinned version, checked by sha256, with the datastore
+  files read through `/etc/kubehz/state/current`, the k3s server token
+  (`token-file`) and the k3s agent token (`agent-token-file`) for agent
+  nodes;
+- installs Cilium at the version of the install configuration. Each version
+  that the script can install has a pinned chart sha256; the script stops
+  on another version before it installs k3s;
 - after k3s connects to the datastore, acknowledges the first certificate
   with `kubehz-agent state-ack` (the api keeps a certificate pending until
   this acknowledgement);
-- installs the in-cluster agent and the renewal timer;
+- puts the agent token into Secret `kubehz-system/kubehz-agent`, removes
+  it from the disk, and installs the in-cluster agent and the renewal
+  timer;
 - installs `/usr/local/bin/kubehz-k3s-uninstall.sh` (source
   `scripts/k3s-state/uninstall.sh`, embedded in the release copy) as its
   first step.
@@ -415,8 +428,8 @@ The renewal timer also finishes a first certificate that is not
 acknowledged.
 
 For an agent node (`--role agent`), the script redeems the ticket with no
-CSR. The api gives the k3s token and the URL of a k3s server, and no
-certificate. The script installs k3s as an agent (service `k3s-agent`)
+CSR and no agent token. The api gives only the k3s agent token and the URL
+of a k3s server, and no certificate. The script installs k3s as an agent (service `k3s-agent`)
 that joins that server. It installs no Cilium, no in-cluster agent and no
 renewal timer. `/etc/kubehz/state` holds only `install.env` and
 `k3s-token`. `--recovery` and `--maintenance` are for servers only. A run
@@ -438,8 +451,12 @@ systemctl and k3s). It also runs the install on a fake machine, as a
 server and as an agent node, and then checks that the uninstall leaves no
 file.
 
-`--recovery` installs a replacement for a lost server: it removes the old
-Node object and its node password Secret, then restarts k3s.
+`--recovery` installs a replacement for a lost server with a recovery
+ticket. Give the machine the host name of the lost server: the script
+removes the Node object of that name and its node password Secret, then
+restarts k3s. A recovery sends no agent token: the cluster keeps its
+Secret. A run after an interruption continues as a recovery when the
+machine redeemed a recovery ticket.
 `--maintenance` also applies the maintenance overlay (see below).
 
 **Certificate renewal** (`kubehz-agent state-renew`, a systemd timer every
@@ -449,8 +466,12 @@ is due, makes a new key and CSR, gets a pending certificate (signed
 request, current key), switches the symlink `current` with one rename,
 restarts k3s and waits up to 5 minutes for the datastore. Then it
 acknowledges with the NEW key. If k3s does not connect, it switches back
-and writes the error to `/etc/kubehz/state/last-error` and to the log (the
-api has no field for it yet). A crash at any step leaves
+and writes the error to `/etc/kubehz/state/last-error`. Each run that fails
+writes its error there. The next check sends it to the api as `lastError`
+(at most 512 characters, printable ASCII; tokens and PEM blocks are
+removed). An acknowledged renewal removes the file, and so does a run that
+finds no renewal due and is not in the wait after a switch back. Then the
+next check sends no `lastError`. A crash at any step leaves
 `current` on one complete generation; a lost answer is retried with the
 same CSR. The renewer does not restart k3s while the agent's upgrade
 Plans exist.
@@ -605,8 +626,7 @@ dogfood convenience, so its absence must never hold up a customer release.
 
 ## Follow-ups (later phases)
 
-- **Managed state:** dual-stack CIDRs; an api field or route for the
-  renewer to report a switch back (today the error stays on the machine).
+- **Managed state:** dual-stack CIDRs.
 
 - **Dashboard** live surfaces (nodes capacity/instance-type, workloads card,
   "reported n s ago"). Harden `readyNodeCount` to use the explicit `ready` bool

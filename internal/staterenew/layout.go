@@ -20,6 +20,10 @@ import (
 //	  install.env           what the install script reads (no secret)
 //	  renew.json            renewer settings (api URL, cluster, machine)
 //	  k3s-token             the k3s server token (0600)
+//	  k3s-agent-token       the k3s agent token, k3s agent-token-file (0600)
+//	  agent-token           the kubehz agent token that this install made,
+//	                        until the install puts it in the cluster (0600)
+//	  last-error            the last renewal error (no secret)
 //	  current -> gen-2      switched with ONE rename(2)
 //	  gen-1/                the previous generation (kept for a switch back)
 //	  gen-2/
@@ -30,8 +34,8 @@ import (
 //	    meta.json           the generation's state
 //
 // A role agent machine has no datastore identity (contract 10.5): its
-// folder holds only install.env and k3s-token. It has no key, no
-// generation, no "current" and no renew.json.
+// folder holds only install.env and k3s-token (there, the k3s agent
+// token). It has no key, no generation, no "current" and no renew.json.
 const (
 	DefaultDir = "/etc/kubehz/state"
 
@@ -45,13 +49,13 @@ const (
 	CSRFile  = "request.csr"
 	metaFile = "meta.json"
 
-	ConfigFile      = "renew.json"
-	TokenFile       = "k3s-token"
-	AgentTokenFile  = "agent-token"
-	InstallEnvFile  = "install.env"
-	AuthnConfigFile = "authentication-config.yaml"
-	SSOManifestFile = "sso-rbac.yaml"
-	lastErrorFile   = "last-error"
+	ConfigFile        = "renew.json"
+	TokenFile         = "k3s-token"
+	K3sAgentTokenFile = "k3s-agent-token"
+	AgentTokenFile    = "agent-token"
+	InstallEnvFile    = "install.env"
+	AuthnConfigFile   = "authentication-config.yaml"
+	lastErrorFile     = "last-error"
 )
 
 // Generation states. A generation moves keyed -> issued -> switched ->

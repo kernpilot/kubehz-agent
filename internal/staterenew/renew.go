@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -60,7 +61,7 @@ type Host interface {
 type API interface {
 	Check(ctx context.Context, s Signer, req CheckRequest) (CheckResponse, error)
 	Renew(ctx context.Context, s Signer, req RenewRequest) (RenewResponse, error)
-	Ack(ctx context.Context, s Signer, req CheckRequest) (AckResponse, error)
+	Ack(ctx context.Context, s Signer, req AckRequest) (AckResponse, error)
 }
 
 // Defaults of the renewer.
@@ -129,9 +130,20 @@ func (r *Renewer) hook(point string) error {
 	return r.crash(point)
 }
 
-// Run does one renewal pass.
+// Run does one renewal pass. The error of a pass is the last renewal error
+// (file last-error), and the next check sends it to the api. A pass that
+// finds no renewal due, and does not wait after a switch back, clears it.
+// An acknowledged renewal clears it too.
 func (r *Renewer) Run(ctx context.Context) error {
 	r.defaults()
+	err := r.run(ctx)
+	if err != nil {
+		r.setLastError(err.Error())
+	}
+	return err
+}
+
+func (r *Renewer) run(ctx context.Context) error {
 	cur, err := r.Store.Current()
 	if err != nil {
 		return fmt.Errorf("find the current certificate in %s: %w; run the install first", r.Store.Dir, err)
@@ -178,7 +190,7 @@ func (r *Renewer) Run(ctx context.Context) error {
 		return fmt.Errorf("the client certificate of %s expired at %s; make a recovery ticket in the dashboard and run the install script with --recovery", genName(cur), na.UTC().Format(time.RFC3339))
 	}
 	version := r.k3sVersion(ctx)
-	chk, err := r.API.Check(ctx, signer, CheckRequest{K3sVersion: version})
+	chk, err := r.API.Check(ctx, signer, CheckRequest{K3sVersion: version, LastError: reportText(r.lastError())})
 	if err != nil {
 		if last := r.lastError(); last != "" {
 			return fmt.Errorf("renewal check failed: %w (the last renewal failed: %s)", err, last)
@@ -195,6 +207,10 @@ func (r *Renewer) Run(ctx context.Context) error {
 	}
 	if !chk.Due && pending == nil {
 		r.Log.Debug("renewal not due", "reason", chk.Reason)
+		if retryIn <= 0 {
+			// The last run was fine, or its failure is over.
+			r.setLastError("")
+		}
 		return nil
 	}
 	busy, err := r.Host.UpgradeInProgress(ctx)
@@ -399,7 +415,7 @@ func (r *Renewer) finish(ctx context.Context, n int, m Meta) error {
 	if err != nil {
 		return err
 	}
-	resp, err := r.API.Ack(ctx, signer, CheckRequest{K3sVersion: r.k3sVersion(ctx)})
+	resp, err := r.API.Ack(ctx, signer, AckRequest{K3sVersion: r.k3sVersion(ctx)})
 	if err != nil {
 		if !isPermanent(err) {
 			return fmt.Errorf("acknowledgement failed; the next run sends it again: %w", err)
@@ -657,16 +673,51 @@ func (r *Renewer) lastError() string {
 
 func (r *Renewer) setLastError(msg string) {
 	path := r.Store.Dir + "/" + lastErrorFile
+	msg = reportText(msg)
 	if msg == "" {
 		_ = os.Remove(path)
 		return
 	}
-	if rs := []rune(msg); len(rs) > 500 {
-		msg = string(rs[:500])
-	}
 	if err := WriteFileAtomic(path, []byte(msg+"\n"), 0o600); err != nil {
 		r.Log.Warn("cannot record the last renewal error", "error", err.Error())
 	}
+}
+
+// maxReport is the api's limit of lastError (characters).
+const maxReport = 512
+
+var (
+	// Secrets that an error text must never carry to the api: kubehz
+	// tokens and tickets, k3s secure tokens and PEM blocks.
+	reportKubehzToken = regexp.MustCompile(`khz_[a-z]+_[A-Za-z0-9]+`)
+	reportK3sToken    = regexp.MustCompile(`K10[0-9A-Fa-f]+::\S*`)
+	reportPEM         = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]+-----.*?(?:-----END [A-Z0-9 ]+-----|$)`)
+)
+
+// reportText makes an error text fit for the api's lastError: no token, no
+// PEM block, printable ASCII only (each other character becomes "?" or a
+// space), and at most 512 characters. The renewer's errors hold no secret;
+// this is a second guard.
+func reportText(msg string) string {
+	msg = reportPEM.ReplaceAllString(msg, "[PEM removed]")
+	msg = reportKubehzToken.ReplaceAllString(msg, "khz_[removed]")
+	msg = reportK3sToken.ReplaceAllString(msg, "K10[removed]")
+	b := make([]byte, 0, len(msg))
+	for _, c := range msg {
+		switch {
+		case c == '\n' || c == '\r' || c == '\t':
+			b = append(b, ' ')
+		case c < 0x20 || c > 0x7e:
+			b = append(b, '?')
+		default:
+			b = append(b, byte(c))
+		}
+	}
+	out := strings.TrimSpace(string(b))
+	if len(out) > maxReport {
+		out = out[:maxReport]
+	}
+	return out
 }
 
 func serialHex(c *x509.Certificate) string {

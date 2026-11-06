@@ -28,13 +28,35 @@ func TestRedeemMain(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d: %s", code, errb.String())
 	}
-	if !strings.Contains(out.String(), "cluster c1, machine m-1") {
+	if !strings.Contains(out.String(), "cluster c1, machine m-1; this install made the cluster's kubehz agent token") {
 		t.Fatalf("stdout %q", out.String())
 	}
-	for _, secret := range []string{testTicket, testK3sToken, testAgentToken} {
+	agentToken := strings.TrimSpace(readFile(t, dir, AgentTokenFile))
+	for _, secret := range []string{testTicket, testK3sToken, testK3sAgentToken, agentToken} {
 		if strings.Contains(out.String()+errb.String(), secret) {
 			t.Fatal("output shows a secret")
 		}
+	}
+}
+
+// --recovery reaches the redemption: no agent token hash.
+func TestRedeemMainRecovery(t *testing.T) {
+	a, srv := newFakeAPI(t)
+	a.redeem = apiRedeem(a)
+	a.ticketKind = KindRecovery
+	dir := filepath.Join(t.TempDir(), "state")
+	var out, errb bytes.Buffer
+	code := RedeemMain(context.Background(), []string{"--dir", dir, "--api-url", srv.URL, "--label", "server-1", "--recovery"}, strings.NewReader(testTicket+"\n"), &out, &errb, "test")
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+	if _, ok := a.redeemRaw[0]["agentTokenHash"]; ok || out.String() != "redeemed: cluster c1, machine m-1\n" {
+		t.Fatalf("body %v, stdout %q", a.redeemRaw[0], out.String())
+	}
+	errb.Reset()
+	code = RedeemMain(context.Background(), []string{"--dir", t.TempDir(), "--api-url", srv.URL, "--role", "agent", "--recovery"}, strings.NewReader(testTicket+"\n"), &out, &errb, "test")
+	if code != ExitFail || len(a.redeemed) != 1 {
+		t.Fatalf("agent with --recovery: exit %d, redemptions %d", code, len(a.redeemed))
 	}
 }
 
@@ -54,7 +76,7 @@ func TestRedeemMainAgent(t *testing.T) {
 	if _, ok := a.redeemRaw[0]["csr"]; ok {
 		t.Fatal("an agent sent a CSR")
 	}
-	if strings.Contains(out.String()+errb.String(), testK3sToken) {
+	if strings.Contains(out.String()+errb.String(), testK3sAgentToken) {
 		t.Fatal("output shows the k3s token")
 	}
 }

@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,13 +17,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/yaml"
 
@@ -69,8 +69,6 @@ const (
 	maxTicket      = 512
 	maxAuthnConfig = 64 << 10
 	maxSANs        = 20
-	maxBindings    = 20
-	maxGroups      = 20
 )
 
 var (
@@ -82,10 +80,10 @@ var (
 	// ticket: https, a host name or a bracketed IPv6 address, an optional
 	// port, no path.
 	serverURLRE = regexp.MustCompile(`^https://(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::[0-9]{1,5})?$`)
+	// ciliumVersionRE is an exact Cilium release (the install script pins
+	// the chart of each version by sha256).
+	ciliumVersionRE = regexp.MustCompile(`^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$`)
 )
-
-// SSORoles are the cluster roles a static SSO binding may name.
-var SSORoles = map[string]bool{"cluster-admin": true, "admin": true, "edit": true, "view": true}
 
 // ReadTicket reads the ticket from the first line of r. The install script
 // asks for it at a hidden prompt and writes it to stdin, so the ticket is in
@@ -108,8 +106,9 @@ func ReadTicket(r io.Reader) (string, error) {
 
 // Redeemer is the first step of the host install. A server makes its first
 // key on this machine, redeems the ticket with a CSR and writes the state
-// folder. An agent node redeems the ticket without a CSR and gets only the
-// k3s token and its server URL.
+// folder. A server install (not a recovery) also makes the kubehz agent
+// token of the cluster and sends only its hash. An agent node redeems the
+// ticket without a CSR and gets only the k3s agent token and its server URL.
 type Redeemer struct {
 	Store Store
 	API   interface {
@@ -118,16 +117,21 @@ type Redeemer struct {
 	APIURL string
 	Label  string
 	Role   string
-	Now    func() time.Time
+	// Recovery is set for a recovery ticket (the script's --recovery). A
+	// recovery sends no agent token hash: the cluster has its agent token.
+	Recovery bool
+	Now      func() time.Time
 }
 
 // Result is what the install script needs to know after a redemption. It
 // holds no secret. ClusterID is empty for role agent: the api tells an
-// agent node no cluster id.
+// agent node no cluster id. AgentToken is true when this install made the
+// cluster's kubehz agent token (the file agent-token).
 type Result struct {
-	Role      string
-	MachineID string
-	ClusterID string
+	Role       string
+	MachineID  string
+	ClusterID  string
+	AgentToken bool
 }
 
 // ErrInstalled means the machine already has a state folder in use.
@@ -143,6 +147,9 @@ func (d *Redeemer) Run(ctx context.Context, ticket string) (Result, error) {
 	}
 	if d.Role != RoleServer && d.Role != RoleAgent {
 		return Result{}, fmt.Errorf("role %q is not supported (use %q or %q, the role of the ticket)", d.Role, RoleServer, RoleAgent)
+	}
+	if d.Role == RoleAgent && d.Recovery {
+		return Result{}, errors.New("a recovery is for a server; an agent ticket is an install ticket")
 	}
 	if !labelRE.MatchString(d.Label) {
 		return Result{}, fmt.Errorf("machine label %q is not a DNS label; use lowercase letters, digits and '-', at most 63 characters", d.Label)
@@ -198,17 +205,13 @@ func (d *Redeemer) Run(ctx context.Context, ticket string) (Result, error) {
 		return Result{}, err
 	}
 
-	resp, err := d.API.Redeem(ctx, RedeemRequest{Ticket: ticket, CSR: string(csr), MachineLabel: d.Label, Role: RoleServer})
+	resp, agentToken, err := d.redeemServer(ctx, RedeemRequest{Ticket: ticket, CSR: string(csr), MachineLabel: d.Label, Role: RoleServer})
 	if err != nil {
 		return Result{}, redeemError(err)
 	}
 	cert, clusterID, err := d.checkResponse(resp, key)
 	if err != nil {
 		return Result{}, fmt.Errorf("the platform's answer is not usable: %w; the ticket is now used, so make a new ticket in the dashboard", err)
-	}
-	sso, err := renderSSOBindings(clusterID, resp.InstallConfig.RoleBindings)
-	if err != nil {
-		return Result{}, err
 	}
 
 	top := func(name string) string { return filepath.Join(d.Store.Dir, name) }
@@ -220,18 +223,18 @@ func (d *Redeemer) Run(ctx context.Context, ticket string) (Result, error) {
 		{d.Store.Path(n, CertFile), []byte(resp.Certificate), 0o644},
 		{d.Store.Path(n, CAFile), []byte(resp.ServingCA), 0o644},
 		{top(TokenFile), []byte(resp.K3sToken + "\n"), 0o600},
+		{top(K3sAgentTokenFile), []byte(resp.K3sAgentToken + "\n"), 0o600},
 		{top(ConfigFile), append(settings, '\n'), 0o600},
-		{top(InstallEnvFile), installEnv(resp, clusterID, len(sso) > 0), 0o600},
 	}
-	if resp.AgentToken != "" {
-		files = append(files, stateFile{top(AgentTokenFile), []byte(resp.AgentToken + "\n"), 0o600})
+	if agentToken != "" {
+		// No newline: the install puts the file as it is into the Secret.
+		files = append(files, stateFile{top(AgentTokenFile), []byte(agentToken), 0o600})
 	}
 	if resp.InstallConfig.AuthenticationConfig != "" {
 		files = append(files, stateFile{top(AuthnConfigFile), []byte(resp.InstallConfig.AuthenticationConfig), 0o600})
 	}
-	if len(sso) > 0 {
-		files = append(files, stateFile{top(SSOManifestFile), sso, 0o600})
-	}
+	// install.env is the last file: the install script reads it.
+	files = append(files, stateFile{top(InstallEnvFile), installEnv(resp, clusterID, agentToken != ""), 0o600})
 	if err := writeFiles(files); err != nil {
 		return Result{}, err
 	}
@@ -255,7 +258,56 @@ func (d *Redeemer) Run(ctx context.Context, ticket string) (Result, error) {
 		return Result{}, err
 	}
 	ok = true
-	return Result{Role: RoleServer, MachineID: resp.MachineID, ClusterID: clusterID}, nil
+	return Result{Role: RoleServer, MachineID: resp.MachineID, ClusterID: clusterID, AgentToken: agentToken != ""}, nil
+}
+
+// redeemServer redeems a server ticket. A server install (not a recovery)
+// makes the kubehz agent token of the cluster on this machine and sends
+// only its sha256. The api refuses the hash, and leaves the ticket unused,
+// when the cluster has an agent token already (another server made it:
+// redeem again without the hash) or when another cluster has this token
+// (make a new one). It returns the token when the api took its hash.
+func (d *Redeemer) redeemServer(ctx context.Context, req RedeemRequest) (RedeemResponse, string, error) {
+	token := ""
+	if !d.Recovery {
+		t, hash, err := newAgentToken()
+		if err != nil {
+			return RedeemResponse{}, "", err
+		}
+		token, req.AgentTokenHash = t, hash
+	}
+	resp, err := d.API.Redeem(ctx, req)
+	for tries := 0; err != nil && req.AgentTokenHash != "" && tries < 2; tries++ {
+		switch errorCode(err) {
+		case "STATE_AGENT_TOKEN_EXISTS":
+			token, req.AgentTokenHash = "", ""
+		case "AGENT_TOKEN_CONFLICT":
+			t, hash, terr := newAgentToken()
+			if terr != nil {
+				return RedeemResponse{}, "", terr
+			}
+			token, req.AgentTokenHash = t, hash
+		default:
+			return RedeemResponse{}, "", err
+		}
+		resp, err = d.API.Redeem(ctx, req)
+	}
+	if err != nil {
+		return RedeemResponse{}, "", err
+	}
+	return resp, token, nil
+}
+
+// newAgentToken makes a kubehz agent token (khz_agt_ and 64 hex digits from
+// the system's random source) and its sha256 in lowercase hex.
+func newAgentToken() (token, hash string, err error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", "", fmt.Errorf("make the agent token: %w", err)
+	}
+	token = "khz_agt_" + hex.EncodeToString(b)
+	sum := sha256.Sum256([]byte(token))
+	return token, hex.EncodeToString(sum[:]), nil
 }
 
 // runAgent redeems an agent ticket: no key, no CSR, no certificate. The
@@ -319,6 +371,9 @@ func redeemError(err error) error {
 	switch {
 	case errorCode(err) == "STATE_TICKET_USED":
 		return fmt.Errorf("the ticket was redeemed before: %w; if that was this machine, its first certificate is revoked now. Make a new ticket in the dashboard and run the install again", err)
+	case errorCode(err) == "BAD_REQUEST":
+		// The api checks the request before it spends the ticket.
+		return fmt.Errorf("the platform refused the redemption: %w; the ticket is not used yet, so run the install again with the options of the command in the dashboard (--role, --recovery)", err)
 	case isPermanent(err):
 		return fmt.Errorf("the platform refused the ticket: %w; make a new ticket in the dashboard (of the role of this install) and run the install again", err)
 	}
@@ -332,6 +387,9 @@ func redeemError(err error) error {
 func (d *Redeemer) checkResponse(resp RedeemResponse, key crypto.Signer) (*x509.Certificate, string, error) {
 	if !machineIDRE.MatchString(resp.MachineID) {
 		return nil, "", fmt.Errorf("machine id %q is not valid", resp.MachineID)
+	}
+	if err := d.checkKind(resp.Kind); err != nil {
+		return nil, "", err
 	}
 	c, err := parseCert([]byte(resp.Certificate))
 	if err != nil {
@@ -353,7 +411,7 @@ func (d *Redeemer) checkResponse(resp RedeemResponse, key crypto.Signer) (*x509.
 	if !config.ValidClusterID(clusterID) {
 		return nil, "", fmt.Errorf("the client certificate names no valid cluster id (subject O %q)", c.Subject.Organization)
 	}
-	if id := resp.InstallConfig.ClusterID; id != "" && id != clusterID {
+	if id := resp.InstallConfig.ClusterID; id != clusterID {
 		return nil, "", fmt.Errorf("install configuration: cluster id %q is not the cluster %q of the client certificate", id, clusterID)
 	}
 	if err := checkCABundle([]byte(resp.ServingCA)); err != nil {
@@ -366,10 +424,12 @@ func (d *Redeemer) checkResponse(resp RedeemResponse, key crypto.Signer) (*x509.
 		// SECURITY: never echo the token.
 		return nil, "", errors.New("the k3s token has an invalid format")
 	}
-	if resp.AgentToken != "" {
-		if _, err := config.ValidateToken(resp.AgentToken); err != nil {
-			return nil, "", err
-		}
+	if !k3sTokenRE.MatchString(resp.K3sAgentToken) {
+		// SECURITY: never echo the token.
+		return nil, "", errors.New("the k3s agent token is missing or has an invalid format")
+	}
+	if resp.K3sAgentToken == resp.K3sToken {
+		return nil, "", errors.New("the k3s agent token is the k3s server token; a server needs two different tokens")
 	}
 	if resp.InstallConfig.ServerURL != "" {
 		return nil, "", errors.New("install configuration: a server ticket has a k3s server URL (that is for role agent)")
@@ -396,6 +456,19 @@ func checkIssued(c *x509.Certificate, serial string, notAfter time.Time, caGener
 	return nil
 }
 
+// checkKind checks the ticket kind of a server redemption against the
+// script's --recovery. A recovery removes the Node object of the lost
+// server; an install does not.
+func (d *Redeemer) checkKind(kind string) error {
+	switch {
+	case d.Recovery && kind != KindRecovery:
+		return fmt.Errorf("the ticket kind is %q, but the install runs with --recovery; use a recovery ticket for a recovery", kind)
+	case !d.Recovery && kind != KindInstall:
+		return fmt.Errorf("the ticket kind is %q; run the install script with --recovery for a recovery ticket", kind)
+	}
+	return nil
+}
+
 // checkAgentResponse checks the answer of an agent redemption. An agent has
 // no datastore identity: a certificate, serving CA or endpoint in the
 // answer is a fault, and nothing of it is written.
@@ -403,15 +476,26 @@ func checkAgentResponse(resp RedeemResponse) error {
 	if !machineIDRE.MatchString(resp.MachineID) {
 		return fmt.Errorf("machine id %q is not valid", resp.MachineID)
 	}
+	if resp.Kind != KindInstall {
+		return fmt.Errorf("the ticket kind is %q; an agent ticket is an install ticket", resp.Kind)
+	}
 	if resp.Certificate != "" || resp.Serial != "" || !resp.NotAfter.IsZero() || resp.CAGeneration != 0 ||
 		resp.ServingCA != "" || resp.Endpoint != "" {
 		return errors.New("the answer has datastore credentials, but an agent machine gets none")
+	}
+	// An agent node joins with the k3s agent token only (k3sToken); the
+	// server token is not for it.
+	if resp.K3sAgentToken != "" {
+		return errors.New("the answer has a second k3s token, but an agent machine gets only the agent token")
 	}
 	if !k3sTokenRE.MatchString(resp.K3sToken) {
 		// SECURITY: never echo the token.
 		return errors.New("the k3s token has an invalid format")
 	}
 	ic := resp.InstallConfig
+	if ic.ClusterID != "" || len(ic.TLSSANs) > 0 || ic.AuthenticationConfig != "" {
+		return errors.New("install configuration: a cluster id, TLS SANs or an authentication configuration are for a server")
+	}
 	if !serverURLRE.MatchString(ic.ServerURL) {
 		return fmt.Errorf("install configuration: k3s server URL %q is not https://<host>[:<port>]", ic.ServerURL)
 	}
@@ -450,6 +534,9 @@ func checkEndpoint(raw string) error {
 func checkInstallConfig(c InstallConfig) error {
 	if c.K3sVersion != "" && !desired.ValidK3sVersion(c.K3sVersion) {
 		return fmt.Errorf("install configuration: k3s version %q is not an exact k3s version", c.K3sVersion)
+	}
+	if c.CiliumVersion != "" && !ciliumVersionRE.MatchString(c.CiliumVersion) {
+		return fmt.Errorf("install configuration: Cilium version %q is not an exact version (for example 1.20.4)", c.CiliumVersion)
 	}
 	for name, v := range map[string]string{"cluster CIDR": c.ClusterCIDR, "service CIDR": c.ServiceCIDR} {
 		if v == "" {
@@ -507,71 +594,10 @@ func checkCIDRs(v string) error {
 	return nil
 }
 
-// renderSSOBindings renders the static SSO role bindings of design 3.4: one
-// ClusterRoleBinding per entry, for groups only.
-func renderSSOBindings(clusterID string, bindings []RoleBinding) ([]byte, error) {
-	if len(bindings) > maxBindings {
-		return nil, fmt.Errorf("install configuration: %d role bindings, at most %d", len(bindings), maxBindings)
-	}
-	var docs []string
-	seen := map[string]bool{}
-	for _, b := range bindings {
-		name := "kubehz-sso-" + b.Name
-		if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 || b.Name == "" {
-			return nil, fmt.Errorf("install configuration: role binding name %q is not valid", b.Name)
-		}
-		if seen[name] {
-			return nil, fmt.Errorf("install configuration: role binding %q is there two times", b.Name)
-		}
-		seen[name] = true
-		if !SSORoles[b.ClusterRole] {
-			return nil, fmt.Errorf("install configuration: role binding %q names cluster role %q (allowed: %s)", b.Name, b.ClusterRole, strings.Join(ssoRoleNames(), ", "))
-		}
-		if len(b.Groups) == 0 || len(b.Groups) > maxGroups {
-			return nil, fmt.Errorf("install configuration: role binding %q has %d groups (want 1 to %d)", b.Name, len(b.Groups), maxGroups)
-		}
-		crb := rbacv1.ClusterRoleBinding{
-			TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "kubehz-install",
-				},
-				Annotations: map[string]string{"kubehz.cloud/cluster-id": clusterID},
-			},
-			RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: b.ClusterRole},
-		}
-		for _, g := range b.Groups {
-			if g == "" || len(g) > 256 || strings.ContainsFunc(g, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
-				return nil, fmt.Errorf("install configuration: role binding %q has a group name that is not valid", b.Name)
-			}
-			crb.Subjects = append(crb.Subjects, rbacv1.Subject{Kind: rbacv1.GroupKind, APIGroup: "rbac.authorization.k8s.io", Name: g})
-		}
-		out, err := yaml.Marshal(crb)
-		if err != nil {
-			return nil, err
-		}
-		docs = append(docs, string(out))
-	}
-	if len(docs) == 0 {
-		return nil, nil
-	}
-	return []byte("# Written by the kubehz install. The SSO role bindings of this cluster.\n---\n" + strings.Join(docs, "---\n")), nil
-}
-
-func ssoRoleNames() []string {
-	out := make([]string, 0, len(SSORoles))
-	for r := range SSORoles {
-		out = append(out, r)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // installEnv is the KEY=value file that the install script reads with a
 // parser (never with "source"). Every value was validated and has no space,
 // quote or newline.
-func installEnv(resp RedeemResponse, clusterID string, sso bool) []byte {
+func installEnv(resp RedeemResponse, clusterID string, agentToken bool) []byte {
 	b := func(v bool) string {
 		if v {
 			return "1"
@@ -581,16 +607,17 @@ func installEnv(resp RedeemResponse, clusterID string, sso bool) []byte {
 	ic := resp.InstallConfig
 	lines := []string{
 		"ROLE=" + RoleServer,
+		"KIND=" + resp.Kind,
 		"CLUSTER_ID=" + clusterID,
 		"MACHINE_ID=" + resp.MachineID,
 		"STATE_ENDPOINT=" + resp.Endpoint,
 		"K3S_VERSION=" + ic.K3sVersion,
+		"CILIUM_VERSION=" + ic.CiliumVersion,
 		"CLUSTER_CIDR=" + ic.ClusterCIDR,
 		"SERVICE_CIDR=" + ic.ServiceCIDR,
 		"TLS_SANS=" + strings.Join(ic.TLSSANs, ","),
 		"HAS_AUTHN_CONFIG=" + b(ic.AuthenticationConfig != ""),
-		"HAS_SSO_BINDINGS=" + b(sso),
-		"HAS_AGENT_TOKEN=" + b(resp.AgentToken != ""),
+		"HAS_AGENT_TOKEN=" + b(agentToken),
 	}
 	return []byte(strings.Join(lines, "\n") + "\n")
 }

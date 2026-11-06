@@ -22,10 +22,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -73,13 +75,48 @@ type pendingCert struct {
 	notAfter time.Time
 }
 
+// The api's request schemas (zod .strict()): the fake decodes into these,
+// not into the agent's types, so a field that the api does not know fails
+// here as it fails at the api. A pointer is an optional field.
+type apiRedeemBody struct {
+	Ticket         string  `json:"ticket"`
+	CSR            *string `json:"csr"`
+	MachineLabel   string  `json:"machineLabel"`
+	Role           string  `json:"role"`
+	AgentTokenHash *string `json:"agentTokenHash"`
+}
+
+type apiCheckBody struct {
+	K3sVersion *string `json:"k3sVersion"`
+	LastError  *string `json:"lastError"`
+}
+
+type apiAckBody struct {
+	K3sVersion *string `json:"k3sVersion"`
+}
+
+type apiRenewBody struct {
+	CSR        string  `json:"csr"`
+	K3sVersion *string `json:"k3sVersion"`
+}
+
+func deref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+var sha256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 // fakeAPI is the machine side of the kubehz api (build contract 4.2, 4.3
 // and 10). It enforces what the api enforces: strict request bodies, the
 // signed method, path (the raw request path, without the query) and body,
 // the role rules of a redemption, a first certificate that stays pending
-// until it is acknowledged, an ack that answers the same serial again, and
-// the revocation of an unacknowledged machine when its ticket is redeemed
-// a second time.
+// until it is acknowledged, an ack that answers the same serial again, the
+// revocation of an unacknowledged machine when its ticket is redeemed a
+// second time, and the rules of the kubehz agent token hash (server install
+// tickets only; one live token per cluster; a hash belongs to one cluster).
 type fakeAPI struct {
 	t   *testing.T
 	mu  sync.Mutex
@@ -93,19 +130,31 @@ type fakeAPI struct {
 	dropRenew   int // renew answers to lose (the request is processed)
 	ackStatus   int // answer every ack with this status (0: normal)
 	ackFailures int // answer this many acks with 503 first
+	checkFails  int // answer this many checks with 503 first
 
 	csrs      []string
 	checks    []CheckRequest
-	ackBodies []CheckRequest
+	ackBodies []AckRequest
 	acks      int
 	signed    []string // the signed path of each signed request
 	jti       map[string]bool
 
 	ticketRole string // the role of testTicket ("" is server)
+	ticketKind string // the kind of testTicket ("" is install)
 	ticketUsed bool
 	redeemed   []RedeemRequest
 	redeemRaw  []map[string]any
 	redeem     func(req RedeemRequest, pub any) (RedeemResponse, int)
+
+	agentTokenHash string // the cluster's live kubehz agent token (hash)
+	conflicts      int    // answer this many hashes with AGENT_TOKEN_CONFLICT
+}
+
+func (a *fakeAPI) kind() string {
+	if a.ticketKind == "" {
+		return KindInstall
+	}
+	return a.ticketKind
 }
 
 func newFakeAPI(t *testing.T) (*fakeAPI, *httptest.Server) {
@@ -272,19 +321,29 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	serial := cert.SerialNumber.Text(16)
 	switch r.URL.Path {
 	case pathCheck:
-		var req CheckRequest
+		var req apiCheckBody
 		if err := strictJSON(body, &req); err != nil {
 			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
+			return
+		}
+		// zod's max(512) counts UTF-16 code units.
+		if req.LastError != nil && len(utf16.Encode([]rune(*req.LastError))) > 512 {
+			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "lastError: at most 512 characters")
 			return
 		}
 		if serial != a.active {
 			a.problem(w, http.StatusForbidden, "STATE_MACHINE_UNKNOWN", "serial is not active")
 			return
 		}
-		a.checks = append(a.checks, req)
+		a.checks = append(a.checks, CheckRequest{K3sVersion: deref(req.K3sVersion), LastError: deref(req.LastError)})
+		if a.checkFails > 0 {
+			a.checkFails--
+			a.problem(w, http.StatusServiceUnavailable, "STATE_RENEW_UNAVAILABLE", "limiter unavailable")
+			return
+		}
 		_ = json.NewEncoder(w).Encode(CheckResponse{Due: a.due, Paused: a.paused, Reason: "not-due"})
 	case pathRenew:
-		var req RenewRequest
+		var req apiRenewBody
 		if err := strictJSON(body, &req); err != nil {
 			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
 			return
@@ -318,12 +377,12 @@ func (a *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(RenewResponse{Certificate: pc.pem, CAGeneration: pc.caGen, Serial: pc.serial, NotAfter: pc.notAfter})
 	case pathAck:
 		a.acks++
-		var req CheckRequest
+		var req apiAckBody
 		if err := strictJSON(body, &req); err != nil {
 			a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
 			return
 		}
-		a.ackBodies = append(a.ackBodies, req)
+		a.ackBodies = append(a.ackBodies, AckRequest{K3sVersion: deref(req.K3sVersion)})
 		if a.ackStatus != 0 {
 			a.problem(w, a.ackStatus, "TEST_ACK_REFUSED", "ack refused")
 			return
@@ -357,15 +416,20 @@ func (a *fakeAPI) serveRedeem(w http.ResponseWriter, r *http.Request, body []byt
 		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "redeem is not signed")
 		return
 	}
-	var req RedeemRequest
-	if err := strictJSON(body, &req); err != nil {
+	var wire apiRedeemBody
+	if err := strictJSON(body, &wire); err != nil {
 		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "body: "+err.Error())
 		return
 	}
+	req := RedeemRequest{Ticket: wire.Ticket, CSR: deref(wire.CSR), MachineLabel: wire.MachineLabel, Role: wire.Role, AgentTokenHash: deref(wire.AgentTokenHash)}
 	var raw map[string]any
 	_ = json.Unmarshal(body, &raw)
 	a.redeemed = append(a.redeemed, req)
 	a.redeemRaw = append(a.redeemRaw, raw)
+	if wire.AgentTokenHash != nil && !sha256HexRE.MatchString(*wire.AgentTokenHash) {
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "agentTokenHash: must be a lowercase hex SHA-256 hash")
+		return
+	}
 	if req.Ticket != testTicket {
 		a.problem(w, http.StatusUnauthorized, "STATE_TICKET_INVALID", "the ticket is not valid")
 		return
@@ -388,6 +452,9 @@ func (a *fakeAPI) serveRedeem(w http.ResponseWriter, r *http.Request, body []byt
 	case req.Role != role:
 		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "the role is not the role of the ticket")
 		return
+	case wire.AgentTokenHash != nil && (role != RoleServer || a.kind() != KindInstall):
+		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "a "+role+" "+a.kind()+" ticket takes no agentTokenHash")
+		return
 	case role == RoleAgent && hasCSR:
 		a.problem(w, http.StatusBadRequest, "BAD_REQUEST", "an agent machine sends no CSR")
 		return
@@ -409,23 +476,40 @@ func (a *fakeAPI) serveRedeem(w http.ResponseWriter, r *http.Request, body []byt
 		}
 		pub = csr.PublicKey
 	}
+	// The agent token comes before the ticket is spent: a refusal leaves
+	// the ticket unused.
+	if h := req.AgentTokenHash; h != "" {
+		if a.agentTokenHash != "" {
+			a.problem(w, http.StatusConflict, "STATE_AGENT_TOKEN_EXISTS", "the cluster already has an agent token")
+			return
+		}
+		if a.conflicts > 0 {
+			a.conflicts--
+			a.problem(w, http.StatusConflict, "AGENT_TOKEN_CONFLICT", "the agent token is already registered")
+			return
+		}
+	}
 	resp, status := a.redeem(req, pub)
 	if status != 0 {
 		a.problem(w, status, "TEST_REFUSED", "ticket refused")
 		return
 	}
 	a.ticketUsed = true
+	if req.AgentTokenHash != "" {
+		a.agentTokenHash = req.AgentTokenHash
+	}
 	_ = json.NewEncoder(w).Encode(wireRedeem(resp))
 }
 
 // wireRedeem encodes a redeem answer as the api does: null for the absent
-// certificate fields, serving CA, endpoint and server URL, and the install
-// configuration fields that the install does not read.
+// certificate fields, serving CA, endpoint, k3s agent token, cluster id and
+// server URL, an empty tlsSans, and the install configuration fields that
+// the install does not read.
 func wireRedeem(resp RedeemResponse) map[string]any {
 	b, _ := json.Marshal(resp)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
-	for _, k := range []string{"certificate", "serial", "servingCA", "endpoint"} {
+	for _, k := range []string{"certificate", "serial", "servingCA", "endpoint", "k3sAgentToken"} {
 		if m[k] == "" {
 			m[k] = nil
 		}
@@ -437,10 +521,17 @@ func wireRedeem(resp RedeemResponse) map[string]any {
 		m["caGeneration"] = nil
 	}
 	ic, _ := m["installConfig"].(map[string]any)
-	if _, ok := ic["serverUrl"]; !ok {
-		ic["serverUrl"] = nil
+	for _, k := range []string{"serverUrl", "clusterId"} {
+		if _, ok := ic[k]; !ok {
+			ic[k] = nil
+		}
 	}
-	ic["ciliumVersion"] = "1.20.1"
+	if _, ok := ic["tlsSans"]; !ok {
+		ic["tlsSans"] = []string{}
+	}
+	if _, ok := ic["ciliumVersion"]; !ok {
+		ic["ciliumVersion"] = "1.20.4"
+	}
 	ic["serverFlags"] = []string{"--flannel-backend=none"}
 	return m
 }

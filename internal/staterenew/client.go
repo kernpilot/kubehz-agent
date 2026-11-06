@@ -25,10 +25,17 @@ const (
 
 const maxResponse = 1 << 20
 
-// CheckRequest is the body of renew/check and renew/ack: the local k3s
-// version (design 4.4 step 4). The api refuses any other field, so the last
-// failure of this renewer stays on the host (file last-error).
+// CheckRequest is the body of renew/check: the local k3s version (design
+// 4.4 step 4) and the last renewal error (at most 512 characters, no
+// secret). No LastError means that the last run was fine; the api then
+// clears the error it shows.
 type CheckRequest struct {
+	K3sVersion string `json:"k3sVersion,omitempty"`
+	LastError  string `json:"lastError,omitempty"`
+}
+
+// AckRequest is the body of renew/ack. The api refuses any other field.
+type AckRequest struct {
 	K3sVersion string `json:"k3sVersion,omitempty"`
 }
 
@@ -59,19 +66,25 @@ type AckResponse struct {
 }
 
 // RedeemRequest is the body of redeem. CSR is empty for role agent: the
-// api refuses a CSR from an agent machine (contract 10.5).
+// api refuses a CSR from an agent machine (contract 10.5). AgentTokenHash
+// is the sha256 (lowercase hex) of the kubehz agent token that this machine
+// made. Only a server install sends it; the token itself stays on the
+// machine.
 type RedeemRequest struct {
-	Ticket       string `json:"ticket"`
-	CSR          string `json:"csr,omitempty"`
-	MachineLabel string `json:"machineLabel"`
-	Role         string `json:"role"`
+	Ticket         string `json:"ticket"`
+	CSR            string `json:"csr,omitempty"`
+	MachineLabel   string `json:"machineLabel"`
+	Role           string `json:"role"`
+	AgentTokenHash string `json:"agentTokenHash,omitempty"`
 }
 
 // RedeemResponse is the answer of redeem. The api answers null for the
 // certificate fields, ServingCA and Endpoint of role agent; a null decodes
 // to the zero value here. Serial can also be null for role server.
-// AgentToken is not in the api contract yet: the install needs it to
-// register the in-cluster agent, and waits for the Secret without it.
+// K3sToken is the token that THIS machine joins with: the k3s server token
+// for role server, the k3s agent token for role agent. K3sAgentToken is the
+// k3s agent token for the agent-token setting of a server (null for role
+// agent).
 type RedeemResponse struct {
 	MachineID     string        `json:"machineId"`
 	Kind          string        `json:"kind"`
@@ -82,33 +95,31 @@ type RedeemResponse struct {
 	ServingCA     string        `json:"servingCA"`
 	Endpoint      string        `json:"endpoint"`
 	K3sToken      string        `json:"k3sToken"`
+	K3sAgentToken string        `json:"k3sAgentToken"`
 	InstallConfig InstallConfig `json:"installConfig"`
-	AgentToken    string        `json:"agentToken,omitempty"`
 }
+
+// Ticket kinds of a redemption.
+const (
+	KindInstall  = "install"
+	KindRecovery = "recovery"
+)
 
 // InstallConfig is the stored install configuration (design 4.2 step 3).
-// The api sends k3sVersion, ciliumVersion, clusterCidr, serviceCidr,
-// serverFlags and serverUrl; the install reads the fields below. ServerURL
-// is the k3s server that a role agent machine joins (null for role server).
-// ClusterID, TLSSANs, AuthenticationConfig and RoleBindings are not in the
-// api contract yet; the install uses them when they come. The cluster id of
-// a server comes from its client certificate.
+// ClusterID is null for role agent; ServerURL (the k3s server that an agent
+// joins) is null for role server; TLSSANs is empty for role agent. The api
+// also sends serverFlags, which the install does not use: the script sets
+// its own flags. AuthenticationConfig is not in the api contract yet; the
+// install uses it when it comes.
 type InstallConfig struct {
-	ClusterID            string        `json:"clusterId,omitempty"`
-	K3sVersion           string        `json:"k3sVersion,omitempty"`
-	ClusterCIDR          string        `json:"clusterCidr,omitempty"`
-	ServiceCIDR          string        `json:"serviceCidr,omitempty"`
-	ServerURL            string        `json:"serverUrl,omitempty"`
-	TLSSANs              []string      `json:"tlsSans,omitempty"`
-	AuthenticationConfig string        `json:"authenticationConfig,omitempty"`
-	RoleBindings         []RoleBinding `json:"roleBindings,omitempty"`
-}
-
-// RoleBinding is one static SSO binding of design 3.4.
-type RoleBinding struct {
-	Name        string   `json:"name"`
-	ClusterRole string   `json:"clusterRole"`
-	Groups      []string `json:"groups"`
+	ClusterID            string   `json:"clusterId,omitempty"`
+	K3sVersion           string   `json:"k3sVersion,omitempty"`
+	CiliumVersion        string   `json:"ciliumVersion,omitempty"`
+	ClusterCIDR          string   `json:"clusterCidr,omitempty"`
+	ServiceCIDR          string   `json:"serviceCidr,omitempty"`
+	ServerURL            string   `json:"serverUrl,omitempty"`
+	TLSSANs              []string `json:"tlsSans,omitempty"`
+	AuthenticationConfig string   `json:"authenticationConfig,omitempty"`
 }
 
 // StatusError is a non-2xx answer of the api. Code is the api's stable
@@ -202,7 +213,7 @@ func (c *Client) Renew(ctx context.Context, s Signer, req RenewRequest) (RenewRe
 
 // Ack calls renew/ack, signed with the NEW key. It acknowledges a renewed
 // certificate and the first certificate of an install.
-func (c *Client) Ack(ctx context.Context, s Signer, req CheckRequest) (AckResponse, error) {
+func (c *Client) Ack(ctx context.Context, s Signer, req AckRequest) (AckResponse, error) {
 	var out AckResponse
 	return out, c.do(ctx, &s, pathAck, req, &out)
 }

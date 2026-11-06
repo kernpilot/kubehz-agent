@@ -8,7 +8,8 @@
 #
 #   curl -sfLo kubehz-k3s.sh <url> && echo "<sha256>  kubehz-k3s.sh" | sha256sum -c && sudo bash kubehz-k3s.sh
 #
-# The ticket sets the role. For an agent ticket, add "--role agent".
+# The command has the options of the ticket: "--role agent" for an agent
+# ticket, "--recovery" for a recovery ticket.
 #
 # What it does for a server, in order:
 #   1. Checks the machine (root, bash, Linux, systemd; no old k3s etcd data).
@@ -17,24 +18,31 @@
 #   3. Installs the kubehz-agent binary (pinned, sha256 checked).
 #   4. Asks for the install ticket at a hidden prompt and redeems it with
 #      "kubehz-agent state-redeem": the client key is made on this machine
-#      and never leaves it.
-#   5. Installs k3s (pinned, sha256 checked) with the managed datastore, no
-#      flannel, no network policy controller, no traefik, no servicelb.
-#   6. Installs Cilium (pinned chart, sha256 checked) through the k3s Helm
-#      controller, and the static SSO role bindings.
+#      and never leaves it. An install (not a recovery) also makes the
+#      kubehz agent token of the cluster on this machine and sends only its
+#      sha256. If the cluster has an agent token already (another server
+#      made it), the redemption goes on without one.
+#   5. Installs k3s (pinned, sha256 checked) with the managed datastore, the
+#      k3s server token and the k3s agent token, no flannel, no network
+#      policy controller, no traefik, no servicelb.
+#   6. Installs Cilium at the version of the install configuration (each
+#      version that this script can install has a pinned chart sha256)
+#      through the k3s Helm controller.
 #   7. Acknowledges the client certificate ("kubehz-agent state-ack"): the
 #      platform keeps the first certificate pending until k3s runs with it.
-#   8. Recovery (--recovery): removes the old Node object and its node
-#      password Secret, then restarts k3s.
-#   9. Installs the in-cluster kubehz-agent and its registration, and keeps
-#      the applied manifest for the uninstall.
+#   8. Recovery (--recovery): removes the Node object of the lost server
+#      (the host name of this machine) and its node password Secret, then
+#      restarts k3s.
+#   9. Installs the in-cluster kubehz-agent and, with the agent token of
+#      step 4, its Secret. It keeps the applied manifest for the uninstall.
 #  10. Installs the certificate renewal timer (kubehz-agent state-renew,
 #      every 5 minutes).
 #
 # An agent node gets no datastore identity: steps 1 to 3, then the
-# redemption WITHOUT a key or CSR (the answer has the k3s token and the
-# server URL), then k3s as an agent of that server. No Cilium (the server
-# installs it), no in-cluster agent, no certificate, no renewal timer.
+# redemption WITHOUT a key, a CSR or an agent token (the answer has the k3s
+# agent token and the server URL), then k3s as an agent of that server. No
+# Cilium (the server installs it), no in-cluster agent, no certificate, no
+# renewal timer.
 #
 # The script is static: the same file for every cluster. It never pipes a
 # download into a shell, and every download is checked against a pinned
@@ -72,9 +80,13 @@ readonly -a K3S_PINS=(
 readonly K3S_INSTALLER_REF="v1.37.2%2Bk3s1"
 readonly K3S_INSTALLER_SHA256="ed01f89fd977bf20ac1516bbebf8370bf3ddbaa55dac8aba610956a4c78cc00b"
 
-# The Cilium Helm chart (helm.cilium.io index digest of cilium-1.20.4.tgz).
-readonly CILIUM_VERSION="1.20.4"
-readonly CILIUM_CHART_SHA256="505abff8385811df1a949776fc42e9f10697989a332acc86d6e8933efcb855ed"
+# Cilium Helm charts this script can install: "<version> <sha256>", the
+# helm.cilium.io index digest of cilium-<version>.tgz. The install
+# configuration names the version; CILIUM_DEFAULT is the fallback.
+readonly CILIUM_DEFAULT="1.20.4"
+readonly -a CILIUM_PINS=(
+	"1.20.4 505abff8385811df1a949776fc42e9f10697989a332acc86d6e8933efcb855ed"
+)
 
 # ── Paths ────────────────────────────────────────────────────────────────
 readonly STATE_DIR="/etc/kubehz/state"
@@ -121,7 +133,9 @@ Options:
                      agent node joins the k3s server of its ticket. It gets
                      no datastore certificate and no renewal timer.
   --recovery         Install a replacement for a lost server. Use a recovery
-                     ticket. The old server must stay off. Server only.
+                     ticket. The old server must stay off. Give this
+                     machine the host name of the lost server: the script
+                     removes the Node object of that name. Server only.
   --maintenance      Also install the k3s upgrade path (the system-upgrade-
                      controller with zero replicas and the agent's rights to
                      run upgrades that you start in the dashboard). Server
@@ -276,6 +290,9 @@ redeem() {
 	# printf is a bash builtin: the ticket is in no argument list and no
 	# environment of another process.
 	local args=(state-redeem --dir "${STATE_DIR}" --api-url "${API_URL}" --label "${LABEL}" --role "${ROLE}")
+	if ((RECOVERY)); then
+		args+=(--recovery)
+	fi
 	if ! printf '%s\n' "${ticket}" | "${AGENT_BIN}" "${args[@]}"; then
 		ticket=""
 		die "the ticket was not redeemed (see the message above)"
@@ -289,7 +306,7 @@ read_install_env() {
 	local key value
 	while IFS='=' read -r key value; do
 		case "${key}" in
-		ROLE | CLUSTER_ID | MACHINE_ID | STATE_ENDPOINT | SERVER_URL | K3S_VERSION | CLUSTER_CIDR | SERVICE_CIDR | TLS_SANS | HAS_AUTHN_CONFIG | HAS_SSO_BINDINGS | HAS_AGENT_TOKEN)
+		ROLE | KIND | CLUSTER_ID | MACHINE_ID | STATE_ENDPOINT | SERVER_URL | K3S_VERSION | CILIUM_VERSION | CLUSTER_CIDR | SERVICE_CIDR | TLS_SANS | HAS_AUTHN_CONFIG | HAS_AGENT_TOKEN)
 			CFG["${key}"]="${value}"
 			;;
 		"") ;;
@@ -309,6 +326,24 @@ read_install_env() {
 		return 0
 	fi
 	[[ -z "${CFG[SERVER_URL]:-}" ]] || die "install.env: a server has no k3s server URL"
+	[[ -f "${STATE_DIR}/k3s-agent-token" ]] || die "the state folder has no k3s agent token; uninstall (sudo ${UNINSTALL_BIN}), then install again with a new ticket"
+	# The ticket kind decides the recovery, also in a run after an
+	# interruption.
+	case "${CFG[KIND]:-}" in
+	recovery)
+		if ((!RECOVERY)); then
+			log "This machine redeemed a recovery ticket: continuing as a recovery"
+			RECOVERY=1
+		fi
+		;;
+	install) ((!RECOVERY)) || die "this machine redeemed an install ticket; run the script without --recovery" ;;
+	"") ;;
+	*) die "install.env: ticket kind '${CFG[KIND]}' is not valid" ;;
+	esac
+	[[ -n "${CFG[CILIUM_VERSION]:-}" ]] || CFG[CILIUM_VERSION]="${CILIUM_DEFAULT}"
+	[[ "${CFG[CILIUM_VERSION]}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "install.env: Cilium version is not valid"
+	cilium_sha256 "${CFG[CILIUM_VERSION]}" >/dev/null ||
+		die "this script does not pin Cilium ${CFG[CILIUM_VERSION]}; run the install script version that the dashboard shows"
 	[[ "${CFG[CLUSTER_ID]:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$ ]] || die "install.env: cluster id is not valid"
 	[[ "${CFG[STATE_ENDPOINT]:-}" =~ ^https://[a-z0-9.-]+:[0-9]{1,5}/?$ ]] || die "install.env: datastore endpoint is not valid"
 	[[ -n "${CFG[CLUSTER_CIDR]:-}" ]] || CFG[CLUSTER_CIDR]="10.42.0.0/16"
@@ -318,6 +353,18 @@ read_install_env() {
 		[[ "${cidr}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "install.env: CIDR '${cidr}' is not an IPv4 CIDR"
 	done
 	[[ "${CFG[TLS_SANS]:-}" =~ ^[A-Za-z0-9.,:-]*$ ]] || die "install.env: TLS SANs are not valid"
+}
+
+cilium_sha256() {
+	local version="$1" pin v sum
+	for pin in "${CILIUM_PINS[@]}"; do
+		read -r v sum <<<"${pin}"
+		if [[ "${v}" == "${version}" ]]; then
+			printf '%s' "${sum}"
+			return 0
+		fi
+	done
+	return 1
 }
 
 k3s_sha256() {
@@ -339,6 +386,7 @@ write_k3s_config() {
 		echo "# Written by the kubehz install script ${AGENT_VERSION}. The datastore files are"
 		echo "# read through the symlink ${STATE_DIR}/current, which the renewal timer switches."
 		echo "token-file: ${STATE_DIR}/k3s-token"
+		echo "agent-token-file: ${STATE_DIR}/k3s-agent-token"
 		echo "datastore-endpoint: ${endpoint}"
 		echo "datastore-cafile: ${STATE_DIR}/current/server-ca.crt"
 		echo "datastore-certfile: ${STATE_DIR}/current/client.crt"
@@ -370,10 +418,13 @@ write_k3s_config() {
 }
 
 write_cilium_chart() {
-	log "Preparing Cilium ${CILIUM_VERSION}"
+	local version="${CFG[CILIUM_VERSION]}" sum
+	sum="$(cilium_sha256 "${version}")" ||
+		die "this script does not pin Cilium ${version}; run the install script version that the dashboard shows"
+	log "Preparing Cilium ${version}"
 	install -d -m 0700 "${K3S_CHARTS}" "${K3S_MANIFESTS}"
-	download "https://helm.cilium.io/cilium-${CILIUM_VERSION}.tgz" "${WORK}/cilium.tgz" "${CILIUM_CHART_SHA256}"
-	install -m 0644 "${WORK}/cilium.tgz" "${K3S_CHARTS}/cilium-${CILIUM_VERSION}.tgz"
+	download "https://helm.cilium.io/cilium-${version}.tgz" "${WORK}/cilium.tgz" "${sum}"
+	install -m 0644 "${WORK}/cilium.tgz" "${K3S_CHARTS}/cilium-${version}.tgz"
 	# The k3s Helm controller installs the chart from the server's own static
 	# file path. bootstrap: the chart runs before the cluster has a CNI.
 	cat >"${K3S_MANIFESTS}/kubehz-cilium.yaml" <<EOF
@@ -385,7 +436,7 @@ metadata:
   namespace: kube-system
 spec:
   bootstrap: true
-  chart: https://%{KUBERNETES_API}%/static/charts/cilium-${CILIUM_VERSION}.tgz
+  chart: https://%{KUBERNETES_API}%/static/charts/cilium-${version}.tgz
   targetNamespace: kube-system
   valuesContent: |-
     ipam:
@@ -398,9 +449,6 @@ spec:
     kubeProxyReplacement: false
 EOF
 	chmod 0600 "${K3S_MANIFESTS}/kubehz-cilium.yaml"
-	if [[ "${CFG[HAS_SSO_BINDINGS]:-0}" == "1" ]]; then
-		install -m 0600 "${STATE_DIR}/sso-rbac.yaml" "${K3S_MANIFESTS}/kubehz-sso-rbac.yaml"
-	fi
 }
 
 # download_k3s installs the pinned k3s binary and downloads the pinned k3s
@@ -429,7 +477,7 @@ install_k3s() {
 }
 
 # write_k3s_agent_config: an agent node joins the k3s server of its ticket
-# with the k3s token. It has no datastore settings.
+# with the k3s agent token. It has no datastore settings.
 write_k3s_agent_config() {
 	install -d -m 0755 "${K3S_CONFIG_DIR}"
 	{
@@ -515,13 +563,16 @@ install_agent() {
 	install -d -m 0700 "$(dirname "${AGENT_MANIFEST}")"
 	install -m 0600 "${WORK}/agent.yaml" "${AGENT_MANIFEST}"
 	kubectl_k3s create namespace kubehz-system --dry-run=client -o yaml | kubectl_k3s apply -f - >/dev/null
+	# The agent token that this install made (the api has only its sha256)
+	# goes into the cluster, and then off the disk. Another server of the
+	# cluster made it before when this install has none.
 	if [[ "${CFG[HAS_AGENT_TOKEN]:-0}" == "1" && -f "${STATE_DIR}/agent-token" ]]; then
 		kubectl_k3s -n kubehz-system create secret generic kubehz-agent \
 			--from-file=agent-token="${STATE_DIR}/agent-token" --dry-run=client -o yaml |
 			kubectl_k3s apply -f - >/dev/null
 		rm -f -- "${STATE_DIR}/agent-token"
 	elif ! kubectl_k3s -n kubehz-system get secret kubehz-agent >/dev/null 2>&1; then
-		log "No agent registration came with the ticket: the agent waits for Secret kubehz-system/kubehz-agent"
+		log "The cluster has no Secret kubehz-system/kubehz-agent: the in-cluster agent waits for it (the install of the first server makes it)"
 	fi
 	kubectl_k3s apply -f "${WORK}/agent.yaml" >/dev/null
 }

@@ -86,6 +86,7 @@ func RedeemMain(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	apiURL := fs.String("api-url", DefaultAPIURL, "kubehz api URL")
 	label := fs.String("label", defaultLabel(), "machine label in the dashboard (a DNS label)")
 	role := fs.String("role", RoleServer, "machine role, the role of the ticket: server or agent")
+	recovery := fs.Bool("recovery", false, "the ticket is a recovery ticket (server only): send no agent token")
 	timeout := fs.Duration("timeout", 2*time.Minute, "time limit of the redemption")
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
@@ -120,19 +121,23 @@ func RedeemMain(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	res, err := (&Redeemer{
-		Store:  Store{Dir: *dir},
-		API:    client,
-		APIURL: strings.TrimRight(*apiURL, "/"),
-		Label:  *label,
-		Role:   *role,
+		Store:    Store{Dir: *dir},
+		API:      client,
+		APIURL:   strings.TrimRight(*apiURL, "/"),
+		Label:    *label,
+		Role:     *role,
+		Recovery: *recovery,
 	}).Run(ctx, ticket)
 	if err != nil {
 		log.Error("redemption failed", "error", err.Error())
 		return ExitFail
 	}
-	if res.Role == RoleAgent {
+	switch {
+	case res.Role == RoleAgent:
 		_, _ = fmt.Fprintf(stdout, "redeemed: agent machine %s\n", res.MachineID)
-	} else {
+	case res.AgentToken:
+		_, _ = fmt.Fprintf(stdout, "redeemed: cluster %s, machine %s; this install made the cluster's kubehz agent token\n", res.ClusterID, res.MachineID)
+	default:
 		_, _ = fmt.Fprintf(stdout, "redeemed: cluster %s, machine %s\n", res.ClusterID, res.MachineID)
 	}
 	return ExitOK

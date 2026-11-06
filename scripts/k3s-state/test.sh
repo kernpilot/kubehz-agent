@@ -264,6 +264,7 @@ for f in kubehz-agent-linux-amd64 kubehz-agent-linux-arm64 install.yaml install-
 done
 bash "${here}/render.sh" v9.8.7 "${assets}" >"${tmp}/v1-rendered.sh"
 
+test_cilium_sum="$(printf 'f%.0s' {1..64})"
 istubs="${tmp}/istubs"
 fakes="${tmp}/fakes"
 ilog="${tmp}/install.log"
@@ -304,11 +305,12 @@ cat >"${fakes}/kubehz-agent" <<EOF
 printf 'kubehz-agent %s\n' "\$*" >>"${ilog}"
 case "\$1" in
 state-redeem)
-	dir="" role=""
+	dir="" role="" kind=install
 	while ((\$# > 0)); do
 		case "\$1" in
 		--dir) dir="\$2"; shift ;;
 		--role) role="\$2"; shift ;;
+		--recovery) kind=recovery ;;
 		esac
 		shift
 	done
@@ -324,7 +326,14 @@ state-redeem)
 		echo key >"\${dir}/gen-1/client.key"
 		echo '{}' >"\${dir}/renew.json"
 		ln -s gen-1 "\${dir}/current"
-		printf 'ROLE=server\nCLUSTER_ID=c1\nMACHINE_ID=m-1\nSTATE_ENDPOINT=https://abc.state.kubehz.cloud:2379\nK3S_VERSION=v1.37.2+k3s1\nCLUSTER_CIDR=10.42.0.0/16\nSERVICE_CIDR=10.43.0.0/16\nTLS_SANS=\nHAS_AUTHN_CONFIG=0\nHAS_SSO_BINDINGS=0\nHAS_AGENT_TOKEN=0\n' >"\${dir}/install.env"
+		printf 'K10agenttoken\n' >"\${dir}/k3s-agent-token"
+		has_token=0
+		if [[ "\${kind}" == "install" ]]; then
+			printf 'khz_agt_%064d' 0 >"\${dir}/agent-token"
+			has_token=1
+		fi
+		printf 'ROLE=server\nKIND=%s\nCLUSTER_ID=c1\nMACHINE_ID=m-1\nSTATE_ENDPOINT=https://abc.state.kubehz.cloud:2379\nK3S_VERSION=v1.37.2+k3s1\nCILIUM_VERSION=%s\nCLUSTER_CIDR=10.42.0.0/16\nSERVICE_CIDR=10.43.0.0/16\nTLS_SANS=\nHAS_AUTHN_CONFIG=0\nHAS_AGENT_TOKEN=%s\n' \
+			"\${kind}" "\$(cat "${tmp}/cilium-version")" "\${has_token}" >"\${dir}/install.env"
 	fi
 	;;
 state-ack) exit "\$(cat "${tmp}/ack-rc")" ;;
@@ -351,13 +360,17 @@ install_rendered() {
 	: >"${ilog}"
 	printf '0\n' >"${tmp}/ack-rc"
 	printf '0\n' >"${tmp}/agent-active-rc"
+	printf '1.20.4\n' >"${tmp}/cilium-version"
 	mkdir -p "${tmp}/worktmp" "${iroot}/usr/local/bin" "${iroot}/etc/systemd/system"
 	# The last line calls main. The embedded uninstall script has its own
 	# call of main, which must stay.
 	[[ "$(tail -n1 "${tmp}/v1-rendered.sh")" == 'main "$@"' ]] || fail "the rendered script does not end with the call of main"
+	# A second Cilium pin (test only) tells the version of install.env from
+	# the default.
 	sed -E \
 		-e "s|^(readonly [A-Z0-9_]+=\")/|\\1${iroot}/|" \
 		-e 's|\[\[ "\$\{EUID\}" -eq 0 \]\]|true|' \
+		-e "s|^readonly -a CILIUM_PINS=\\($|&\\n\\t\"1.99.1 ${test_cilium_sum}\"|" \
 		-e '$d' \
 		"${tmp}/v1-rendered.sh" >"${icopy}"
 	# Each edit must hit (a missed anchor would test the real paths).
@@ -366,6 +379,7 @@ install_rendered() {
 	[[ "${moved}" == 8 ]] || fail "the test copy moved ${moved} paths, want 8"
 	# shellcheck disable=SC2016 # a literal string
 	grep -qF '"${EUID}" -eq 0' "${icopy}" && fail "the root check is still in the test copy"
+	grep -qx "	\"1.99.1 ${test_cilium_sum}\"" "${icopy}" || fail "the test copy has no test Cilium pin"
 	mains="$(grep -cx 'main "$@"' "${tmp}/v1-rendered.sh")" || true
 	[[ "$(grep -cx 'main "$@"' "${icopy}")" == "$((mains - 1))" ]] || fail "the test copy did not lose exactly the last call of main"
 	# The k3s installer: writes the unit and the uninstaller of the role, as
@@ -397,7 +411,7 @@ run_install() {
 		FAKES="${fakes}" ILOG="${ilog}" bash -c '
 			source "$0"
 			download() {
-				printf "download %s\n" "$1" >>"${ILOG}"
+				printf "download %s %s\n" "$1" "$3" >>"${ILOG}"
 				case "$1" in
 				*/kubehz-agent-linux-*) cp -- "${FAKES}/kubehz-agent" "$2" ;;
 				*/k3s-io/k3s/*/install.sh) cp -- "${FAKES}/k3s-install.sh" "$2" ;;
@@ -458,6 +472,7 @@ if [[ -f "${cfg}" ]]; then
 	grep -qx 'server: "https://k3s.example.com:6443"' "${cfg}" || fail "config.yaml does not name the server: $(cat "${cfg}")"
 	grep -qx "token-file: ${iroot}/etc/kubehz/state/k3s-token" "${cfg}" || fail "config.yaml does not name the token file"
 	grep -q 'datastore' "${cfg}" && fail "an agent's config.yaml has datastore settings"
+	grep -q 'agent-token-file' "${cfg}" && fail "an agent's config.yaml has an agent-token-file"
 	[[ "$(stat -c %a "${cfg}")" == 600 ]] || fail "config.yaml mode $(stat -c %a "${cfg}")"
 else
 	fail "no ${cfg}"
@@ -497,7 +512,7 @@ current="a server: the certificate is acknowledged after k3s runs, before the ag
 install_rendered
 run_install --label server-1
 [[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
-grep -q '^kubehz-agent state-redeem .* --role server$' "${ilog}" || fail "the ticket was not redeemed with --role server"
+grep -q '^kubehz-agent state-redeem .* --role server$' "${ilog}" || fail "the ticket was not redeemed with --role server (and without --recovery)"
 start="$(iline '^systemctl restart --no-block k3s$')"
 ready="$(iline '^k3s kubectl .* get --raw /readyz$')"
 ack="$(iline "^kubehz-agent state-ack --dir ${iroot}/etc/kubehz/state --kubeconfig ${iroot}/etc/rancher/k3s/k3s.yaml$")"
@@ -509,6 +524,17 @@ timer="$(iline '^systemctl enable --now kubehz-state-renew.timer$')"
 grep -qx 'k3s-install INSTALL_K3S_EXEC=server SKIP_START=true SKIP_DOWNLOAD=true' "${ilog}" || fail "k3s was not installed as a server"
 [[ -f "${iroot}/etc/systemd/system/kubehz-state-renew.timer" ]] || fail "no renewal timer"
 grep -q '^datastore-certfile: .*/current/client.crt$' "${iroot}/etc/rancher/k3s/config.yaml" || fail "config.yaml has no datastore certificate"
+# Two k3s tokens: the server token, and the agent token for agent nodes.
+grep -qx "token-file: ${iroot}/etc/kubehz/state/k3s-token" "${iroot}/etc/rancher/k3s/config.yaml" || fail "config.yaml has no server token file"
+grep -qx "agent-token-file: ${iroot}/etc/kubehz/state/k3s-agent-token" "${iroot}/etc/rancher/k3s/config.yaml" ||
+	fail "config.yaml has no agent-token-file: $(cat "${iroot}/etc/rancher/k3s/config.yaml")"
+# The kubehz agent token that the redemption made goes into the cluster
+# before the in-cluster agent, then off the disk.
+secret="$(iline "^k3s kubectl .* -n kubehz-system create secret generic kubehz-agent --from-file=agent-token=${iroot}/etc/kubehz/state/agent-token --dry-run=client -o yaml$")"
+((secret > ack && secret < apply)) || fail "the agent token Secret (line ${secret}) is not between the acknowledgement (${ack}) and the agent (${apply})"
+[[ -e "${iroot}/etc/kubehz/state/agent-token" ]] && fail "the agent token stayed on the disk"
+grep -qx 'download https://helm.cilium.io/cilium-1.20.4.tgz 505abff8385811df1a949776fc42e9f10697989a332acc86d6e8933efcb855ed' "${ilog}" ||
+	fail "Cilium is not the version of install.env with its pin: $(grep cilium "${ilog}")"
 
 current="a server: the uninstall removes everything the install wrote"
 run_uninstall
@@ -529,6 +555,67 @@ run_install --label server-1
 [[ "${rc}" == 0 ]] || fail "the next run: exit ${rc}: ${out}"
 grep -q 'state-redeem' "${ilog}" && fail "the next run redeemed the ticket again"
 grep -q '^kubehz-agent state-ack ' "${ilog}" || fail "the next run did not acknowledge"
+run_uninstall
+assert_clean
+
+current="a server recovery: no agent token, the Node of the lost server goes"
+install_rendered
+run_install --label server-1 --recovery
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+grep -q '^kubehz-agent state-redeem .* --role server --recovery$' "${ilog}" || fail "the ticket was not redeemed with --recovery"
+grep -qx "^k3s kubectl .* delete node ${self_node} --ignore-not-found --wait=false" "${ilog}" || fail "the Node of the lost server was not removed"
+grep -q 'create secret generic kubehz-agent' "${ilog}" && fail "a recovery replaced the agent token Secret"
+grep -qx 'KIND=recovery' "${iroot}/etc/kubehz/state/install.env" || fail "install.env has no KIND=recovery"
+run_uninstall
+assert_clean
+
+current="an interrupted recovery continues as a recovery, also without --recovery"
+install_rendered
+printf '1\n' >"${tmp}/ack-rc"
+run_install --label server-1 --recovery
+[[ "${rc}" != 0 ]] || fail "exit 0 after a failed acknowledgement"
+printf '0\n' >"${tmp}/ack-rc"
+: >"${ilog}"
+run_install --label server-1
+[[ "${rc}" == 0 ]] || fail "the next run: exit ${rc}: ${out}"
+grep -q 'state-redeem' "${ilog}" && fail "the next run redeemed the ticket again"
+grep -q 'continuing as a recovery' <<<"${out}" || fail "the next run did not continue as a recovery: ${out}"
+grep -q " delete node ${self_node} " "${ilog}" || fail "the next run did not remove the Node of the lost server"
+run_uninstall
+assert_clean
+
+current="an install ticket: a later run with --recovery stops"
+install_rendered
+printf '1\n' >"${tmp}/ack-rc"
+run_install --label server-1
+[[ "${rc}" != 0 ]] || fail "exit 0 after a failed acknowledgement"
+: >"${ilog}"
+run_install --label server-1 --recovery
+[[ "${rc}" != 0 ]] || fail "a run with --recovery after an install ticket passed"
+grep -q 'redeemed an install ticket; run the script without --recovery' <<<"${out}" || fail "the error does not say what to do: ${out}"
+grep -q ' delete node ' "${ilog}" && fail "a run after an install ticket removed a Node"
+run_uninstall
+assert_clean
+
+current="Cilium is the version of the install configuration"
+install_rendered
+printf '1.99.1\n' >"${tmp}/cilium-version"
+run_install --label server-1
+[[ "${rc}" == 0 ]] || fail "exit ${rc}: ${out}"
+grep -qx "download https://helm.cilium.io/cilium-1.99.1.tgz ${test_cilium_sum}" "${ilog}" ||
+	fail "Cilium is not the version of install.env: $(grep cilium "${ilog}")"
+grep -q 'chart: https://%{KUBERNETES_API}%/static/charts/cilium-1.99.1.tgz' "${iroot}/var/lib/rancher/k3s/server/manifests/kubehz-cilium.yaml" ||
+	fail "the HelmChart does not name the chart of install.env"
+run_uninstall
+assert_clean
+
+current="a Cilium version without a pin stops before k3s"
+install_rendered
+printf '1.99.0\n' >"${tmp}/cilium-version"
+run_install --label server-1
+[[ "${rc}" != 0 ]] || fail "an unpinned Cilium version passed"
+grep -q 'does not pin Cilium 1.99.0' <<<"${out}" || fail "the error does not name the version: ${out}"
+grep -q 'k3s-install' "${ilog}" && fail "k3s was installed before the Cilium check"
 run_uninstall
 assert_clean
 
