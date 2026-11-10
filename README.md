@@ -466,12 +466,12 @@ How they work, truthfully:
    404 page from a proxy or a router is not one. Any other failed read
    changes nothing, so a standby that cannot read the Lease stays silent.
    Because the holder is then the only reporter, **a holder whose
-   heartbeats fail for 5 minutes steps down**: it stops acting, releases the lease, and does not contend
-   again until one of its heartbeats goes through, so a replica that can
-   reach the platform takes over. On shutdown the process waits for the
-   drain and the release before it exits (the default 30 s grace period
-   covers both). Upgrading from an agent that predates this: re-apply
-   `deploy/managed/`.
+   heartbeats fail for 5 minutes steps down**: it stops acting, releases
+   the lease, and does not contend again until one of its heartbeats goes
+   through, so a replica that can reach the platform takes over. On
+   shutdown the process waits for the drain and the release before it exits
+   (the default 30 s grace period covers both). Upgrading from an agent
+   that predates this: re-apply `deploy/managed/`.
 8. **Progress is reported, in memory only.** Every outcome
    (`pending → in-progress → done/failed`, with the acted `revision`) rides
    the heartbeat's `actions[]`; stale heal reports for self-recovered nodes
