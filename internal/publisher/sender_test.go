@@ -343,3 +343,148 @@ func TestSender_AuthErrorUnchangedTokenStillBacksOff(t *testing.T) {
 		t.Errorf("waits = %v: the second wait must be longer than the first (exponential)", waits)
 	}
 }
+
+// The gate is asked before EVERY send, a retry too. A beat that failed while
+// the gate was open is dropped once the gate closes: it is not retried, and
+// it does not come back when the gate opens again. (A replica that queued a
+// beat before it saw another replica hold the acting lease must not deliver
+// it late: the beat carries no actions and would erase the holder's.)
+func TestSender_GateDropsAQueuedRetry(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	var mu sync.Mutex
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p state.Payload
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		mu.Lock()
+		seen = append(seen, p.Timestamp)
+		mu.Unlock()
+		if fail.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	sent := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), seen...)
+	}
+
+	var open atomic.Bool
+	open.Store(true)
+	var asked atomic.Int32
+	timer := make(chan time.Time, 1)
+	backingOff := make(chan struct{}, 4) // the sender waits for its retry
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_000_000, 0).UnixNano())
+
+	pub := New(srv.URL, "d", testToken, "0.1.0", srv.Client())
+	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
+	s.afterFunc = func(time.Duration) <-chan time.Time {
+		backingOff <- struct{}{}
+		return timer
+	}
+	s.now = func() time.Time { return time.Unix(0, clock.Load()) }
+	s.SetGate(func() bool {
+		asked.Add(1)
+		return open.Load()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); s.Run(ctx) }()
+	defer func() { cancel(); wg.Wait() }()
+
+	stale := samplePayload()
+	stale.Timestamp = "stale"
+	s.Enqueue(stale)
+	<-backingOff
+	if got := sent(); len(got) != 1 || asked.Load() != 1 {
+		t.Fatalf("sends = %v, gate asked %d times, want one send and one question", got, asked.Load())
+	}
+	clock.Add(int64(10 * time.Second))
+	if got := s.FailingFor(); got != 10*time.Second {
+		t.Errorf("FailingFor = %s after one failed send 10s ago, want 10s", got)
+	}
+
+	// The gate closes while the failed beat waits for its retry.
+	open.Store(false)
+	timer <- time.Now()
+	waitFor(t, func() bool { return asked.Load() == 2 }, 2*time.Second)
+	time.Sleep(100 * time.Millisecond)
+	if got := sent(); len(got) != 1 {
+		t.Fatalf("sends = %v: the retry went out after the gate closed", got)
+	}
+	if got := s.FailingFor(); got != 10*time.Second {
+		t.Errorf("FailingFor = %s after a dropped beat, want 10s: a beat held back is neither a success nor a failure", got)
+	}
+
+	// The gate opens again: the dropped beat stays dropped; the next one goes.
+	open.Store(true)
+	fail.Store(false)
+	time.Sleep(100 * time.Millisecond)
+	if got := sent(); len(got) != 1 {
+		t.Fatalf("sends = %v: the dropped beat came back when the gate opened", got)
+	}
+	fresh := samplePayload()
+	fresh.Timestamp = "fresh"
+	s.Enqueue(fresh)
+	waitFor(t, func() bool { return len(sent()) == 2 }, 2*time.Second)
+	if got := sent(); got[1] != "fresh" {
+		t.Errorf("sends = %v, want the fresh beat second", got)
+	}
+	waitFor(t, func() bool { return s.FailingFor() == 0 }, 2*time.Second)
+}
+
+// FailingFor measures the whole run of failures: from the FIRST failed send
+// after the last success, not from the latest one, and back to zero after a
+// success.
+func TestSender_FailingForSpansTheRunOfFailures(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	timer := make(chan time.Time, 1)
+	backingOff := make(chan struct{}, 4)
+	var clock atomic.Int64
+	clock.Store(time.Unix(1_000_000, 0).UnixNano())
+	pub := New(srv.URL, "d", testToken, "0.1.0", srv.Client())
+	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
+	s.afterFunc = func(time.Duration) <-chan time.Time {
+		backingOff <- struct{}{}
+		return timer
+	}
+	s.now = func() time.Time { return time.Unix(0, clock.Load()) }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); s.Run(ctx) }()
+	defer func() { cancel(); wg.Wait() }()
+
+	if got := s.FailingFor(); got != 0 {
+		t.Fatalf("FailingFor = %s before any send, want 0", got)
+	}
+	s.Enqueue(samplePayload())
+	<-backingOff // the first failure is recorded
+	clock.Add(int64(10 * time.Second))
+	timer <- time.Now()
+	<-backingOff // the second failure is recorded
+	clock.Add(int64(10 * time.Second))
+	if got := s.FailingFor(); got != 20*time.Second {
+		t.Errorf("FailingFor = %s after failures 20s and 10s ago, want 20s (from the first failure)", got)
+	}
+	timer <- time.Now()
+	waitFor(t, func() bool { return calls.Load() == 3 }, 2*time.Second)
+	waitFor(t, func() bool { return s.FailingFor() == 0 }, 2*time.Second)
+}
