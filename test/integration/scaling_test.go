@@ -28,7 +28,10 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,8 +89,20 @@ func TestScalingLoopAgainstRealAPIServer(t *testing.T) {
 	create(ctx, t, mds, machineDeployment("pool-big", 1))
 	create(ctx, t, mds, machineDeployment("pool-legacy", 4))
 
+	// The executor gets its OWN client, wrapped in a counter of the PATCH
+	// requests it sends. A converged pass must SEND nothing: the apiserver may
+	// skip persisting an unchanged object, so resourceVersion alone cannot
+	// prove that no write was sent.
+	patches := &patchCounter{}
+	ecfg := rest.CopyConfig(cfg)
+	ecfg.Wrap(patches.wrap)
+	execDyn, err := dynamic.NewForConfig(ecfg)
+	if err != nil {
+		t.Fatalf("executor dynamic client: %v", err)
+	}
+
 	store := actions.New(nil)
-	exec := executor.New(dyn, store, executor.Options{Namespace: ns, MaxReplicas: maxReplicas})
+	exec := executor.New(execDyn, store, executor.Options{Namespace: ns, MaxReplicas: maxReplicas})
 
 	doc := &desired.Doc{
 		Revision:  11,
@@ -105,6 +120,10 @@ func TestScalingLoopAgainstRealAPIServer(t *testing.T) {
 	// ── The pool the platform may scale converged, on the apiserver.
 	if got := replicas(ctx, t, mds, "pool-a"); got != 5 {
 		t.Errorf("pool-a replicas = %d, want 5", got)
+	}
+	// ── One PATCH, to that pool only: every refusal sent nothing.
+	if total, byName := patches.snapshot(); total != 1 || byName["pool-a"] != 1 {
+		t.Errorf("first pass sent %d PATCH requests %v, want exactly one, to pool-a", total, byName)
 	}
 	if a := action(t, store, state.ActionScale, "pool-a"); a.Status != state.ActionDone {
 		t.Errorf("pool-a action = %+v, want done", a)
@@ -155,10 +174,15 @@ func TestScalingLoopAgainstRealAPIServer(t *testing.T) {
 	}
 
 	// ── IDEMPOTENCE, measured: a converged pool is re-reconciled with no
-	//    write at all. Only a real apiserver can prove this — resourceVersion
-	//    changes on every write, and on nothing else.
+	//    write at all. The counter proves that no PATCH was SENT; the
+	//    resourceVersion proves that the stored object did not change.
 	before := get(ctx, t, mds, "pool-a").GetResourceVersion()
+	sentBefore, _ := patches.snapshot()
 	exec.Reconcile(ctx, doc)
+	if sent, byName := patches.snapshot(); sent != sentBefore {
+		t.Errorf("the pass on a converged pool sent %d PATCH request(s) %v, want none",
+			sent-sentBefore, byName)
+	}
 	if after := get(ctx, t, mds, "pool-a").GetResourceVersion(); after != before {
 		t.Errorf("resourceVersion moved from %s to %s on a converged pool — the pass wrote when it had nothing to do",
 			before, after)
@@ -167,14 +191,56 @@ func TestScalingLoopAgainstRealAPIServer(t *testing.T) {
 		t.Errorf("pool-a replicas = %d after the second pass, want a stable 5", got)
 	}
 
-	// ── A new intent still lands (the loop is live, not wedged).
+	// ── A new intent still lands (the loop is live, not wedged), and the
+	//    counter sees it, so a zero above is not a dead counter.
 	doc.Revision = 12
 	doc.WorkerPools[0].DesiredReplicas = 3
+	sentBefore, _ = patches.snapshot()
 	exec.Reconcile(ctx, doc)
 	if got := replicas(ctx, t, mds, "pool-a"); got != 3 {
 		t.Errorf("pool-a replicas = %d after scaling down, want 3", got)
 	}
+	if sent, _ := patches.snapshot(); sent != sentBefore+1 {
+		t.Errorf("the new intent sent %d PATCH request(s), want 1", sent-sentBefore)
+	}
 }
+
+// patchCounter counts the PATCH requests a client sends, per object name
+// (the last path segment).
+type patchCounter struct {
+	mu     sync.Mutex
+	total  int
+	byName map[string]int
+}
+
+func (p *patchCounter) wrap(next http.RoundTripper) http.RoundTripper {
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPatch {
+			p.mu.Lock()
+			p.total++
+			if p.byName == nil {
+				p.byName = map[string]int{}
+			}
+			p.byName[path.Base(r.URL.Path)]++
+			p.mu.Unlock()
+		}
+		return next.RoundTrip(r)
+	})
+}
+
+func (p *patchCounter) snapshot() (int, map[string]int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	byName := make(map[string]int, len(p.byName))
+	for k, v := range p.byName {
+		byName[k] = v
+	}
+	return p.total, byName
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // restConfig loads the ambient kubeconfig. No cluster is a FAILURE, not a
 // skip: this test only builds under the integration tag, so reaching it means
