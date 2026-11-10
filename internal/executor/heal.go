@@ -21,15 +21,18 @@
 //     cluster-wide; ANY already-deleting machine (ours, a scale-down, a P6
 //     roll replacement) counts against the budget — conservative on purpose.
 //   - PER-POOL COOLDOWN: cooldownSeconds between remediations in the same
-//     pool, with the executor's construction time as a baseline — an agent
+//     pool, FLOORED at minHealCooldown agent-side (a document cannot lower
+//     it), with the executor's construction time as a baseline — an agent
 //     RESTART starts a fresh cooldown, so a crash-looping agent can never
 //     become a machine-delete loop.
-//   - LOCAL SANITY BOUNDS, owed to no server number: one pass remediates at
-//     most a THIRD of a pool (floored at one machine), and a pool — or the
-//     whole worker set — whose nodes ALL went unhealthy inside one short
-//     window is refused outright. Simultaneous failure is an outage or a
-//     partition, and a partitioned node is indistinguishable from a dead one
-//     from here. See localBoundsFor.
+//   - LOCAL SANITY BOUNDS, owed to no server number: at most a THIRD of a
+//     pool (floored at one machine) is out of service at once, counting the
+//     disruptions of earlier passes that have not recovered yet; a pool — or
+//     the whole worker set — whose nodes ALL went unhealthy inside one short
+//     window is refused outright; and a pool with a not-Ready node whose
+//     failure time is unknown is refused too. Simultaneous failure is an
+//     outage or a partition, and a partitioned node is indistinguishable
+//     from a dead one from here. See localBoundsFor.
 //   - AUTOSCALER POOLS are skipped (refused loudly): the cluster-autoscaler
 //     owns their machine lifecycle; fighting it is worse than a NotReady node.
 //   - UNOWNED machines are refused: deleting a Machine no MachineSet/
@@ -80,17 +83,27 @@ import (
 // would fight the kubelet's own grace periods.
 const minDetectionWindow = 60 * time.Second
 
+// minHealCooldown is the agent-side FLOOR for cooldownSeconds. The cooldown
+// is a server number, and a document that sends 0 would let healing delete
+// machines of one pool back to back, pass after pass. With the floor a pool
+// loses at most one machine to healing per five minutes, whatever the
+// document says.
+const minHealCooldown = 5 * time.Minute
+
 // LOCAL SANITY BOUNDS. maxUnhealthy, the cooldown and the in-flight budget are
 // all SERVER-owned numbers, and a wrong-but-plausible document (maxUnhealthy
 // 50 on a 12-machine cluster) satisfies every one of them while real servers
-// are torn down one cooldown apart. The two bounds below need no server input:
+// are torn down one cooldown apart. The bounds below need no server input:
 // they are computed from what the agent sees in its own cluster.
 const (
-	// healFractionNumerator/healFractionDenominator cap what ONE pass may
-	// remediate as a FRACTION of the pool — rounded down, floored at one so a
-	// small pool still heals. The excess waits for the next pass and is
-	// reported, so the blast radius of a single pass never scales with a
-	// number the platform sent.
+	// healFractionNumerator/healFractionDenominator cap how much of a pool
+	// may be OUT OF SERVICE at once while healing acts — rounded down,
+	// floored at one so a small pool still heals. Out of service counts every
+	// machine slot of the pool without a Ready node except the current
+	// candidates: machines being deleted, replacements that have not joined
+	// or are not Ready yet, and replicas that do not exist yet. A deletion
+	// therefore keeps counting until its replacement serves, ACROSS passes,
+	// and the blast radius never scales with a number the platform sent.
 	healFractionNumerator   = 1
 	healFractionDenominator = 3
 
@@ -115,29 +128,51 @@ const (
 	minSimultaneousNodes = 2
 )
 
-// poolCensus is the LOCAL evidence one pass has about a pool: how many
-// machines it owns, how many of them joined a node, when each unhealthy node
-// last changed its Ready condition, and how many candidates it produced.
+// poolCensus is the LOCAL evidence one pass has about a pool: its intended
+// size, how many of its machines serve (back a Ready node), how many of them
+// joined a node, when each unhealthy node last changed its Ready condition,
+// which not-Ready nodes report no such time, and how many candidates it
+// produced.
 type poolCensus struct {
-	machines   int
+	md         *unstructured.Unstructured
+	machines   int // not deleting
+	all        int // including deleting
+	serving    int // not deleting, backing a Ready node
 	nodes      int
 	unhealthy  []time.Time
+	unknown    []string // not Ready, no Ready transition time
 	candidates int
+}
+
+// size is the pool's intended size: the MachineDeployment's spec.replicas,
+// never below the machines that exist (a scale-down in progress). Without a
+// readable spec.replicas every machine counts, deleting ones included — the
+// conservative direction.
+func (c *poolCensus) size() int {
+	if c.md != nil {
+		if r, ok := currentReplicas(c.md); ok {
+			return max(int(r), c.machines)
+		}
+	}
+	return c.all
 }
 
 // localBounds is what the cluster's own state says one pass may do:
 // refuseEverything (an outage signature across the whole worker set),
-// refusePool (the same signature inside one pool) and perPool (the fraction
-// cap per pool).
+// refusePool (the same signature, or missing evidence, inside one pool),
+// maxOut (the fraction cap per pool), size (the pool's intended size) and
+// inFlight (the pool's disruptions that have not recovered yet).
 type localBounds struct {
 	refuseEverything string
 	refusePool       map[string]string
-	perPool          map[string]int
+	maxOut           map[string]int
+	size             map[string]int
+	inFlight         map[string]int
 }
 
-// capFor is how many machines of one pool this pass may remediate.
+// capFor is how many machines of one pool may be out of service at once.
 func (b localBounds) capFor(pool string) int {
-	if n, ok := b.perPool[pool]; ok {
+	if n, ok := b.maxOut[pool]; ok {
 		return n
 	}
 	return 1
@@ -160,7 +195,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 	now := e.now()
 	unhealthyAfter := flooredWindow(pol.UnhealthyAfterSeconds)
 	startupTimeout := flooredWindow(pol.NodeStartupTimeoutSeconds)
-	cooldown := time.Duration(pol.CooldownSeconds) * time.Second
+	cooldown := flooredCooldown(pol.CooldownSeconds)
 
 	lctx, cancel := context.WithTimeout(ctx, callTimeout)
 	mds, err := machines.ListMachineDeployments(lctx, e.dyn, e.namespace)
@@ -285,7 +320,8 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 
 	// ── LOCAL SANITY BOUNDS (independent of the server's numbers).
 	bounds := e.localBoundsFor(cands, machineList, nodes, byNodeName, resolver)
-	// remediated counts THIS pass's deletions per pool, against the fraction cap.
+	// remediated counts THIS pass's deletions per pool. They join the pool's
+	// disruptions in flight against the fraction cap.
 	remediated := make(map[string]int, len(cands))
 
 	budget := pol.MaxUnhealthy - inFlight
@@ -317,10 +353,11 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			wait := (cooldown - now.Sub(e.lastHealTime(c.pool))).Truncate(time.Second)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("cooldown: next remediation in pool %s allowed in %s", c.pool, wait))
-		case remediated[c.pool] >= bounds.capFor(c.pool):
+		case bounds.inFlight[c.pool]+remediated[c.pool] >= bounds.capFor(c.pool):
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
-				fmt.Sprintf("waiting: pool %s already had %d remediation(s) this pass — one pass remediates at most %d/%d of a pool",
-					c.pool, remediated[c.pool], healFractionNumerator, healFractionDenominator))
+				fmt.Sprintf("waiting: pool %s already has %d of its %d machines out of service (deleting, being replaced or not Ready) — healing keeps at most %d/%d of a pool (%d) out at once",
+					c.pool, bounds.inFlight[c.pool]+remediated[c.pool], bounds.size[c.pool],
+					healFractionNumerator, healFractionDenominator, bounds.capFor(c.pool)))
 		default:
 			if !e.remediate(ctx, doc.Revision, c, now) {
 				halted = true // §3 halt-on-failure: queue the rest, retry next poll
@@ -334,7 +371,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 }
 
 // localBoundsFor reads the cluster's OWN evidence and returns what this pass
-// may do. Two rules, both computed locally, both refusal-biased:
+// may do. Three rules, all computed locally, all refusal-biased:
 //
 //  1. SIMULTANEOUS FAILURE → refuse. Every node of a pool (or of the whole
 //     worker set) unhealthy, with the Ready transitions inside
@@ -342,9 +379,18 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 //     Deleting those machines would destroy healthy capacity to "fix" a
 //     reachability problem. Needs at least minSimultaneousNodes nodes — one
 //     node has nothing to be simultaneous with.
-//  2. FRACTION → cap. One pass remediates at most healFraction of a pool
-//     (floored at one machine); the rest waits and is reported. maxUnhealthy
-//     cannot express this: it is one absolute number for clusters of any size.
+//  2. MISSING EVIDENCE → refuse. A not-Ready node without a Ready transition
+//     time could have failed at the same moment as all the others, so it
+//     never weakens rule 1: inside its pool it refuses remediation outright,
+//     and across the worker set it counts as failed inside the window.
+//  3. FRACTION → cap. At most healFraction of a pool (floored at one machine)
+//     is out of service at once, and that INCLUDES the disruptions of earlier
+//     passes that have not recovered: a machine being deleted, a replacement
+//     not yet Ready, a replica not yet created. Out of service is the pool's
+//     intended size minus its serving machines; the current candidates are
+//     taken off, because deleting an already-dead machine does not change
+//     what the pool serves until it is replaced. maxUnhealthy cannot express
+//     this: it is one absolute number for clusters of any size.
 func (e *Executor) localBoundsFor(
 	cands []healCandidate,
 	machineList []unstructured.Unstructured,
@@ -364,15 +410,20 @@ func (e *Executor) localBoundsFor(
 
 	for i := range machineList {
 		m := &machineList[i]
-		if machines.Deleting(m) {
+		pool, md := resolver.PoolFor(m)
+		if pool == "" {
 			continue
 		}
-		if pool, _ := resolver.PoolFor(m); pool != "" {
-			entry(pool).machines++
+		c := entry(pool)
+		c.md = md
+		c.all++
+		if !machines.Deleting(m) {
+			c.machines++
 		}
 	}
 
 	clusterNodes := 0
+	clusterUnknown := 0
 	var clusterUnhealthy []time.Time
 	for _, node := range nodes {
 		if node == nil || isControlPlaneNode(node) {
@@ -390,11 +441,16 @@ func (e *Executor) localBoundsFor(
 		c.nodes++
 		clusterNodes++
 		status, since := nodeReadyCondition(node)
-		if status == corev1.ConditionTrue || since.IsZero() {
-			continue
+		switch {
+		case status == corev1.ConditionTrue:
+			c.serving++
+		case since.IsZero():
+			c.unknown = append(c.unknown, node.Name)
+			clusterUnknown++
+		default:
+			c.unhealthy = append(c.unhealthy, since)
+			clusterUnhealthy = append(clusterUnhealthy, since)
 		}
-		c.unhealthy = append(c.unhealthy, since)
-		clusterUnhealthy = append(clusterUnhealthy, since)
 	}
 
 	for _, c := range cands {
@@ -405,13 +461,21 @@ func (e *Executor) localBoundsFor(
 
 	bounds := localBounds{
 		refusePool: make(map[string]string, len(census)),
-		perPool:    make(map[string]int, len(census)),
+		maxOut:     make(map[string]int, len(census)),
+		size:       make(map[string]int, len(census)),
+		inFlight:   make(map[string]int, len(census)),
 	}
 	for pool, c := range census {
-		bounds.perPool[pool] = maxPerPass(c.machines)
+		size := c.size()
+		bounds.size[pool] = size
+		bounds.maxOut[pool] = maxOutOfService(size)
+		bounds.inFlight[pool] = max(0, size-c.serving-c.candidates)
 	}
 
-	if clusterNodes >= minSimultaneousNodes && len(clusterUnhealthy) == clusterNodes && withinWindow(clusterUnhealthy) {
+	// An unknown failure time could be the same time as every other one.
+	if clusterNodes >= minSimultaneousNodes &&
+		len(clusterUnhealthy)+clusterUnknown == clusterNodes &&
+		(len(clusterUnhealthy) == 0 || withinWindow(clusterUnhealthy)) {
 		bounds.refuseEverything = fmt.Sprintf(
 			"refusing to heal: all %d worker nodes went unhealthy within %s — an outage or a partition, not node hardware",
 			clusterNodes, simultaneousFailureWindow)
@@ -425,6 +489,15 @@ func (e *Executor) localBoundsFor(
 		if c.candidates == 0 {
 			continue
 		}
+		if len(c.unknown) > 0 {
+			sort.Strings(c.unknown)
+			bounds.refusePool[pool] = fmt.Sprintf(
+				"refusing to heal: node %s of pool %s is not Ready and reports no Ready transition time — without it the agent cannot rule out a simultaneous failure",
+				c.unknown[0], pool)
+			e.log.Warn("heal: a not-Ready node reports no Ready transition time; refusing its pool's remediation",
+				"pool", pool, "node", c.unknown[0])
+			continue
+		}
 		if c.nodes >= minSimultaneousNodes && len(c.unhealthy) == c.nodes && withinWindow(c.unhealthy) {
 			bounds.refusePool[pool] = fmt.Sprintf(
 				"refusing to heal: all %d nodes of pool %s went unhealthy within %s — an outage or a partition, not node hardware",
@@ -436,10 +509,11 @@ func (e *Executor) localBoundsFor(
 	return bounds
 }
 
-// maxPerPass is how many machines of a pool of this size one pass may
-// remediate: the configured fraction, rounded down, floored at one.
-func maxPerPass(poolMachines int) int {
-	n := poolMachines * healFractionNumerator / healFractionDenominator
+// maxOutOfService is how many machines of a pool of this size may be out of
+// service at once while healing acts: the configured fraction, rounded down,
+// floored at one.
+func maxOutOfService(poolSize int) int {
+	n := poolSize * healFractionNumerator / healFractionDenominator
 	if n < 1 {
 		return 1
 	}
@@ -527,6 +601,16 @@ func (e *Executor) reportHeal(revision int, target, status, detail string) {
 	})
 }
 
+// flooredCooldown converts cooldownSeconds to a duration, flooring at
+// minHealCooldown (a longer pause is safe; a shorter one is not).
+func flooredCooldown(seconds int) time.Duration {
+	d := time.Duration(seconds) * time.Second
+	if d < minHealCooldown {
+		return minHealCooldown
+	}
+	return d
+}
+
 // flooredWindow converts a policy seconds value to a duration, flooring at
 // minDetectionWindow (tightening a guardrail is safe; loosening never is).
 func flooredWindow(seconds int) time.Duration {
@@ -539,7 +623,8 @@ func flooredWindow(seconds int) time.Duration {
 
 // nodeReadyCondition extracts the node's Ready condition status and its
 // lastTransitionTime. A node WITHOUT a Ready condition reports Unknown with a
-// zero time — the caller skips it (no way to establish a duration).
+// zero time. Detection skips such a node (no way to establish a duration),
+// and the local bounds read it as missing evidence and refuse its pool.
 func nodeReadyCondition(node *corev1.Node) (corev1.ConditionStatus, time.Time) {
 	for _, c := range node.Status.Conditions {
 		if c.Type == corev1.NodeReady {

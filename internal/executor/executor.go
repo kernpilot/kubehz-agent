@@ -271,9 +271,9 @@ func (e *Executor) Reconcile(ctx context.Context, doc *desired.Doc) (retry bool)
 }
 
 // RefuseStale implements desired.Actor. The poller has found the cached
-// document too old to act on (the platform stopped serving it — see the
-// Poller's freshness bounds), so the refusal is REPORTED where the outcomes
-// are: on the heartbeat, not only in the agent's log.
+// document too old to act on (no revalidation succeeded inside the Poller's
+// freshness bounds), so the refusal is REPORTED where the outcomes are: on
+// the heartbeat, not only in the agent's log.
 //
 // One report per declared pool, for each armed loop. A heal action normally
 // carries a MACHINE name; a refusal has no candidate machine, so the pool name

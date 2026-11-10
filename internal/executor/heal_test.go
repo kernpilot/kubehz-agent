@@ -40,14 +40,36 @@ func healingDoc(revision int, maxUnhealthy int) *desired.Doc {
 }
 
 // selectorMD builds an MD whose selector owns machines labeled
-// workerset=<name> (the authoritative pool mapping).
+// workerset=<name> (the authoritative pool mapping). It carries no
+// spec.replicas, so healing sizes the pool by the machines that exist; use
+// selectorMDWithReplicas where the intended size matters.
 func selectorMD(name string) *unstructured.Unstructured {
 	u := md(name, 2)
+	unstructured.RemoveNestedField(u.Object, "spec", "replicas")
 	if err := unstructured.SetNestedMap(u.Object,
 		map[string]any{"workerset": name}, "spec", "selector", "matchLabels"); err != nil {
 		panic(err)
 	}
 	return u
+}
+
+// selectorMDWithReplicas is selectorMD with an intended size.
+func selectorMDWithReplicas(name string, replicas int64) *unstructured.Unstructured {
+	u := selectorMD(name)
+	if err := unstructured.SetNestedField(u.Object, replicas, "spec", "replicas"); err != nil {
+		panic(err)
+	}
+	return u
+}
+
+// noTransitionNode builds a not-Ready node that reports no Ready transition
+// time: a zero lastTransitionTime, or (noCondition) no Ready condition at all.
+func noTransitionNode(name string, noCondition bool) *corev1.Node {
+	n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{}}}
+	if !noCondition {
+		n.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionUnknown}}
+	}
+	return n
 }
 
 // workerMachine builds a machine in pool (workerset label), with a nodeRef
@@ -153,12 +175,20 @@ func TestHeal_RespectsUnhealthyAfterWindow(t *testing.T) {
 }
 
 // A machine whose node never joined within nodeStartupTimeoutSeconds is
-// remediated; a younger joinless machine is not.
+// remediated; a younger joinless machine is not. The pool has four serving
+// machines, so the young one (out of service, not yet joined) leaves room
+// under the fraction cap (2 of 6).
 func TestHeal_RemediatesJoinlessMachine(t *testing.T) {
 	dyn := fakeDyn(selectorMD("pool-a"),
 		workerMachine("pool-a-old", "pool-a", "", t0.Add(-20*time.Minute)),
-		workerMachine("pool-a-young", "pool-a", "", t0.Add(-2*time.Minute)))
-	exec, store := newHealExecutor(dyn, nil)
+		workerMachine("pool-a-young", "pool-a", "", t0.Add(-2*time.Minute)),
+		workerMachine("pool-a-r1", "pool-a", "r-1", t0.Add(-time.Hour)),
+		workerMachine("pool-a-r2", "pool-a", "r-2", t0.Add(-time.Hour)),
+		workerMachine("pool-a-r3", "pool-a", "r-3", t0.Add(-time.Hour)),
+		workerMachine("pool-a-r4", "pool-a", "r-4", t0.Add(-time.Hour)))
+	exec, store := newHealExecutor(dyn, []*corev1.Node{
+		readyNode("r-1"), readyNode("r-2"), readyNode("r-3"), readyNode("r-4"),
+	})
 
 	exec.Reconcile(context.Background(), healingDoc(4, 1))
 
@@ -512,35 +542,43 @@ func TestHeal_PolicyKnobsRespected(t *testing.T) {
 		t.Errorf("zero window not floored to 60s (would flap with kubelet grace periods)")
 	}
 
-	// CooldownSeconds 0 disables the pause: two remediations in the same pool
-	// back to back. The pool holds SIX machines and the two failures are
-	// staggered, so neither local sanity bound interferes — the per-pass
-	// fraction cap allows 6/3 = 2, and 2 of 6 nodes failing 40 minutes apart
-	// is not an outage signature.
-	dyn3 := fakeDyn(selectorMD("pool-a"),
+	// A cooldown of 0 is FLOORED to five minutes: the document cannot make
+	// healing delete one pool's machines back to back. Two staggered failures
+	// in a pool of six (neither the fraction cap nor the outage refusal
+	// interferes): one deletion now, the second only after the floor.
+	dyn3 := fakeDyn(selectorMDWithReplicas("pool-a", 6),
 		workerMachine("pool-a-1", "pool-a", "w-1", t0.Add(-time.Hour)),
 		workerMachine("pool-a-2", "pool-a", "w-2", t0.Add(-time.Hour)),
 		workerMachine("pool-a-3", "pool-a", "w-3", t0.Add(-time.Hour)),
 		workerMachine("pool-a-4", "pool-a", "w-4", t0.Add(-time.Hour)),
 		workerMachine("pool-a-5", "pool-a", "w-5", t0.Add(-time.Hour)),
 		workerMachine("pool-a-6", "pool-a", "w-6", t0.Add(-time.Hour)))
-	store3 := actions.New(nil)
-	exec3 := New(dyn3, store3, Options{
-		Namespace: ns, MaxReplicas: 50,
-		Nodes: func() ([]*corev1.Node, error) {
-			return []*corev1.Node{
-				notReadyNode("w-1", corev1.ConditionFalse, t0.Add(-time.Hour), false),
-				notReadyNode("w-2", corev1.ConditionFalse, t0.Add(-20*time.Minute), false),
-				readyNode("w-3"), readyNode("w-4"), readyNode("w-5"), readyNode("w-6"),
-			}, nil
-		},
-		Now: func() time.Time { return t0 },
+	exec3, store3 := newHealExecutor(dyn3, []*corev1.Node{
+		notReadyNode("w-1", corev1.ConditionFalse, t0.Add(-time.Hour), false),
+		notReadyNode("w-2", corev1.ConditionFalse, t0.Add(-20*time.Minute), false),
+		readyNode("w-3"), readyNode("w-4"), readyNode("w-5"), readyNode("w-6"),
 	})
 	doc3 := healingDoc(4, 2)
 	doc3.Healing.CooldownSeconds = 0
 	exec3.Reconcile(context.Background(), doc3)
-	if machineExists(t, dyn3, "pool-a-1") || machineExists(t, dyn3, "pool-a-2") {
-		t.Errorf("cooldown 0 must allow immediate remediation (both machines)")
+	if machineExists(t, dyn3, "pool-a-1") {
+		t.Fatalf("the first remediation did not happen")
+	}
+	if !machineExists(t, dyn3, "pool-a-2") {
+		t.Fatalf("cooldown 0 deleted a second machine of the pool in the same pass — the floor did not hold")
+	}
+	if a := findAction(t, store3, "pool-a-2"); a.Status != state.ActionPending || !strings.Contains(a.Detail, "cooldown") {
+		t.Errorf("action = %+v, want cooldown pending", a)
+	}
+	exec3.now = func() time.Time { return t0.Add(4 * time.Minute) }
+	exec3.Reconcile(context.Background(), doc3)
+	if !machineExists(t, dyn3, "pool-a-2") {
+		t.Fatalf("cooldown 0 deleted the second machine before the five-minute floor")
+	}
+	exec3.now = func() time.Time { return t0.Add(6 * time.Minute) }
+	exec3.Reconcile(context.Background(), doc3)
+	if machineExists(t, dyn3, "pool-a-2") {
+		t.Errorf("the second remediation is still blocked after the floor elapsed")
 	}
 }
 
@@ -549,28 +587,94 @@ func TestHeal_PolicyKnobsRespected(t *testing.T) {
 // node — and a partitioned server is alive, running the user's workload.
 // Nothing is deleted and the refusal is reported.
 //
-// The fixture isolates this rule from the fraction cap: only ONE node has
-// crossed unhealthyAfter, so a pass may remediate it (cap 1 of 2 machines).
-// Only the simultaneity evidence stops the delete.
+// The fixture isolates the POOL rule: a healthy worker in another pool keeps
+// the cluster-wide rule out of it, and every node of pool-a is a candidate,
+// so the fraction cap would let one deletion through (1 of 3). Only the
+// pool's simultaneity evidence stops the delete.
 func TestHeal_RefusesSimultaneousPoolFailure(t *testing.T) {
-	dyn := fakeDyn(selectorMD("pool-a"),
+	dyn := fakeDyn(selectorMD("pool-a"), selectorMD("pool-b"),
 		workerMachine("pool-a-1", "pool-a", "w-1", t0.Add(-time.Hour)),
-		workerMachine("pool-a-2", "pool-a", "w-2", t0.Add(-time.Hour)))
+		workerMachine("pool-a-2", "pool-a", "w-2", t0.Add(-time.Hour)),
+		workerMachine("pool-a-3", "pool-a", "w-3", t0.Add(-time.Hour)),
+		workerMachine("pool-b-1", "pool-b", "b-1", t0.Add(-time.Hour)))
 	exec, store := newHealExecutor(dyn, []*corev1.Node{
-		notReadyNode("w-1", corev1.ConditionUnknown, t0.Add(-6*time.Minute), false), // past unhealthyAfter
-		notReadyNode("w-2", corev1.ConditionUnknown, t0.Add(-4*time.Minute), false), // not yet a candidate
+		notReadyNode("w-1", corev1.ConditionUnknown, t0.Add(-9*time.Minute), false),
+		notReadyNode("w-2", corev1.ConditionUnknown, t0.Add(-8*time.Minute), false),
+		notReadyNode("w-3", corev1.ConditionUnknown, t0.Add(-6*time.Minute), false),
+		readyNode("b-1"),
 	})
 
 	// A wrong-but-plausible maxUnhealthy: the storm brake, the budget and the
 	// cooldown are all satisfied.
 	exec.Reconcile(context.Background(), healingDoc(4, 10))
 
+	const want = "all 3 nodes of pool pool-a went unhealthy within"
+	for _, name := range []string{"pool-a-1", "pool-a-2", "pool-a-3"} {
+		if !machineExists(t, dyn, name) {
+			t.Fatalf("%s deleted during a whole-pool failure — a partition is not hardware failure", name)
+		}
+		a := findAction(t, store, name)
+		if a.Status != state.ActionFailed || !strings.Contains(a.Detail, want) {
+			t.Errorf("action %s = %+v, want the pool refusal %q", name, a, want)
+		}
+	}
+}
+
+// MISSING EVIDENCE refuses (pool). One not-Ready node of pool-a reports no
+// Ready transition time, so the agent cannot tell whether it failed together
+// with the five others. Without it in the count the pool would not look like
+// an outage and the fraction cap (2 of 6) would let a deletion through.
+func TestHeal_UnknownTransitionTimeRefusesThePool(t *testing.T) {
+	objs := []runtime.Object{selectorMD("pool-a"), selectorMD("pool-b"),
+		workerMachine("pool-b-1", "pool-b", "b-1", t0.Add(-time.Hour))}
+	nodes := []*corev1.Node{readyNode("b-1")}
+	for i := 1; i <= 6; i++ {
+		name := "w-" + string(rune('0'+i))
+		objs = append(objs, workerMachine("pool-a-"+string(rune('0'+i)), "pool-a", name, t0.Add(-time.Hour)))
+		if i == 6 {
+			nodes = append(nodes, noTransitionNode(name, false))
+			continue
+		}
+		nodes = append(nodes, notReadyNode(name, corev1.ConditionUnknown, t0.Add(-time.Duration(10-i)*time.Minute), false))
+	}
+	dyn := fakeDyn(objs...)
+	exec, store := newHealExecutor(dyn, nodes)
+
+	exec.Reconcile(context.Background(), healingDoc(4, 10))
+
+	for i := 1; i <= 5; i++ {
+		name := "pool-a-" + string(rune('0'+i))
+		if !machineExists(t, dyn, name) {
+			t.Fatalf("%s deleted although a node of its pool reports no Ready transition time", name)
+		}
+		a := findAction(t, store, name)
+		if a.Status != state.ActionFailed || !strings.Contains(a.Detail, "node w-6 of pool pool-a is not Ready and reports no Ready transition time") {
+			t.Errorf("action %s = %+v, want the missing-evidence refusal", name, a)
+		}
+	}
+}
+
+// MISSING EVIDENCE refuses (cluster). Two one-machine pools: one node failed
+// eight minutes ago, the other has no Ready condition at all. The unknown one
+// could have failed at the same moment, so the whole worker set reads as an
+// outage.
+func TestHeal_UnknownTransitionTimeCountsAsSimultaneous(t *testing.T) {
+	dyn := fakeDyn(selectorMD("pool-a"), selectorMD("pool-b"),
+		workerMachine("pool-a-1", "pool-a", "w-1", t0.Add(-time.Hour)),
+		workerMachine("pool-b-1", "pool-b", "w-2", t0.Add(-time.Hour)))
+	exec, store := newHealExecutor(dyn, []*corev1.Node{
+		notReadyNode("w-1", corev1.ConditionUnknown, t0.Add(-8*time.Minute), false),
+		noTransitionNode("w-2", true),
+	})
+
+	exec.Reconcile(context.Background(), healingDoc(4, 10))
+
 	if !machineExists(t, dyn, "pool-a-1") {
-		t.Fatalf("machine deleted during a whole-pool failure — a partition is not hardware failure")
+		t.Fatalf("pool-a-1 deleted while the only other worker reports no Ready transition time")
 	}
 	a := findAction(t, store, "pool-a-1")
-	if a.Status != state.ActionFailed || !strings.Contains(a.Detail, "outage or a partition") {
-		t.Errorf("action = %+v, want the simultaneous-failure refusal", a)
+	if a.Status != state.ActionFailed || !strings.Contains(a.Detail, "all 2 worker nodes") {
+		t.Errorf("action = %+v, want the cluster-wide outage refusal", a)
 	}
 }
 
@@ -600,47 +704,73 @@ func TestHeal_RefusesSimultaneousClusterFailure(t *testing.T) {
 	}
 }
 
-// LOCAL BOUND (fraction): one pass remediates at most a third of a pool, even
-// when every SERVER-owned number allows more. Four staggered failures in a
-// pool of six, maxUnhealthy 10 and no cooldown: two deletions, two waits.
-// Before this bound the pass deleted all four.
-func TestHeal_FractionCapsOnePass(t *testing.T) {
-	dyn := fakeDyn(selectorMD("pool-a"),
-		workerMachine("pool-a-1", "pool-a", "w-1", t0.Add(-time.Hour)),
-		workerMachine("pool-a-2", "pool-a", "w-2", t0.Add(-time.Hour)),
-		workerMachine("pool-a-3", "pool-a", "w-3", t0.Add(-time.Hour)),
-		workerMachine("pool-a-4", "pool-a", "w-4", t0.Add(-time.Hour)),
-		workerMachine("pool-a-5", "pool-a", "w-5", t0.Add(-time.Hour)),
-		workerMachine("pool-a-6", "pool-a", "w-6", t0.Add(-time.Hour)))
-	// Staggered by 15 minutes: four independent failures, not an outage.
-	exec, store := newHealExecutor(dyn, []*corev1.Node{
-		notReadyNode("w-1", corev1.ConditionFalse, t0.Add(-60*time.Minute), false),
-		notReadyNode("w-2", corev1.ConditionFalse, t0.Add(-45*time.Minute), false),
-		notReadyNode("w-3", corev1.ConditionFalse, t0.Add(-30*time.Minute), false),
-		notReadyNode("w-4", corev1.ConditionFalse, t0.Add(-15*time.Minute), false),
-		readyNode("w-5"), readyNode("w-6"),
-	})
-
-	doc := healingDoc(4, 10)
-	doc.Healing.CooldownSeconds = 0 // the cooldown must not be what limits this
-	exec.Reconcile(context.Background(), doc)
-
-	deleted := 0
-	for _, name := range []string{"pool-a-1", "pool-a-2", "pool-a-3", "pool-a-4"} {
-		if !machineExists(t, dyn, name) {
-			deleted++
-		}
+// LOCAL BOUND (fraction, across passes): at most a third of a pool is out of
+// service at once, and a deletion keeps counting until its replacement
+// serves. Twelve machines, eleven of them partitioned (Unknown at the same
+// moment) and one Ready, so the outage refusal does not engage; the document
+// is wrong but plausible (maxUnhealthy 50, cooldown 0). Pass after pass, the
+// agent deletes four machines and then waits: the eleven are never all gone.
+// Before this bound each pass started from zero.
+func TestHeal_FractionCountsDisruptionsAcrossPasses(t *testing.T) {
+	objs := []runtime.Object{selectorMDWithReplicas("pool-a", 12)}
+	nodes := []*corev1.Node{readyNode("w-ready")}
+	objs = append(objs, workerMachine("pool-a-ready", "pool-a", "w-ready", t0.Add(-time.Hour)))
+	var sick []string
+	for i := 0; i < 11; i++ {
+		name := "pool-a-" + string(rune('a'+i))
+		node := "w-" + string(rune('a'+i))
+		sick = append(sick, name)
+		objs = append(objs, workerMachine(name, "pool-a", node, t0.Add(-time.Hour)))
+		nodes = append(nodes, notReadyNode(node, corev1.ConditionUnknown, t0.Add(-10*time.Minute), false))
 	}
-	if deleted != 2 {
-		t.Fatalf("deleted %d machines in one pass, want 2 (a third of a six-machine pool)", deleted)
+	dyn := fakeDyn(objs...)
+	exec, store := newHealExecutor(dyn, nodes)
+	exec.nodes = func() ([]*corev1.Node, error) { return nodes, nil }
+
+	doc := healingDoc(4, 50)
+	doc.Healing.CooldownSeconds = 0
+	deleted := func() int {
+		n := 0
+		for _, name := range sick {
+			if !machineExists(t, dyn, name) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// One pass every six minutes, past the cooldown floor each time.
+	for pass := 0; pass < 8; pass++ {
+		at := t0.Add(time.Duration(pass) * 6 * time.Minute)
+		exec.now = func() time.Time { return at }
+		exec.Reconcile(context.Background(), doc)
+	}
+	if got := deleted(); got != 4 {
+		t.Fatalf("deleted %d of 11 machines over 8 passes, want 4 (a third of a twelve-machine pool out at once)", got)
 	}
 	waiting := 0
 	for _, a := range store.Snapshot() {
-		if a.Status == state.ActionPending && strings.Contains(a.Detail, "one pass remediates at most") {
+		if a.Status == state.ActionPending && strings.Contains(a.Detail, "already has 4 of its 12 machines out of service") {
 			waiting++
 		}
 	}
-	if waiting != 2 {
-		t.Errorf("waiting reports = %d, want 2 — the excess must be reported, not dropped: %+v", waiting, store.Snapshot())
+	if waiting == 0 {
+		t.Errorf("no candidate reports why it waits: %+v", store.Snapshot())
+	}
+
+	// A replacement joins and serves: one slot is back, so one more deletion
+	// may proceed, and no more.
+	if _, err := dyn.Resource(machines.MachineGVR).Namespace(ns).Create(context.Background(),
+		workerMachine("pool-a-new", "pool-a", "w-new", t0.Add(time.Hour)), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	nodes = append(nodes, readyNode("w-new"))
+	for pass := 8; pass < 11; pass++ {
+		at := t0.Add(time.Duration(pass) * 6 * time.Minute)
+		exec.now = func() time.Time { return at }
+		exec.Reconcile(context.Background(), doc)
+	}
+	if got := deleted(); got != 5 {
+		t.Errorf("deleted %d after one replacement served, want 5", got)
 	}
 }
