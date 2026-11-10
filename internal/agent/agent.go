@@ -56,6 +56,10 @@ const (
 	backoffMax  = 5 * time.Minute
 	// tokenReadTimeout bounds a Secret re-read on the API-fallback path.
 	tokenReadTimeout = 10 * time.Second
+	// leaseFirstReadWait bounds how long the first beat waits for the first
+	// read of the acting Lease (normally milliseconds; the bound only matters
+	// when the election cannot start at all).
+	leaseFirstReadWait = 10 * time.Second
 )
 
 // Agent is the long-running managed-tier live-view + desired-state agent.
@@ -216,13 +220,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		go issueCollector.Run(ctx)
 	}
 
+	// leaseObs watches the acting Lease for the REPORTING side: while another
+	// replica holds it, this replica sends no beats (see the push below). nil
+	// without an acting loop — a pure reporter always reports.
+	var leaseObs *leader.Observer
 	if a.dyn != nil {
 		// Node health for the P5 healer comes from the SAME informer cache the
 		// live view reports from — one watch, one truth. Pods feed the
 		// post-heal eviction unwedge (executor/unwedge.go) from the same cache.
 		nodes := func() ([]*corev1.Node, error) { return nodeInf.Lister().List(labels.Everything()) }
 		pods := func() ([]*corev1.Pod, error) { return podInf.Lister().List(labels.Everything()) }
-		go a.runActingLoop(ctx, actionStore, nodes, pods, reloadToken)
+		leaseObs = leader.NewObserver()
+		go a.runActingLoop(ctx, actionStore, nodes, pods, reloadToken, leaseObs)
 	} else {
 		a.log.Warn("desired-state loop disabled (no dynamic client) — running report-only")
 	}
@@ -233,7 +242,30 @@ func (a *Agent) Run(ctx context.Context) error {
 		MinGap:       a.cfg.MinGap,
 	}, nil)
 
+	// The first beat must not race the first read of the Lease: a standby that
+	// beats before it knows a peer holds the lease would clear the holder's
+	// action reports once.
+	leaseObs.WaitFirstRead(ctx, leaseFirstReadWait)
+
+	standbyLogged := false
 	coalescer.Run(ctx, changes, func(reason publisher.PushReason) {
+		// ONE REPORTER PER CLUSTER while acting is held. The platform keeps one
+		// action snapshot per cluster, latest-wins, and reads a beat without
+		// actions[] as "clear". A standby never acts, so its beats carry no
+		// actions and would erase the holder's outcomes and refusals. The
+		// holder reports the same live view, so the standby stays silent
+		// until the lease is free or stops being renewed.
+		if leaseObs.PeerHolds() {
+			if !standbyLogged {
+				standbyLogged = true
+				a.log.Info("another replica holds the acting lease and reports for this cluster; this replica sends no beats until the lease is free")
+			}
+			return
+		}
+		if standbyLogged {
+			standbyLogged = false
+			a.log.Info("no other replica holds the acting lease; this replica reports again")
+		}
 		payload := collector.BuildPayload(src, collector.Meta{
 			ClusterID:        a.cfg.ClusterID,
 			ServerVersion:    a.getVersion(),
@@ -275,13 +307,15 @@ func (a *Agent) Run(ctx context.Context) error {
 // while reporting need not be). Losing the lease stops the loop and clears the
 // action reports, so this replica stops asserting outcomes the new leader now
 // owns. A leader-election failure — no Lease RBAC, no coordination API — is
-// loud and leaves the agent reporting, never acting.
+// loud and leaves the agent reporting, never acting. obs records the
+// election's reads of the Lease for the reporting side.
 func (a *Agent) runActingLoop(
 	ctx context.Context,
 	actionStore *actions.Store,
 	nodes executor.NodeSource,
 	pods executor.PodSource,
 	reloadToken publisher.TokenReloader,
+	obs *leader.Observer,
 ) {
 	// The Lease lives beside the agent. A caller that built its Config by hand
 	// may have left the namespace empty; fall back to the same default Load
@@ -294,6 +328,7 @@ func (a *Agent) runActingLoop(
 		Client:    a.client,
 		Namespace: namespace,
 		Identity:  leader.Identity(a.cfg.PodName),
+		Observer:  obs,
 		Logger:    a.log,
 	}
 	a.log.Info("desired-state loop waiting for the acting lease (exactly one replica may act)",

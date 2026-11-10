@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,6 +26,7 @@ import (
 	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/inventory"
+	"github.com/kernpilot/kubehz-agent/internal/leader"
 	"github.com/kernpilot/kubehz-agent/internal/machines"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
@@ -234,6 +236,98 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 			t.Errorf("Run returned %v, want context.Canceled", err)
 		}
 	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after context cancel")
+	}
+}
+
+// A STANDBY sends no beats while another replica holds the acting lease. The
+// platform keeps one action snapshot per cluster, latest-wins, and reads a
+// beat without actions[] as "clear", so a standby's beats would erase the
+// holder's outcomes and refusals. Once the peer's lease runs out (it stops
+// renewing), the standby reports again.
+func TestAgent_StandbySendsNoBeatsWhileAPeerHoldsTheLease(t *testing.T) {
+	now := metav1.NewMicroTime(time.Now())
+	peer, two := "peer-replica_0000", int32(2)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leader.LeaseName, Namespace: config.DefaultNamespace},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity: &peer, LeaseDurationSeconds: &two,
+			AcquireTime: &now, RenewTime: &now,
+		},
+	}
+	client := fake.NewClientset(testNode("cp-1"), lease)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			executor.MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:           "MachineList",
+		})
+
+	var mu sync.Mutex
+	var beats []time.Time
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		beats = append(beats, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := &config.Config{
+		ClusterID:    "kubehz.in.net",
+		APIURL:       srv.URL,
+		AgentToken:   testToken,
+		FullInterval: 100 * time.Millisecond,
+		Debounce:     20 * time.Millisecond,
+		MinGap:       20 * time.Millisecond,
+		DesiredPoll:  50 * time.Millisecond,
+		MDNamespace:  "kube-system",
+		MaxReplicas:  50,
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- New(cfg, client, dyn, nil).Run(ctx) }()
+
+	// The peer's lease is valid for two seconds from the standby's first read.
+	time.Sleep(time.Second)
+	mu.Lock()
+	early := len(beats)
+	mu.Unlock()
+	if early != 0 {
+		t.Errorf("%d beats sent in the first second while another replica held the acting lease, want 0", early)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(beats)
+		var first time.Time
+		if n > 0 {
+			first = beats[0]
+		}
+		mu.Unlock()
+		if n > 0 {
+			if first.Sub(start) < 1500*time.Millisecond {
+				t.Errorf("first beat %s after start, inside the peer's lease", first.Sub(start))
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the standby never reported again after the peer's lease ran out")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not stop after context cancel")
 	}
 }
