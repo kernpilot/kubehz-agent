@@ -460,8 +460,9 @@ How they work, truthfully:
    so a standby's beats would erase the holder's reports. The holder reports
    the same live view. The check runs before every send, a retry too, so a
    beat queued before the standby saw the peer is dropped, not sent late. A
-   standby reports again when the lease is free, or when a read finds it
-   unchanged for one lease duration; a read that fails changes nothing, so
+   standby reports again when the lease is free, when a read finds it
+   unchanged for one lease duration, or when the apiserver answers that the
+   Lease does not exist (deleted). Any other failed read changes nothing, so
    a standby that cannot read the Lease stays silent. Because the holder is
    then the only reporter, **a holder whose heartbeats fail for 5 minutes
    steps down**: it stops acting, releases the lease, and does not contend

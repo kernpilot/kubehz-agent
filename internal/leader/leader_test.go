@@ -492,6 +492,31 @@ func TestObserver_AFailedReadKeepsThePeer(t *testing.T) {
 	}
 }
 
+// A NotFound is the one failed read that IS evidence: the apiserver says
+// there is no Lease, so no peer holds it. The peer the replica last saw stops
+// counting at once. Other errors stay inconclusive.
+func TestObserver_AMissingLeaseIsNoPeer(t *testing.T) {
+	o := NewObserver()
+	now := time.Unix(1_000_000, 0)
+	o.now = func() time.Time { return now }
+	_ = o.wrap(nil, "me")
+
+	peer := &resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}
+	o.read(peer, []byte("v1"), nil)
+	o.read(nil, nil, apierrors.NewForbidden(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, LeaseName, errors.New("denied")))
+	if !o.PeerHolds() {
+		t.Fatal("a Forbidden read ended the peer's count; it proves nothing about the holder")
+	}
+	o.read(nil, nil, apierrors.NewNotFound(schema.GroupResource{Group: "coordination.k8s.io", Resource: "leases"}, LeaseName))
+	if o.PeerHolds() {
+		t.Fatal("the peer still counts after the apiserver said the Lease does not exist: the replica would stay silent for good")
+	}
+	o.read(peer, []byte("v2"), nil)
+	if !o.PeerHolds() {
+		t.Error("a peer that creates the Lease again does not count")
+	}
+}
+
 // startLeading runs replica-a's Run in the background and waits until it
 // acts. It returns the cancel for Run and a channel that yields Run's return
 // time.

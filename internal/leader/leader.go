@@ -48,6 +48,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
@@ -454,7 +455,11 @@ func release(cfg Config, log *slog.Logger) {
 // stops changing (the holder died) stops counting once a read finds it
 // unchanged for one lease duration, which is the read at which a standby
 // takes the lease. A read that FAILS proves nothing about the holder: the
-// peer keeps counting, however long this process cannot read the Lease.
+// peer keeps counting, however long this process cannot read the Lease. The
+// one exception is the apiserver's NotFound: that is a definite answer, there
+// is no Lease, so no peer holds it and the standby reports again. (It does
+// not make this process the holder: acting still needs the election to
+// create and acquire the Lease.)
 type Observer struct {
 	now func() time.Time
 
@@ -517,8 +522,21 @@ func (o *Observer) wrap(lock resourcelock.Interface, identity string) resourcelo
 
 func (o *Observer) read(rec *resourcelock.LeaderElectionRecord, raw []byte, err error) {
 	defer o.firstReadOnce.Do(func() { close(o.firstRead) })
-	if err != nil || rec == nil {
+	if apierrors.IsNotFound(err) {
+		// No Lease at all (deleted, or never created): nobody holds it. A
+		// replica out of the race must see this, or it would stay silent
+		// for a peer that is gone, and without a successful beat it never
+		// becomes eligible to create the Lease again.
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		o.raw = nil
+		o.holder = ""
+		o.seenAt = time.Time{}
+		o.readAt = o.now()
 		return
+	}
+	if err != nil || rec == nil {
+		return // inconclusive: keep what the last good read showed
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()

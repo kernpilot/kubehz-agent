@@ -547,6 +547,80 @@ func TestAgent_FormerHolderDropsItsQueuedBeat(t *testing.T) {
 	}
 }
 
+// RECOVERY when the peer's Lease is deleted. A replica stepped down (its
+// heartbeats failed), a peer took the Lease, and the replica went silent for
+// it. Then the peer stops and its Lease is deleted, and the platform is
+// reachable again. The replica's reads now answer NotFound: that is no peer,
+// so its beats go out again, the successful beat makes it eligible, and it
+// creates and acquires the Lease. Without that it would stay silent and out
+// of the race for good: only a successful beat makes it eligible, and only
+// an eligible replica creates the Lease.
+func TestAgent_RecoversWhenThePeersLeaseIsDeleted(t *testing.T) {
+	var failing atomic.Bool
+	var ok atomic.Int32
+	ag, client := actingAgent(t, func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		ok.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	ag.stepDownAfter = 300 * time.Millisecond
+	ag.sendBackoff = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ag.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitUntil(t, "the agent never acquired the acting lease", 5*time.Second, func() bool { return holdsIt(client) })
+
+	// The heartbeats fail; the replica steps down and releases the Lease.
+	failing.Store(true)
+	waitUntil(t, "the holder never stepped down", 5*time.Second, func() bool { return storedHolder(client) == "" })
+
+	// A peer takes the Lease, and the replica goes silent for it.
+	leases := client.CoordinationV1().Leases(config.DefaultNamespace)
+	l, err := leases.Get(context.Background(), leader.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	peer, thirty := "peer-replica_0000", int32(30)
+	now := metav1.NewMicroTime(time.Now())
+	l.Spec.HolderIdentity, l.Spec.LeaseDurationSeconds = &peer, &thirty
+	l.Spec.AcquireTime, l.Spec.RenewTime = &now, &now
+	if _, err := leases.Update(context.Background(), l, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("hand the lease to the peer: %v", err)
+	}
+	before := ok.Load()
+	// Let the replica read the peer's record before the platform comes
+	// back, so that no beat goes out before the gate closes.
+	time.Sleep(500 * time.Millisecond)
+	failing.Store(false)
+	time.Sleep(time.Second)
+	if got := ok.Load(); got != before {
+		t.Fatalf("%d beats went out while the peer held the Lease, want 0 (precondition)", got-before)
+	}
+	if holdsIt(client) {
+		t.Fatal("the replica took the Lease from a live peer (precondition)")
+	}
+
+	// The peer is gone and its Lease is deleted.
+	if err := leases.Delete(context.Background(), leader.LeaseName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete lease: %v", err)
+	}
+	waitUntil(t, "no beat went out after the peer's Lease was deleted: the replica stays silent for a peer that is gone",
+		5*time.Second, func() bool { return ok.Load() > before })
+	waitUntil(t, "the replica never acquired the Lease again after its beats went through",
+		5*time.Second, func() bool { return holdsIt(client) })
+}
+
 func waitForPayload(t *testing.T, mu *sync.Mutex, payloads *[]state.Payload, match func(state.Payload) bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
