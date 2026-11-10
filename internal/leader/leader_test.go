@@ -18,6 +18,8 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/kernpilot/kubehz-agent/internal/leader/leasetest"
 )
 
 // testConfig is the same election, sped up: seconds instead of the production
@@ -422,8 +424,9 @@ func TestObserver_SeesThePeerWhileItHoldsTheLease(t *testing.T) {
 	waitFor("the new holder still sees a peer", func() bool { return !obsB.PeerHolds() })
 }
 
-// A holder that stops renewing stops counting after one lease duration, by
-// the observer's own clock. Re-reading the same record is not a renewal.
+// A holder that stops renewing stops counting once a read finds its record
+// unchanged for one lease duration, by the observer's own clock. Re-reading
+// the same record is not a renewal.
 func TestObserver_AStaleRecordStopsCounting(t *testing.T) {
 	o := NewObserver()
 	now := time.Unix(1_000_000, 0)
@@ -449,11 +452,6 @@ func TestObserver_AStaleRecordStopsCounting(t *testing.T) {
 	if !o.PeerHolds() {
 		t.Error("a renewal (a changed record) does not count")
 	}
-	o.read(nil, nil, errors.New("forbidden"))
-	now = now.Add(31 * time.Second)
-	if o.PeerHolds() {
-		t.Error("a record this replica can no longer read still counts after its lease duration")
-	}
 	o.read(&resourcelock.LeaderElectionRecord{HolderIdentity: "me", LeaseDurationSeconds: 30}, []byte("v3"), nil)
 	if o.PeerHolds() {
 		t.Error("this replica's own record counts as a peer")
@@ -465,6 +463,284 @@ func TestObserver_AStaleRecordStopsCounting(t *testing.T) {
 	var none *Observer
 	if none.PeerHolds() {
 		t.Error("a nil observer sees a peer")
+	}
+}
+
+// A read that FAILS proves nothing about the holder. While this replica
+// cannot read the Lease, the peer it last saw keeps counting, however long
+// that takes: a healthy holder is still renewing, and this replica's beats
+// would erase its action reports. Only a successful read that finds the
+// record unchanged for a full lease duration ends it.
+func TestObserver_AFailedReadKeepsThePeer(t *testing.T) {
+	o := NewObserver()
+	now := time.Unix(1_000_000, 0)
+	o.now = func() time.Time { return now }
+	_ = o.wrap(nil, "me")
+
+	peer := &resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}
+	o.read(peer, []byte("v1"), nil)
+	for i := 0; i < 5; i++ {
+		now = now.Add(31 * time.Second)
+		o.read(nil, nil, errors.New("connection refused"))
+	}
+	if !o.PeerHolds() {
+		t.Fatal("the peer stopped counting while this replica could not read the Lease — its beats would erase the holder's reports")
+	}
+	o.read(peer, []byte("v1"), nil)
+	if o.PeerHolds() {
+		t.Error("an unchanged record read again after its lease duration still counts")
+	}
+}
+
+// startLeading runs replica-a's Run in the background and waits until it
+// acts. It returns the cancel for Run and a channel that yields Run's return
+// time.
+func startLeading(t *testing.T, cfg Config, onLeading func(context.Context)) (context.CancelFunc, <-chan time.Time) {
+	t.Helper()
+	leading := make(chan struct{})
+	var once sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan time.Time, 1)
+	go func() {
+		_ = Run(ctx, cfg, func(lctx context.Context) {
+			once.Do(func() { close(leading) })
+			onLeading(lctx)
+		})
+		done <- time.Now()
+	}()
+	select {
+	case <-leading:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("never acquired the lease")
+	}
+	return cancel, done
+}
+
+func storedHolder(t *testing.T, client *fake.Clientset) string {
+	t.Helper()
+	l, err := client.CoordinationV1().Leases("kubehz-system").Get(context.Background(), LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	if l.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *l.Spec.HolderIdentity
+}
+
+// The release on shutdown never touches a Lease a successor holds. Here the
+// successor took the Lease while replica-a was still finishing its acting
+// callback; replica-a's release reads it and must leave it alone.
+func TestRun_ReleaseLeavesASuccessorsLeaseAlone(t *testing.T) {
+	client := fake.NewClientset()
+	leasetest.EnforceResourceVersion(client)
+
+	cancel, done := startLeading(t, testConfig(client, "replica-a"), func(lctx context.Context) {
+		<-lctx.Done()
+		// replica-b takes the Lease before this callback returns.
+		leases := client.CoordinationV1().Leases("kubehz-system")
+		for i := 0; i < 50; i++ {
+			l, err := leases.Get(context.Background(), LeaseName, metav1.GetOptions{})
+			if err != nil {
+				t.Errorf("get lease: %v", err)
+				return
+			}
+			b, ten := "replica-b", int32(10)
+			now := metav1.NewMicroTime(time.Now())
+			l.Spec.HolderIdentity, l.Spec.LeaseDurationSeconds = &b, &ten
+			l.Spec.AcquireTime, l.Spec.RenewTime = &now, &now
+			if _, err = leases.Update(context.Background(), l, metav1.UpdateOptions{}); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond) // a renewal came between; read again
+		}
+		t.Error("the test could not hand the Lease to replica-b")
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if got := storedHolder(t, client); got != "replica-b" {
+		t.Errorf("stored holder = %q after replica-a's shutdown, want replica-b: the release cleared a successor's Lease", got)
+	}
+}
+
+// The release is a compare-and-swap. A successor can take the Lease between
+// the release's read and its write; the write then carries a resourceVersion
+// that is no longer the stored one, and it must fail instead of clearing the
+// successor's Lease.
+func TestRun_ReleaseIsACompareAndSwap(t *testing.T) {
+	client := fake.NewClientset()
+	versions := leasetest.EnforceResourceVersion(client)
+
+	var callbackReturned, interposed atomic.Bool
+	// The first read after the callback returned is the release's own read
+	// (the elector renews without reading while it holds the lease). It
+	// answers with replica-a's Lease and, at the same moment, lets replica-b
+	// take the stored one.
+	client.PrependReactor("get", "leases", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if !callbackReturned.Load() || interposed.Swap(true) {
+			return false, nil, nil
+		}
+		obj, err := client.Tracker().Get(leasetest.LeaseGVR, a.GetNamespace(), LeaseName)
+		if err != nil {
+			t.Errorf("tracker get: %v", err)
+			return false, nil, nil
+		}
+		mine := obj.(*coordinationv1.Lease)
+		theirs := mine.DeepCopy()
+		b, ten := "replica-b", int32(10)
+		now := metav1.NewMicroTime(time.Now())
+		theirs.Spec.HolderIdentity, theirs.Spec.LeaseDurationSeconds = &b, &ten
+		theirs.Spec.AcquireTime, theirs.Spec.RenewTime = &now, &now
+		theirs.ResourceVersion = versions.Next()
+		if err := client.Tracker().Update(leasetest.LeaseGVR, theirs, a.GetNamespace()); err != nil {
+			t.Errorf("tracker update: %v", err)
+		}
+		return true, mine, nil
+	})
+
+	cancel, done := startLeading(t, testConfig(client, "replica-a"), func(lctx context.Context) {
+		<-lctx.Done()
+		callbackReturned.Store(true)
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if !interposed.Load() {
+		t.Fatal("the release never read the Lease")
+	}
+	if got := storedHolder(t, client); got != "replica-b" {
+		t.Errorf("stored holder = %q, want replica-b: the release overwrote a Lease that changed after it was read", got)
+	}
+}
+
+// STEP-DOWN: once MayLead says this replica must not hold the lease, acting
+// stops, the callback is joined, and only then is the lease released. Run
+// then stays out of the race while MayLead says no, and contends again once
+// it says yes.
+func TestRun_StepsDownWhileItMayNotLead(t *testing.T) {
+	client := fake.NewClientset()
+	var mu sync.Mutex
+	var returnedAt, releasedAt time.Time
+	client.PrependReactor("update", "leases", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if holder, ok := leaseHolder(a); ok && holder == "" {
+			mu.Lock()
+			if releasedAt.IsZero() {
+				releasedAt = time.Now()
+			}
+			mu.Unlock()
+		}
+		return false, nil, nil
+	})
+
+	var unfit atomic.Bool
+	var terms atomic.Int32
+	second := make(chan struct{})
+	cfg := testConfig(client, "replica-a")
+	cfg.MayLead = func() error {
+		if unfit.Load() {
+			return errors.New("the test says no")
+		}
+		return nil
+	}
+	cancel, done := startLeading(t, cfg, func(lctx context.Context) {
+		n := terms.Add(1)
+		if n == 2 {
+			close(second)
+		}
+		<-lctx.Done()
+		if n == 1 {
+			time.Sleep(300 * time.Millisecond) // an in-flight write finishing
+			mu.Lock()
+			returnedAt = time.Now()
+			mu.Unlock()
+		}
+	})
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	unfit.Store(true)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		released := !releasedAt.IsZero()
+		mu.Unlock()
+		if released {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the holder never released the lease after MayLead said no")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	if returnedAt.IsZero() || releasedAt.Before(returnedAt) {
+		t.Errorf("the lease was released before the acting callback returned (returned %v, released %v)", returnedAt, releasedAt)
+	}
+	mu.Unlock()
+
+	// Out of the race: a released lease is free, and a contending replica
+	// would take it back within one retry period.
+	time.Sleep(time.Second)
+	if got := terms.Load(); got != 1 {
+		t.Fatalf("%d terms while MayLead said no, want 1: the replica contended again", got)
+	}
+	if got := storedHolder(t, client); got != "" {
+		t.Errorf("stored holder = %q while MayLead said no, want none", got)
+	}
+
+	unfit.Store(false)
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replica never contended again after MayLead said yes")
+	}
+}
+
+// Out of the race, a replica still reads the Lease, so its Observer sees the
+// holder: the elector, which does those reads otherwise, does not run.
+func TestRun_OutOfTheRaceItStillSeesTheHolder(t *testing.T) {
+	client := fake.NewClientset()
+	bCancel, bDone := startLeading(t, testConfig(client, "replica-b"), func(lctx context.Context) { <-lctx.Done() })
+	defer func() {
+		bCancel()
+		<-bDone
+	}()
+
+	obs := NewObserver()
+	cfg := testConfig(client, "replica-a")
+	cfg.Observer = obs
+	cfg.MayLead = func() error { return errors.New("the test says no") }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var acted atomic.Bool
+	go func() {
+		defer close(done)
+		_ = Run(ctx, cfg, func(context.Context) { acted.Store(true) })
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !obs.PeerHolds() {
+		if time.Now().After(deadline) {
+			t.Fatal("a replica out of the race never saw the holder — it would report over the holder's actions")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if acted.Load() {
+		t.Error("acted while MayLead said no")
 	}
 }
 
