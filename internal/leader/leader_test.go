@@ -2,8 +2,12 @@ package leader
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,7 +19,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
@@ -431,7 +437,7 @@ func TestObserver_AStaleRecordStopsCounting(t *testing.T) {
 	o := NewObserver()
 	now := time.Unix(1_000_000, 0)
 	o.now = func() time.Time { return now }
-	_ = o.wrap(nil, "me")
+	_ = o.wrap(nil, "me", LeaseName)
 
 	peer := &resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}
 	o.read(peer, []byte("v1"), nil)
@@ -475,7 +481,7 @@ func TestObserver_AFailedReadKeepsThePeer(t *testing.T) {
 	o := NewObserver()
 	now := time.Unix(1_000_000, 0)
 	o.now = func() time.Time { return now }
-	_ = o.wrap(nil, "me")
+	_ = o.wrap(nil, "me", LeaseName)
 
 	peer := &resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}
 	o.read(peer, []byte("v1"), nil)
@@ -499,7 +505,7 @@ func TestObserver_AMissingLeaseIsNoPeer(t *testing.T) {
 	o := NewObserver()
 	now := time.Unix(1_000_000, 0)
 	o.now = func() time.Time { return now }
-	_ = o.wrap(nil, "me")
+	_ = o.wrap(nil, "me", LeaseName)
 
 	peer := &resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}
 	o.read(peer, []byte("v1"), nil)
@@ -514,6 +520,77 @@ func TestObserver_AMissingLeaseIsNoPeer(t *testing.T) {
 	o.read(peer, []byte("v2"), nil)
 	if !o.PeerHolds() {
 		t.Error("a peer that creates the Lease again does not count")
+	}
+}
+
+// Only the apiserver's own NotFound for the Lease ends the peer's count. Every
+// case is an HTTP 404 that client-go reports as NotFound, read through a real
+// REST client and the election's own lock. A 404 page from a proxy or a
+// router, or a NotFound for another object, says nothing about the Lease: if
+// it ended the count, the standby's beats would erase the reports of a holder
+// that still acts.
+func TestObserver_OnlyTheLeasesOwnNotFoundIsNoPeer(t *testing.T) {
+	status := func(details *metav1.StatusDetails) string {
+		b, err := json.Marshal(metav1.Status{
+			TypeMeta: metav1.TypeMeta{Kind: "Status", APIVersion: "v1"},
+			Status:   metav1.StatusFailure, Reason: metav1.StatusReasonNotFound,
+			Code: http.StatusNotFound, Message: "not found", Details: details,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	leaseDetails := func(name string) *metav1.StatusDetails {
+		return &metav1.StatusDetails{Group: "coordination.k8s.io", Kind: "leases", Name: name}
+	}
+	cases := []struct {
+		name, contentType, body string
+		noPeer                  bool
+	}{
+		{"an HTML page", "text/html", "<html><body><h1>404 Not Found</h1></body></html>", false},
+		{"a plain-text page", "text/plain; charset=utf-8", "404 page not found\n", false},
+		{"no content type", "", "not here", false},
+		{"JSON that is not a Status", "application/json", `{"error":"no route"}`, false},
+		{"a Status for another Lease", "application/json", status(leaseDetails("another-lease")), false},
+		{"a Status for another kind", "application/json", status(&metav1.StatusDetails{Kind: "namespaces", Name: LeaseName}), false},
+		{"a Status without details", "application/json", status(nil), false},
+		{"the apiserver's NotFound for the Lease", "application/json", status(leaseDetails(LeaseName)), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			client, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+			if err != nil {
+				t.Fatalf("client: %v", err)
+			}
+			o := NewObserver()
+			lock := o.wrap(&resourcelock.LeaseLock{
+				LeaseMeta:  metav1.ObjectMeta{Name: LeaseName, Namespace: "kubehz-system"},
+				Client:     client.CoordinationV1(),
+				LockConfig: resourcelock.ResourceLockConfig{Identity: "me"},
+			}, "me", LeaseName)
+			o.read(&resourcelock.LeaderElectionRecord{HolderIdentity: "peer", LeaseDurationSeconds: 30}, []byte("v1"), nil)
+
+			_, _, err = lock.Get(context.Background())
+			if !apierrors.IsNotFound(err) {
+				t.Fatalf("client-go did not report this 404 as NotFound (precondition): %v", err)
+			}
+			if got := !o.PeerHolds(); got != tc.noPeer {
+				if tc.noPeer {
+					t.Errorf("the apiserver's NotFound for the Lease did not end the peer's count")
+				} else {
+					t.Errorf("this 404 ended the peer's count; it proves nothing about the Lease (err: %v)", err)
+				}
+			}
+		})
 	}
 }
 

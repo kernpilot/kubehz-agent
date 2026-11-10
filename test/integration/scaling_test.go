@@ -11,6 +11,8 @@
 // SCALING is the loop under test on purpose: it is the reversible one. It
 // patches one integer on one object, so a wrong answer costs a replica count,
 // never a deleted server. Healing deletes machines and is not run here.
+// lease_test.go only reads the acting Lease (the apiserver's NotFound for a
+// deleted Lease); it never acts.
 //
 // Run it by hand against any throwaway cluster:
 //

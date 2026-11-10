@@ -42,6 +42,7 @@ package leader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -177,7 +178,7 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 		},
 	}
 	if cfg.Observer != nil {
-		lock = cfg.Observer.wrap(lock, cfg.Identity)
+		lock = cfg.Observer.wrap(lock, cfg.Identity, cfg.Name)
 	}
 
 	for {
@@ -456,15 +457,16 @@ func release(cfg Config, log *slog.Logger) {
 // unchanged for one lease duration, which is the read at which a standby
 // takes the lease. A read that FAILS proves nothing about the holder: the
 // peer keeps counting, however long this process cannot read the Lease. The
-// one exception is the apiserver's NotFound: that is a definite answer, there
-// is no Lease, so no peer holds it and the standby reports again. (It does
-// not make this process the holder: acting still needs the election to
-// create and acquire the Lease.)
+// one exception is the apiserver's own NotFound for the Lease (see
+// leaseAbsent): that is a definite answer, there is no Lease, so no peer
+// holds it and the standby reports again. (It does not make this process the
+// holder: acting still needs the election to create and acquire the Lease.)
 type Observer struct {
 	now func() time.Time
 
 	mu       sync.Mutex
 	identity string
+	lease    string // the Lease name, to match a NotFound against
 	raw      []byte
 	holder   string
 	duration time.Duration
@@ -513,22 +515,24 @@ func (o *Observer) WaitFirstRead(ctx context.Context, maxWait time.Duration) {
 }
 
 // wrap returns lock with every read and every successful write recorded.
-func (o *Observer) wrap(lock resourcelock.Interface, identity string) resourcelock.Interface {
+// lease is the name of the Lease that lock reads.
+func (o *Observer) wrap(lock resourcelock.Interface, identity, lease string) resourcelock.Interface {
 	o.mu.Lock()
 	o.identity = identity
+	o.lease = lease
 	o.mu.Unlock()
 	return &observedLock{Interface: lock, obs: o}
 }
 
 func (o *Observer) read(rec *resourcelock.LeaderElectionRecord, raw []byte, err error) {
 	defer o.firstReadOnce.Do(func() { close(o.firstRead) })
-	if apierrors.IsNotFound(err) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if leaseAbsent(err, o.lease) {
 		// No Lease at all (deleted, or never created): nobody holds it. A
 		// replica out of the race must see this, or it would stay silent
 		// for a peer that is gone, and without a successful beat it never
 		// becomes eligible to create the Lease again.
-		o.mu.Lock()
-		defer o.mu.Unlock()
 		o.raw = nil
 		o.holder = ""
 		o.seenAt = time.Time{}
@@ -538,8 +542,6 @@ func (o *Observer) read(rec *resourcelock.LeaderElectionRecord, raw []byte, err 
 	if err != nil || rec == nil {
 		return // inconclusive: keep what the last good read showed
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	now := o.now()
 	if !bytes.Equal(raw, o.raw) {
 		o.raw = append(o.raw[:0], raw...)
@@ -548,6 +550,25 @@ func (o *Observer) read(rec *resourcelock.LeaderElectionRecord, raw []byte, err 
 	o.readAt = now
 	o.holder = rec.HolderIdentity
 	o.duration = time.Duration(rec.LeaseDurationSeconds) * time.Second
+}
+
+// leaseAbsent reports whether err is the apiserver's own answer that the
+// Lease named lease does not exist: a NotFound Status that client-go decoded
+// from the response, and whose details name that Lease. client-go also
+// reports an HTTP 404 without a Status (an HTML or text page from a proxy, a
+// routing failure) as NotFound. It marks that error as an unexpected server
+// response, and such a 404 proves nothing about the Lease. A NotFound for
+// another object proves nothing either.
+func leaseAbsent(err error, lease string) bool {
+	if !apierrors.IsNotFound(err) || apierrors.IsUnexpectedServerError(err) {
+		return false
+	}
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		return false
+	}
+	d := status.Status().Details
+	return d != nil && d.Kind == "leases" && d.Name == lease
 }
 
 // wrote records this process's own successful create or update: from then on
