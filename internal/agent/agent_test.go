@@ -354,14 +354,14 @@ func actingAgent(t *testing.T, beat http.HandlerFunc) (*Agent, *fake.Clientset) 
 			machines.MachineGVR:           "MachineList",
 		})
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", beat)
-	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /api/clusters/cl-0123abcd/heartbeat", beat)
+	mux.HandleFunc("GET /api/clusters/cl-0123abcd/desired", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"kubernetesVersion":null,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	ag := New(&config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cl-0123abcd",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 100 * time.Millisecond,
