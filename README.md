@@ -16,7 +16,9 @@ in-cluster agent-token the bash heartbeat uses.
 > capability is **server-gated** (the `/desired` `execution{}` flags computed
 > from tier × access × platform kill switch) with hard, unit-tested
 > guardrails; anything authorized-but-unbuilt is reported as an unsupported
-> action, never improvised. Control-plane upgrades stay user-driven.
+> action, never improvised. Acting is single-writer (a leader-elected Lease),
+> so running more than one replica is safe. Control-plane upgrades stay
+> user-driven.
 
 It complements, and does not replace, the lightweight bash **heartbeat CronJob**
 (registered tier). The Go rewrite exists because node facts must be **correct**:
@@ -46,7 +48,9 @@ recur — and the mapping is unit-tested as a regression guard.
   MachineDeployment patch (replicas / kubelet version) and Machine **delete**
   (self-healing, the sharpest permission the agent holds — loudly documented
   in `deploy/managed/rbac-managed.yaml`, removable independently) — is an
-  opt-in RBAC overlay (`deploy/managed/`), absent from the base entirely.
+  opt-in RBAC overlay (`deploy/managed/`), absent from the base entirely —
+  together with the acting Lease that makes the agent prove it is the only
+  actor before it writes anything.
   The base's one write, `patch` on `clusterinventories/status`, is a
   visibility mirror on the cluster's own reporting object (see the inventory
   section), not an acting permission.
@@ -99,6 +103,7 @@ recur — and the mapping is unit-tested as a regression guard.
 | `internal/machineissues` | ungated, fail-soft `machineIssues[]` collector (terminal errors, retry-loop events, join timeouts) |
 | `internal/executor` | the acting side: P3 replica patches, P5 heal deletes, P6 kubelet rolls + every safety rail |
 | `internal/actions` | in-memory action-report store (latest-revision-wins, diff-aware notify, stale-heal prune) |
+| `internal/leader` | the acting Lease: leader election gating the desired-state loop (one actor, or none) |
 | `internal/agent` | wiring: informers → coalescer → sender; poller → executor → actions → beats |
 | `internal/buildinfo` | build-stamped version |
 | `deploy/` | base (read-only) + `managed/` overlay (acting RBAC) — resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
@@ -300,9 +305,38 @@ How they work, truthfully:
    unhealthyAfterSeconds, cooldownSeconds}` policy. The ETag is treated as an
    **opaque token** (cached, echoed verbatim, never parsed) — a server-side
    format change costs one extra `200`, nothing else.
+   **Stale intent is not intent.** Neither a `304` nor a `200` proves
+   freshness: a proxy, a CDN or a broken gateway can serve either one from a
+   frozen copy forever, and healing asks to re-run on *every* tick. Every
+   request carries `Cache-Control: no-cache`, so a cache that obeys it must
+   ask the platform first. For a cache that does not, the agent
+   **revalidates** on its own cadence: every 5 polls, whatever those polls
+   returned, it fetches **unconditionally** (no `If-None-Match` — no cache may
+   answer that with a `304`), and only a document served to that request
+   counts as proof. Past 10 polls without proof an armed healer **stops
+   acting**, past 60 every other retry stops, and the refusal is reported as
+   a failed action ("the agent does not act on intent nobody re-affirmed").
+   Healing deletes machines, which is why it gets the tighter bound. The next
+   successful revalidation clears it.
+   **Unchanged intent is not re-run.** A revalidation that returns the same
+   document (compared in full: the flags can change without a new revision)
+   is treated like a `304`: a pass that already converged does not run
+   again, so a manual change made since (a pool scaled by hand) stays. Only
+   new intent, or a pass that asked for a re-run (a transient failure, an
+   armed healer), runs.
 2. **Acting is server-gated with no local enable.** There is *no* agent-side
    configuration that can turn any execution on; when the server says
-   `false` (or any 4xx), the agent acts on nothing and clears its reports. A
+   `false`, the agent acts on nothing and clears its reports. A **rejection**
+   (401/403, any other 4xx except 408/429, or a document that fails
+   validation) also **revokes** the cached document and its ETag: a later
+   `304` cannot bring it back, and the agent acts again only on a new
+   document. An **incomplete** document is rejected whole: a pool without
+   `desiredReplicas` (missing or `null` is not zero — zero would remove every
+   server of the pool), or an enabled healing policy with a missing number.
+   So is complete JSON with a field of the wrong type (`"desiredReplicas":
+   "3"`) and a body above 1 MiB. Only a body that is not complete JSON (a
+   transfer cut short) counts as a transient failure and keeps the cached
+   document until its freshness bound. A
    tier downgrade or kill-switch flip reaches the agent on its next poll
    (the flags are part of the ETag). 401/403 honor the full retry backoff,
    exactly like the heartbeat sender.
@@ -312,6 +346,24 @@ How they work, truthfully:
    `machinedeployments.cluster.k8s.io/v1alpha1`, KubeOne's machine-controller
    group (**not** `cluster.x-k8s.io`). The pool↔MD **name equality is the
    mapping contract**; an unmatched pool is skipped and reported `failed`.
+   Three things the scaling loop deliberately does **not** do, each reported
+   rather than improvised:
+   - **It never creates a pool.** A MachineDeployment carries the image,
+     network, SSH keys and cloud-init of your own provisioning, which the
+     agent may not invent (and the RBAC overlay grants `patch`, never
+     `create`). A desired pool with no MD reports `failed` — "the agent never
+     creates pools; create it with your own tooling (`lo provision` /
+     `kubeone apply`)" — instead of a forever-pending promise.
+   - **It never deletes a pool.** A MachineDeployment the document does not
+     declare is left alone and named once in the log. A delete would tear
+     down every server in the pool, and a document that dropped a pool looks
+     exactly like a partial one. Removing a pool stays a deliberate operator
+     action.
+   - **It never changes a machine type.** `workerPools[].machineType` is read
+     and *reported*: when it differs from the pool template's declared type
+     the scale action's detail says so ("machineType cpx41 not applied (pool
+     runs cpx31)"). Applying it would replace every server in the pool. An
+     unreadable template type reports nothing — unknown is not a mismatch.
 4. **Self-healing (P5): delete the Machine, let the cluster rebuild it.** A
    worker node continuously NotReady/Unknown for `unhealthyAfterSeconds`, or
    a machine whose node never appeared within `nodeStartupTimeoutSeconds`,
@@ -322,11 +374,40 @@ How they work, truthfully:
    `maxUnhealthy` deletes *nothing* and reports every candidate `failed`
    ("unhealthy count N exceeds maxUnhealthy M — refusing (possible outage)");
    at most `maxUnhealthy` disruptions in flight (any already-deleting machine
-   counts); per-pool `cooldownSeconds` with the agent's start time as
-   baseline (**restart = fresh cooldown** — a crash-looping agent can never
-   become a machine-delete loop); autoscaler-owned pools and unowned machines
-   are refused. Healing re-evaluates every poll tick; detection windows are
-   floored at 60 s agent-side.
+   counts); per-pool `cooldownSeconds`, **never below 5 minutes** whatever
+   the document says, with the agent's start time as baseline (**restart =
+   fresh cooldown** — a crash-looping agent can never become a machine-delete
+   loop); autoscaler-owned pools and unowned machines are refused. Healing
+   re-evaluates every poll tick; detection windows are floored at 60 s
+   agent-side.
+   **Three bounds owe nothing to the server's numbers** — `maxUnhealthy`, the
+   cooldown and the budget all arrive in the document, and one
+   wrong-but-plausible number (`maxUnhealthy: 50` on a 12-machine cluster)
+   satisfies every one of them:
+   - **Simultaneous failure is an outage, not hardware.** When *every* node of
+     a pool — or of the whole worker set, which is how one-machine pools are
+     covered — goes unhealthy inside 5 minutes, the agent refuses to
+     remediate anything there and reports why. Independent hardware does not
+     fail together; a partition, an apiserver outage or a control-plane
+     restart does, and those leave the servers alive and running your
+     workload while their nodes read `Unknown`. The agent cannot tell a dead
+     node from a partitioned one, so it does not guess.
+   - **Missing evidence refuses.** A not-Ready node that reports no Ready
+     transition time could have failed at the same moment as all the others,
+     so its pool is not healed until it does, and across the worker set it
+     counts as failed inside the window.
+   - **Healing acts on a pool only while at most a third of it is out of
+     service** (rounded down, floored at one machine, so small pools still
+     heal). Out of service is every machine slot without a Ready node: the
+     unhealthy machines themselves, a machine being deleted, a replacement
+     that has not joined or is not Ready yet (also one that failed and is a
+     candidate now), a replica that does not exist yet. Deleting a machine
+     that does not serve leaves the count as it is; only a machine that
+     serves again lowers it. So healing's own deletions never put more than
+     a third of a pool out of service, across passes and restarts, and a
+     pool that is out beyond that is not healed at all: every candidate
+     waits and is reported. This bounds the blast radius by the size of the
+     pool instead of by a number the platform sent.
    **Eviction unwedge (the bounded follow-through):** when the healed node is
    truly dead (kubelet stopped), machine-controller's eviction of the pods
    stuck Terminating there can never confirm, so the deleted Machine sits in
@@ -358,18 +439,52 @@ How they work, truthfully:
    with the credentials **it already holds**. The agent contains no hcloud
    token, no SSH key, no provisioner — revoking the platform's access is
    `kubectl delete ns kubehz-system` and nothing else changes.
-7. **Progress is reported, in memory only.** Every outcome
+7. **Exactly one replica acts.** Acting is gated on a leader-elected Lease
+   (`kubehz-system/kubehz-live-agent`, RBAC in `deploy/managed/`): the poller
+   and the executor start only while this replica holds it. When the lease
+   is lost, or the agent shuts down, acting is cancelled **first**, and the
+   agent waits for it to return before anything else happens: it does not
+   contend again while acting may still run, and on shutdown it keeps the
+   lease renewed until acting has returned and only then releases it. The
+   successor begins with a fresh cooldown baseline and this replica clears
+   its action reports. The reason is concrete: the per-pool cooldown, the
+   in-flight budget and the one-pool-at-a-time roll are per-*process* state,
+   so two actors would double every one of those bounds.
+   **No Lease, no acting**: without the coordination RBAC (or the API) the
+   agent keeps reporting and never acts, and after two minutes without the
+   lease it says so in its log — it cannot tell a peer holding the lease from
+   a missing grant or an unreachable apiserver, so the one warning names all
+   three. Running more than one replica is therefore safe. While a peer holds
+   the lease, a standby sends **no heartbeats**: the platform keeps one
+   action snapshot per cluster and reads a beat without actions as "clear",
+   so a standby's beats would erase the holder's reports. The holder reports
+   the same live view. The check runs before every send, a retry too, so a
+   beat queued before the standby saw the peer is dropped, not sent late. A
+   standby reports again when the lease is free, when a read finds it
+   unchanged for one lease duration, or when the apiserver answers that the
+   Lease does not exist (deleted). Only the apiserver's own answer counts: a
+   404 page from a proxy or a router is not one. Any other failed read
+   changes nothing, so a standby that cannot read the Lease stays silent.
+   Because the holder is then the only reporter, **a holder whose
+   heartbeats fail for 5 minutes steps down**: it stops acting, releases
+   the lease, and does not contend again until one of its heartbeats goes
+   through, so a replica that can reach the platform takes over. On
+   shutdown the process waits for the drain and the release before it exits
+   (the default 30 s grace period covers both). Upgrading from an agent
+   that predates this: re-apply `deploy/managed/`.
+8. **Progress is reported, in memory only.** Every outcome
    (`pending → in-progress → done/failed`, with the acted `revision`) rides
    the heartbeat's `actions[]`; stale heal reports for self-recovered nodes
    are pruned. Restart = re-poll + reconverge; because the executors are
    idempotent, that costs zero cluster writes.
 
-The acting RBAC — `patch` on machinedeployments (replicas + kubelet version)
-and read + **delete** on machines (kube-system-scoped Roles), plus a
-pods-**delete**-only ClusterRole for the eviction unwedge (the stuck pods
-span arbitrary namespaces, which no namespaced Role can express) — is an
-**opt-in overlay**: `kubectl apply -k deploy/managed/`, absent from the
-registered-tier base. The machines **delete** verb exists solely for P5 and
+The acting RBAC — list + `patch` on machinedeployments (replicas + kubelet
+version) and list + **delete** on machines (kube-system-scoped Roles), a
+`coordination.k8s.io` Lease Role in `kubehz-system` (the single-actor proof;
+without it the agent refuses to act at all), plus a pods-**delete**-only
+ClusterRole for the eviction unwedge (the stuck pods span arbitrary
+namespaces, which no namespaced Role can express) — is an **opt-in overlay**:
+`kubectl apply -k deploy/managed/`, absent from the registered-tier base. The machines **delete** verb exists solely for P5 and
 is loudly documented in `deploy/managed/rbac-managed.yaml`; drop that one
 verb and healing fails closed (reported `Forbidden`) while everything else
 keeps working. Drop the unwedge ClusterRole and only the unwedge is
@@ -392,6 +507,7 @@ disabled — healing itself is unaffected. See
 | `KUBEHZ_MD_NAMESPACE` | `kube-system` | where the executor looks for MachineDeployments |
 | `KUBEHZ_MAX_REPLICAS` | `50` | per-pool ceiling; out-of-bounds desired is **refused**, not clamped |
 | `KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS` | `300` | how long a heal-deleted machine may sit deleting (node still dead) before the one-shot eviction unwedge; min 60 |
+| `KUBEHZ_POD_NAME` | — (downward API) | this replica's name in the acting Lease's `holderIdentity`; falls back to the hostname |
 | `KUBEHZ_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 
 None of these enable acting — execution is authorized exclusively by the
@@ -417,6 +533,13 @@ path needs a rollout restart.
 go build ./...
 go test -race ./...
 go vet ./... && gofmt -l .
+
+# Integration: the SCALING loop against a REAL apiserver (every other test
+# drives a fake client). CI runs this on a throwaway kind cluster; by hand:
+kind create cluster --name kubehz-agent-it \
+  --image kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+go test -tags integration -count=1 -v ./test/integration/...
+kind delete cluster --name kubehz-agent-it
 
 # container (pinned distroless/static, non-root, read-only rootfs)
 docker build -t kubehz-agent:dev --build-arg VERSION=dev .
@@ -504,7 +627,6 @@ dogfood convenience, so its absence must never hold up a customer release.
 - **Dashboard** live surfaces (nodes capacity/instance-type, workloads card,
   "reported n s ago"). Harden `readyNodeCount` to use the explicit `ready` bool
   (the current regex substring-matches `NotReady` as ready) and key off `schema`.
-- **HA:** leader-elected Lease (`kubehz-system`) for multi-replica.
 - **Observed pools:** a MachineDeployment informer feeding `pools[]` (observed
   replicas/ready per pool) once the API ingests it — closes the
   desired→observed convergence loop in the dashboard; apps deployments

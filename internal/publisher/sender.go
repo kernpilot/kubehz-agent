@@ -16,15 +16,23 @@ import (
 // (coalescing at the delivery layer too). This guarantees the informer/
 // coalescer goroutine NEVER blocks on the network, and the freshest state is
 // always what gets sent.
+//
+// A gate (SetGate) can hold the sends back: it is asked before EVERY send,
+// a retry included, and while it is closed the pending payload is dropped,
+// not kept for later. The Sender also tracks how long its sends have failed
+// without a success in between (FailingFor).
 type Sender struct {
 	pub        *Publisher
 	newBackoff func() *Backoff
 	log        *slog.Logger
 	afterFunc  func(time.Duration) <-chan time.Time // injectable timer for tests
+	now        func() time.Time                     // injectable clock for tests
+	gate       func() bool
 
-	mu     sync.Mutex
-	latest *state.Payload
-	wake   chan struct{}
+	mu           sync.Mutex
+	latest       *state.Payload
+	wake         chan struct{}
+	failingSince time.Time // first failure since the last success; zero = none
 }
 
 // NewSender builds a Sender. logger may be nil (discards). baseBackoff/maxBackoff
@@ -38,8 +46,41 @@ func NewSender(pub *Publisher, baseBackoff, maxBackoff time.Duration, logger *sl
 		newBackoff: func() *Backoff { return NewBackoff(baseBackoff, maxBackoff) },
 		log:        logger,
 		afterFunc:  time.After,
+		now:        time.Now,
 		wake:       make(chan struct{}, 1),
 	}
+}
+
+// SetGate installs the send gate. Call it before Run. While gate returns
+// false nothing is sent: the pending payload is dropped, and the next
+// Enqueue brings a fresh one. A dropped payload is neither a success nor a
+// failure for FailingFor. nil removes the gate.
+func (s *Sender) SetGate(gate func() bool) { s.gate = gate }
+
+// FailingFor reports how long the sends have failed: the time since the
+// first failed send after the last successful one, or zero when the last
+// send went through (or none failed yet).
+func (s *Sender) FailingFor() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failingSince.IsZero() {
+		return 0
+	}
+	return s.now().Sub(s.failingSince)
+}
+
+func (s *Sender) failed() {
+	s.mu.Lock()
+	if s.failingSince.IsZero() {
+		s.failingSince = s.now()
+	}
+	s.mu.Unlock()
+}
+
+func (s *Sender) succeeded() {
+	s.mu.Lock()
+	s.failingSince = time.Time{}
+	s.mu.Unlock()
 }
 
 // Enqueue stores the payload as the latest to send and wakes the sender. It is
@@ -89,15 +130,23 @@ func (s *Sender) Run(ctx context.Context) {
 			if p == nil {
 				break
 			}
+			// The gate is asked before every attempt, a retry too: a payload
+			// queued while the gate was open must not go out after it closed.
+			if s.gate != nil && !s.gate() {
+				s.clearIfSame(p)
+				continue
+			}
 			err := s.pub.Publish(ctx, p)
 			if err == nil {
 				s.clearIfSame(p)
+				s.succeeded()
 				backoff.Reset()
 				continue
 			}
 			if ctx.Err() != nil {
 				return
 			}
+			s.failed()
 
 			var authErr *AuthError
 			if errors.As(err, &authErr) && s.reloadToken(ctx) {

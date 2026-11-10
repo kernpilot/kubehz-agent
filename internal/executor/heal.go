@@ -21,9 +21,19 @@
 //     cluster-wide; ANY already-deleting machine (ours, a scale-down, a P6
 //     roll replacement) counts against the budget — conservative on purpose.
 //   - PER-POOL COOLDOWN: cooldownSeconds between remediations in the same
-//     pool, with the executor's construction time as a baseline — an agent
+//     pool, FLOORED at minHealCooldown agent-side (a document cannot lower
+//     it), with the executor's construction time as a baseline — an agent
 //     RESTART starts a fresh cooldown, so a crash-looping agent can never
 //     become a machine-delete loop.
+//   - LOCAL SANITY BOUNDS, owed to no server number: healing acts on a pool
+//     only while at most a THIRD of it (floored at one machine) is out of
+//     service, and every machine slot without a Ready node counts, the
+//     remediation candidates and the failed replacements included; a pool — or
+//     the whole worker set — whose nodes ALL went unhealthy inside one short
+//     window is refused outright; and a pool with a not-Ready node whose
+//     failure time is unknown is refused too. Simultaneous failure is an
+//     outage or a partition, and a partitioned node is indistinguishable
+//     from a dead one from here. See localBoundsFor.
 //   - AUTOSCALER POOLS are skipped (refused loudly): the cluster-autoscaler
 //     owns their machine lifecycle; fighting it is worse than a NotReady node.
 //   - UNOWNED machines are refused: deleting a Machine no MachineSet/
@@ -74,6 +84,109 @@ import (
 // would fight the kubelet's own grace periods.
 const minDetectionWindow = 60 * time.Second
 
+// minHealCooldown is the agent-side FLOOR for cooldownSeconds. The cooldown
+// is a server number, and a document that sends 0 would let healing delete
+// machines of one pool back to back, pass after pass. With the floor a pool
+// loses at most one machine to healing per five minutes, whatever the
+// document says.
+const minHealCooldown = 5 * time.Minute
+
+// LOCAL SANITY BOUNDS. maxUnhealthy, the cooldown and the in-flight budget are
+// all SERVER-owned numbers, and a wrong-but-plausible document (maxUnhealthy
+// 50 on a 12-machine cluster) satisfies every one of them while real servers
+// are torn down one cooldown apart. The bounds below need no server input:
+// they are computed from what the agent sees in its own cluster.
+const (
+	// healFractionNumerator/healFractionDenominator cap how much of a pool
+	// may be OUT OF SERVICE while healing acts on it: rounded down, floored
+	// at one so a small pool still heals. Out of service is the pool's
+	// intended size minus its machines that back a Ready node. That counts
+	// every candidate, every machine being deleted, every replacement that
+	// has not joined or is not Ready yet (a failed replacement that became a
+	// candidate itself too) and every replica that does not exist yet.
+	//
+	// Deleting a machine that does not serve does not change this count, so
+	// a deletion never "frees" room: room comes back only when a machine
+	// serves again. Healing can therefore never have more than this fraction
+	// of a pool out of service because of its own deletions, across passes
+	// and restarts, and the blast radius never scales with a number the
+	// platform sent. A pool that is out of service beyond the fraction is
+	// not healed by the agent at all: that is an outage, not node hardware.
+	healFractionNumerator   = 1
+	healFractionDenominator = 3
+
+	// simultaneousFailureWindow: nodes that ALL stop reporting inside this
+	// window failed TOGETHER. Independent hardware does not do that; a network
+	// partition, an apiserver outage or a control-plane restart does — and in
+	// those the servers are alive and still running the user's workload while
+	// their nodes read Unknown. The agent cannot tell a dead node from a
+	// partitioned one, so it does not guess: it refuses and reports.
+	//
+	// Five minutes, not seconds: the node controller flips every unreachable
+	// node within one grace period, and a partition that spreads over a few
+	// minutes is still a partition. The cost of the wide window is a delayed
+	// remediation, which the cluster survives; the cost of a narrow one is a
+	// deleted healthy server.
+	simultaneousFailureWindow = 5 * time.Minute
+
+	// minSimultaneousNodes: simultaneity needs at least two nodes to mean
+	// anything. A one-node pool has nothing to fail together with, and
+	// refusing there would disable healing for exactly the case it exists for
+	// (the cluster-wide check still covers such pools).
+	minSimultaneousNodes = 2
+)
+
+// poolCensus is the LOCAL evidence one pass has about a pool: its intended
+// size, how many of its machines serve (back a Ready node), how many of them
+// joined a node, when each unhealthy node last changed its Ready condition,
+// which not-Ready nodes report no such time, and how many candidates it
+// produced.
+type poolCensus struct {
+	md         *unstructured.Unstructured
+	machines   int // not deleting
+	all        int // including deleting
+	serving    int // not deleting, backing a Ready node
+	nodes      int
+	unhealthy  []time.Time
+	unknown    []string // not Ready, no Ready transition time
+	candidates int
+}
+
+// size is the pool's intended size: the MachineDeployment's spec.replicas,
+// never below the machines that exist (a scale-down in progress). Without a
+// readable spec.replicas every machine counts, deleting ones included — the
+// conservative direction.
+func (c *poolCensus) size() int {
+	if c.md != nil {
+		if r, ok := currentReplicas(c.md); ok {
+			return max(int(r), c.machines)
+		}
+	}
+	return c.all
+}
+
+// localBounds is what the cluster's own state says one pass may do:
+// refuseEverything (an outage signature across the whole worker set),
+// refusePool (the same signature, or missing evidence, inside one pool),
+// maxOut (the fraction cap per pool), size (the pool's intended size) and
+// outOfService (the pool's slots without a serving machine).
+type localBounds struct {
+	refuseEverything string
+	refusePool       map[string]string
+	maxOut           map[string]int
+	size             map[string]int
+	outOfService     map[string]int
+}
+
+// capFor is how many machines of one pool may be out of service while
+// healing acts on it.
+func (b localBounds) capFor(pool string) int {
+	if n, ok := b.maxOut[pool]; ok {
+		return n
+	}
+	return 1
+}
+
 // healCandidate is one unhealthy worker machine.
 type healCandidate struct {
 	machineName string
@@ -91,7 +204,7 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 	now := e.now()
 	unhealthyAfter := flooredWindow(pol.UnhealthyAfterSeconds)
 	startupTimeout := flooredWindow(pol.NodeStartupTimeoutSeconds)
-	cooldown := time.Duration(pol.CooldownSeconds) * time.Second
+	cooldown := flooredCooldown(pol.CooldownSeconds)
 
 	lctx, cancel := context.WithTimeout(ctx, callTimeout)
 	mds, err := machines.ListMachineDeployments(lctx, e.dyn, e.namespace)
@@ -214,6 +327,9 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 		return
 	}
 
+	// ── LOCAL SANITY BOUNDS (independent of the server's numbers).
+	bounds := e.localBoundsFor(cands, machineList, nodes, byNodeName, resolver)
+
 	budget := pol.MaxUnhealthy - inFlight
 	halted := false
 	for _, c := range cands {
@@ -232,6 +348,10 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			key, _ := hasAutoscalerAnnotations(c.md)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed,
 				"refusing to heal: pool "+c.pool+" is managed by cluster-autoscaler ("+key+" present)")
+		case bounds.refuseEverything != "":
+			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed, bounds.refuseEverything)
+		case bounds.refusePool[c.pool] != "":
+			e.reportHeal(doc.Revision, c.machineName, state.ActionFailed, bounds.refusePool[c.pool])
 		case budget <= 0:
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("waiting: %d disruption(s) already in flight (maxUnhealthy %d)", inFlight, pol.MaxUnhealthy))
@@ -239,6 +359,11 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			wait := (cooldown - now.Sub(e.lastHealTime(c.pool))).Truncate(time.Second)
 			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
 				fmt.Sprintf("cooldown: next remediation in pool %s allowed in %s", c.pool, wait))
+		case bounds.outOfService[c.pool] > bounds.capFor(c.pool):
+			e.reportHeal(doc.Revision, c.machineName, state.ActionPending,
+				fmt.Sprintf("waiting: pool %s has %d of its %d machines out of service (not Ready, not joined, deleting or not created yet); healing acts on a pool only while at most %d/%d of it (%d) is out of service",
+					c.pool, bounds.outOfService[c.pool], bounds.size[c.pool],
+					healFractionNumerator, healFractionDenominator, bounds.capFor(c.pool)))
 		default:
 			if !e.remediate(ctx, doc.Revision, c, now) {
 				halted = true // §3 halt-on-failure: queue the rest, retry next poll
@@ -248,6 +373,191 @@ func (e *Executor) healPass(ctx context.Context, doc *desired.Doc) {
 			}
 		}
 	}
+}
+
+// localBoundsFor reads the cluster's OWN evidence and returns what this pass
+// may do. Three rules, all computed locally, all refusal-biased:
+//
+//  1. SIMULTANEOUS FAILURE → refuse. Every node of a pool (or of the whole
+//     worker set) unhealthy, with the Ready transitions inside
+//     simultaneousFailureWindow, is an outage or a partition, not hardware.
+//     Deleting those machines would destroy healthy capacity to "fix" a
+//     reachability problem. Needs at least minSimultaneousNodes nodes — one
+//     node has nothing to be simultaneous with.
+//  2. MISSING EVIDENCE → refuse. A not-Ready node without a Ready transition
+//     time could have failed at the same moment as all the others, so it
+//     never weakens rule 1: inside its pool it refuses remediation outright,
+//     and across the worker set it counts as failed inside the window.
+//  3. FRACTION → cap. Healing acts on a pool only while at most healFraction
+//     of it (floored at one machine) is out of service. Out of service is
+//     the pool's intended size minus its serving machines, with NOTHING taken
+//     off: the candidates count, and so do the disruptions of earlier passes
+//     that have not recovered (a machine being deleted, a replacement not yet
+//     Ready or one that failed and became a candidate, a replica not yet
+//     created). A deletion does not change the count, and only a machine
+//     that serves again lowers it. maxUnhealthy cannot express this: it is
+//     one absolute number for clusters of any size.
+//
+// Rule 3 also stops every pool that rule 1 refuses (a pool with no serving
+// node is out of service beyond the fraction). Rule 1 still runs: it names
+// the cause and reports a refusal instead of a wait, and the cluster-wide
+// form covers one-machine pools, which the fraction cannot.
+func (e *Executor) localBoundsFor(
+	cands []healCandidate,
+	machineList []unstructured.Unstructured,
+	nodes []*corev1.Node,
+	byNodeName map[string]*unstructured.Unstructured,
+	resolver *machines.PoolResolver,
+) localBounds {
+	census := make(map[string]*poolCensus)
+	entry := func(pool string) *poolCensus {
+		c, ok := census[pool]
+		if !ok {
+			c = &poolCensus{}
+			census[pool] = c
+		}
+		return c
+	}
+
+	for i := range machineList {
+		m := &machineList[i]
+		pool, md := resolver.PoolFor(m)
+		if pool == "" {
+			continue
+		}
+		c := entry(pool)
+		c.md = md
+		c.all++
+		if !machines.Deleting(m) {
+			c.machines++
+		}
+	}
+
+	clusterNodes := 0
+	clusterUnknown := 0
+	var clusterUnhealthy []time.Time
+	for _, node := range nodes {
+		if node == nil || isControlPlaneNode(node) {
+			continue
+		}
+		m := byNodeName[node.Name]
+		if m == nil {
+			continue // no backing machine (static worker): not healable, not evidence
+		}
+		pool, _ := resolver.PoolFor(m)
+		if pool == "" {
+			continue
+		}
+		c := entry(pool)
+		c.nodes++
+		clusterNodes++
+		status, since := nodeReadyCondition(node)
+		switch {
+		case status == corev1.ConditionTrue:
+			c.serving++
+		case since.IsZero():
+			c.unknown = append(c.unknown, node.Name)
+			clusterUnknown++
+		default:
+			c.unhealthy = append(c.unhealthy, since)
+			clusterUnhealthy = append(clusterUnhealthy, since)
+		}
+	}
+
+	for _, c := range cands {
+		if c.pool != "" {
+			entry(c.pool).candidates++
+		}
+	}
+
+	bounds := localBounds{
+		refusePool:   make(map[string]string, len(census)),
+		maxOut:       make(map[string]int, len(census)),
+		size:         make(map[string]int, len(census)),
+		outOfService: make(map[string]int, len(census)),
+	}
+	for pool, c := range census {
+		size := c.size()
+		bounds.size[pool] = size
+		bounds.maxOut[pool] = maxOutOfService(size)
+		bounds.outOfService[pool] = max(0, size-c.serving)
+	}
+
+	// An unknown failure time could be the same time as every other one.
+	if clusterNodes >= minSimultaneousNodes &&
+		len(clusterUnhealthy)+clusterUnknown == clusterNodes &&
+		(len(clusterUnhealthy) == 0 || withinWindow(clusterUnhealthy)) {
+		bounds.refuseEverything = fmt.Sprintf(
+			"refusing to heal: all %d worker nodes went unhealthy within %s — an outage or a partition, not node hardware",
+			clusterNodes, simultaneousFailureWindow)
+		e.log.Warn("heal: every worker node failed at once; refusing all remediation",
+			"nodes", clusterNodes, "window", simultaneousFailureWindow.String())
+		return bounds
+	}
+
+	for _, pool := range sortedKeys(census) {
+		c := census[pool]
+		if c.candidates == 0 {
+			continue
+		}
+		if len(c.unknown) > 0 {
+			sort.Strings(c.unknown)
+			bounds.refusePool[pool] = fmt.Sprintf(
+				"refusing to heal: node %s of pool %s is not Ready and reports no Ready transition time — without it the agent cannot rule out a simultaneous failure",
+				c.unknown[0], pool)
+			e.log.Warn("heal: a not-Ready node reports no Ready transition time; refusing its pool's remediation",
+				"pool", pool, "node", c.unknown[0])
+			continue
+		}
+		if c.nodes >= minSimultaneousNodes && len(c.unhealthy) == c.nodes && withinWindow(c.unhealthy) {
+			bounds.refusePool[pool] = fmt.Sprintf(
+				"refusing to heal: all %d nodes of pool %s went unhealthy within %s — an outage or a partition, not node hardware",
+				c.nodes, pool, simultaneousFailureWindow)
+			e.log.Warn("heal: every node of a pool failed at once; refusing its remediation",
+				"pool", pool, "nodes", c.nodes, "window", simultaneousFailureWindow.String())
+		}
+	}
+	return bounds
+}
+
+// maxOutOfService is how many machines of a pool of this size may be out of
+// service while healing acts on it: the configured fraction, rounded down,
+// floored at one.
+func maxOutOfService(poolSize int) int {
+	n := poolSize * healFractionNumerator / healFractionDenominator
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// withinWindow reports whether every transition time lies inside
+// simultaneousFailureWindow (first to last).
+func withinWindow(times []time.Time) bool {
+	if len(times) == 0 {
+		return false
+	}
+	first, last := times[0], times[0]
+	for _, t := range times[1:] {
+		if t.Before(first) {
+			first = t
+		}
+		if t.After(last) {
+			last = t
+		}
+	}
+	return last.Sub(first) <= simultaneousFailureWindow
+}
+
+// sortedKeys returns a map's keys in a deterministic order (log and report
+// order must not depend on map iteration).
+func sortedKeys(m map[string]*poolCensus) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // remediate deletes one candidate's Machine, reporting in-progress →
@@ -302,6 +612,16 @@ func (e *Executor) reportHeal(revision int, target, status, detail string) {
 	})
 }
 
+// flooredCooldown converts cooldownSeconds to a duration, flooring at
+// minHealCooldown (a longer pause is safe; a shorter one is not).
+func flooredCooldown(seconds int) time.Duration {
+	d := time.Duration(seconds) * time.Second
+	if d < minHealCooldown {
+		return minHealCooldown
+	}
+	return d
+}
+
 // flooredWindow converts a policy seconds value to a duration, flooring at
 // minDetectionWindow (tightening a guardrail is safe; loosening never is).
 func flooredWindow(seconds int) time.Duration {
@@ -314,7 +634,8 @@ func flooredWindow(seconds int) time.Duration {
 
 // nodeReadyCondition extracts the node's Ready condition status and its
 // lastTransitionTime. A node WITHOUT a Ready condition reports Unknown with a
-// zero time — the caller skips it (no way to establish a duration).
+// zero time. Detection skips such a node (no way to establish a duration),
+// and the local bounds read it as missing evidence and refuse its pool.
 func nodeReadyCondition(node *corev1.Node) (corev1.ConditionStatus, time.Time) {
 	for _, c := range node.Status.Conditions {
 		if c.Type == corev1.NodeReady {

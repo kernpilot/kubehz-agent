@@ -250,8 +250,9 @@ func TestClient_AuthErrors(t *testing.T) {
 	}
 }
 
-// Any other failure (5xx, other 4xx, garbage body, negative revision) is a
-// generic error: no document, so the caller acts on nothing (report-only).
+// Any other failure (5xx, other 4xx, garbage body, negative revision) is an
+// error that is not an AuthError: no document, so the caller acts on nothing
+// (report-only). TestClient_ClassifiesRejections covers which are rejections.
 func TestClient_RejectsBadResponses(t *testing.T) {
 	cases := []struct {
 		name string
@@ -284,5 +285,195 @@ func TestClient_EscapesClusterID(t *testing.T) {
 	c := NewClient("https://api.kubehz.cloud", "a/../b", testToken, "0.1.0", nil)
 	if strings.Contains(c.URL(), "a/../b") {
 		t.Errorf("cluster ID not escaped: %s", c.URL())
+	}
+}
+
+// Revalidate must ask the ORIGIN: no If-None-Match, plus no-cache so no
+// intermediary may answer from a stored copy. It exists because a 304 proves
+// nothing about freshness — anything in the path can serve one forever.
+func TestClient_RevalidateBypassesCaches(t *testing.T) {
+	const etag = `"3-10"`
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write([]byte(docBody))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	if _, _, err := c.Fetch(context.Background()); err != nil { // caches the ETag
+		t.Fatalf("priming fetch: %v", err)
+	}
+	doc, notModified, err := c.Revalidate(context.Background())
+	if err != nil || notModified || doc == nil {
+		t.Fatalf("revalidate: doc=%v notModified=%v err=%v", doc, notModified, err)
+	}
+	if v := got.Get("If-None-Match"); v != "" {
+		t.Errorf("revalidation sent If-None-Match %q — a conditional request can be answered 304 by any cache", v)
+	}
+	if v := got.Get("Cache-Control"); v != "no-cache" {
+		t.Errorf("revalidation Cache-Control = %q, want no-cache", v)
+	}
+}
+
+// A 304 to an unconditional request is a broken cache answering, never an
+// affirmation — the client reports it as an error so the poller counts the
+// poll as unaffirmed.
+func TestClient_Revalidate304IsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	doc, notModified, err := c.Revalidate(context.Background())
+	if err == nil {
+		t.Fatalf("revalidate accepted a 304: doc=%v notModified=%v", doc, notModified)
+	}
+	if !strings.Contains(err.Error(), "304") {
+		t.Errorf("error = %q, want it to name the 304", err.Error())
+	}
+	if doc != nil || notModified {
+		t.Errorf("a rejected revalidation must yield no document: doc=%v notModified=%v", doc, notModified)
+	}
+}
+
+// fetchBody serves body once and returns what Fetch makes of it.
+func fetchBody(t *testing.T, body string) (*Doc, error) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	doc, _, err := NewClient(srv.URL, "d", testToken, "0.1.0", srv.Client()).Fetch(context.Background())
+	return doc, err
+}
+
+// MISSING IS NOT ZERO. A pool without desiredReplicas would decode as 0, and
+// the scaling executor would patch the pool to zero machines. An incomplete
+// document is a rejection, never intent; only an explicit 0 means zero.
+func TestClient_RejectsIncompleteIntent(t *testing.T) {
+	const execOn = `"execution":{"scaling":true,"upgrades":false,"healing":true}`
+	for name, body := range map[string]string{
+		"pool without desiredReplicas": `{"revision":3,"kubernetesVersion":null,"workerPools":[{"name":"pool-a"}],` + execOn + `}`,
+		"pool with null desiredReplicas": `{"revision":3,"kubernetesVersion":null,` +
+			`"workerPools":[{"name":"pool-a","desiredReplicas":null}],` + execOn + `}`,
+		"pool without a name": `{"revision":3,"kubernetesVersion":null,"workerPools":[{"desiredReplicas":3}],` + execOn + `}`,
+		"armed healing without cooldownSeconds": `{"revision":3,"kubernetesVersion":null,"workerPools":[],` + execOn + `,` +
+			`"healing":{"enabled":true,"maxUnhealthy":2,"nodeStartupTimeoutSeconds":600,"unhealthyAfterSeconds":300}}`,
+		"armed healing with null maxUnhealthy": `{"revision":3,"kubernetesVersion":null,"workerPools":[],` + execOn + `,` +
+			`"healing":{"enabled":true,"maxUnhealthy":null,"nodeStartupTimeoutSeconds":600,"unhealthyAfterSeconds":300,"cooldownSeconds":900}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			doc, err := fetchBody(t, body)
+			if doc != nil {
+				t.Fatalf("incomplete intent decoded into a document: %+v", doc)
+			}
+			var rejected *RejectedError
+			if !errors.As(err, &rejected) || rejected.Status != http.StatusOK {
+				t.Errorf("err = %v, want a *RejectedError carrying the 200", err)
+			}
+		})
+	}
+
+	for name, body := range map[string]string{
+		"explicit zero replicas": `{"revision":3,"kubernetesVersion":null,` +
+			`"workerPools":[{"name":"pool-a","desiredReplicas":0}],` + execOn + `}`,
+		"healing off without numbers": `{"revision":3,"kubernetesVersion":null,"workerPools":[],` + execOn + `,` +
+			`"healing":{"enabled":false}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			doc, err := fetchBody(t, body)
+			if err != nil || doc == nil {
+				t.Fatalf("complete intent rejected: %v", err)
+			}
+		})
+	}
+}
+
+// The poller revokes the cached document on a REJECTION and keeps it on a
+// transient failure, so the classification is part of the contract.
+func TestClient_ClassifiesRejections(t *testing.T) {
+	for name, tc := range map[string]struct {
+		h         http.HandlerFunc
+		rejection bool
+	}{
+		"401": {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(401) }, true},
+		"403": {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(403) }, true},
+		"404": {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(404) }, true},
+		"410": {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(410) }, true},
+		"negative revision": {func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":-1,"kubernetesVersion":null,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`))
+		}, true},
+		// Complete JSON with a field of the wrong type is the platform's whole
+		// answer, not a transfer cut short.
+		"wrong field type": {func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":4,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":"3"}],"execution":{"scaling":true,"upgrades":false}}`))
+		}, true},
+		"wrong top-level type": {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) }, true},
+		"oversized body": {func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":4,"pad":"` + strings.Repeat("x", maxBodyBytes) + `"}`))
+		}, true},
+		"408":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(408) }, false},
+		"429":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(429) }, false},
+		"500":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) }, false},
+		"503":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }, false},
+		"garbage body": {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{nope")) }, false},
+		"cut short":    {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"revision":4,"workerPools":[`)) }, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(tc.h)
+			defer srv.Close()
+			_, _, err := NewClient(srv.URL, "d", testToken, "0.1.0", srv.Client()).Fetch(context.Background())
+			if err == nil {
+				t.Fatal("no error")
+			}
+			if got := IsRejection(err); got != tc.rejection {
+				t.Errorf("IsRejection(%v) = %v, want %v", err, got, tc.rejection)
+			}
+		})
+	}
+}
+
+// After ForgetETag the next Fetch carries no validator, so a 304 cannot bring
+// back a representation the platform revoked. Every request, the conditional
+// one too, asks for the origin's own answer (no-cache).
+func TestClient_ForgetETagAndNoCache(t *testing.T) {
+	var mu sync.Mutex
+	var seen []http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Clone())
+		mu.Unlock()
+		w.Header().Set("ETag", `"3-10"`)
+		_, _ = w.Write([]byte(docBody))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	for i := 0; i < 2; i++ {
+		if _, _, err := c.Fetch(context.Background()); err != nil {
+			t.Fatalf("fetch %d: %v", i, err)
+		}
+	}
+	c.ForgetETag()
+	if _, _, err := c.Fetch(context.Background()); err != nil {
+		t.Fatalf("fetch after ForgetETag: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := seen[1].Get("If-None-Match"); got != `"3-10"` {
+		t.Fatalf("second fetch If-None-Match = %q, want the cached ETag", got)
+	}
+	if got := seen[2].Get("If-None-Match"); got != "" {
+		t.Errorf("fetch after ForgetETag sent If-None-Match %q", got)
+	}
+	for i, h := range seen {
+		if h.Get("Cache-Control") != "no-cache" || h.Get("Pragma") != "no-cache" {
+			t.Errorf("request %d: Cache-Control %q, Pragma %q, want no-cache on every request",
+				i, h.Get("Cache-Control"), h.Get("Pragma"))
+		}
 	}
 }

@@ -106,6 +106,48 @@ func MDKubeletVersion(md *unstructured.Unstructured) string {
 	return v
 }
 
+// MDMachineType returns the machine type the pool template declares, or ""
+// when it cannot be read.
+//
+// machine-controller keeps the provider configuration as raw JSON in
+// MachineSpec.ProviderSpec.Value (a runtime.RawExtension), so on an
+// unstructured MachineDeployment it is a nested map:
+//
+//	spec.template.spec.providerSpec.value.cloudProviderSpec.serverType
+//
+// Hetzner names the field serverType; other providers name it instanceType,
+// and both are read. Each is a machine-controller ConfigVarString, which
+// serializes either as a plain string ("cpx31") or as an object
+// ({"value":"cpx31"}). A Secret/ConfigMap reference carries no literal and
+// reads as "" — the caller must treat "" as UNKNOWN and never as a mismatch.
+func MDMachineType(md *unstructured.Unstructured) string {
+	spec, found, err := unstructured.NestedMap(md.Object,
+		"spec", "template", "spec", "providerSpec", "value", "cloudProviderSpec")
+	if !found || err != nil {
+		return ""
+	}
+	for _, key := range []string{"serverType", "instanceType"} {
+		if v := configVarString(spec[key]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// configVarString reads a machine-controller ConfigVarString: a plain string,
+// or an object carrying a literal "value". Anything else reads as "".
+func configVarString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case map[string]any:
+		if s, ok := t["value"].(string); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
 // Deleting reports whether the object carries a deletionTimestamp (machine-
 // controller is already draining/deprovisioning it).
 func Deleting(m *unstructured.Unstructured) bool {

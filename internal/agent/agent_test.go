@@ -10,9 +10,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -20,11 +22,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/kernpilot/kubehz-agent/internal/config"
 	"github.com/kernpilot/kubehz-agent/internal/executor"
 	"github.com/kernpilot/kubehz-agent/internal/inventory"
+	"github.com/kernpilot/kubehz-agent/internal/leader"
+	"github.com/kernpilot/kubehz-agent/internal/leader/leasetest"
 	"github.com/kernpilot/kubehz-agent/internal/machines"
 	"github.com/kernpilot/kubehz-agent/internal/state"
 )
@@ -236,6 +241,384 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not stop after context cancel")
 	}
+}
+
+// A STANDBY sends no beats while another replica holds the acting lease. The
+// platform keeps one action snapshot per cluster, latest-wins, and reads a
+// beat without actions[] as "clear", so a standby's beats would erase the
+// holder's outcomes and refusals. Once the peer's lease runs out (it stops
+// renewing), the standby reports again.
+func TestAgent_StandbySendsNoBeatsWhileAPeerHoldsTheLease(t *testing.T) {
+	now := metav1.NewMicroTime(time.Now())
+	peer, two := "peer-replica_0000", int32(2)
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leader.LeaseName, Namespace: config.DefaultNamespace},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity: &peer, LeaseDurationSeconds: &two,
+			AcquireTime: &now, RenewTime: &now,
+		},
+	}
+	client := fake.NewClientset(testNode("cp-1"), lease)
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			executor.MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:           "MachineList",
+		})
+
+	var mu sync.Mutex
+	var beats []time.Time
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		beats = append(beats, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := &config.Config{
+		ClusterID:    "kubehz.in.net",
+		APIURL:       srv.URL,
+		AgentToken:   testToken,
+		FullInterval: 100 * time.Millisecond,
+		Debounce:     20 * time.Millisecond,
+		MinGap:       20 * time.Millisecond,
+		DesiredPoll:  50 * time.Millisecond,
+		MDNamespace:  "kube-system",
+		MaxReplicas:  50,
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	ag := New(cfg, client, dyn, nil)
+	ag.lease = testLease
+	go func() { done <- ag.Run(ctx) }()
+
+	// The peer's lease is valid for two seconds from the standby's first read.
+	time.Sleep(time.Second)
+	mu.Lock()
+	early := len(beats)
+	mu.Unlock()
+	if early != 0 {
+		t.Errorf("%d beats sent in the first second while another replica held the acting lease, want 0", early)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(beats)
+		var first time.Time
+		if n > 0 {
+			first = beats[0]
+		}
+		mu.Unlock()
+		if n > 0 {
+			if first.Sub(start) < 1500*time.Millisecond {
+				t.Errorf("first beat %s after start, inside the peer's lease", first.Sub(start))
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the standby never reported again after the peer's lease ran out")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after context cancel")
+	}
+}
+
+// testLease is the acting Lease sped up: seconds instead of the production
+// half-minute.
+var testLease = leaseTimings{duration: 2 * time.Second, renewDeadline: time.Second, retryPeriod: 100 * time.Millisecond}
+
+// actingAgent builds an agent WITH an acting loop (a dynamic client) against
+// a platform that serves a no-op desired document; beat answers the
+// heartbeats. The pod name is agent-pod, so the lease identity starts with
+// "agent-pod_".
+func actingAgent(t *testing.T, beat http.HandlerFunc) (*Agent, *fake.Clientset) {
+	t.Helper()
+	client := fake.NewClientset(testNode("cp-1"))
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			executor.MachineDeploymentGVR: "MachineDeploymentList",
+			machines.MachineGVR:           "MachineList",
+		})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/clusters/cl-0123abcd/heartbeat", beat)
+	mux.HandleFunc("GET /api/clusters/cl-0123abcd/desired", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"revision":0,"kubernetesVersion":null,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	ag := New(&config.Config{
+		ClusterID:    "cl-0123abcd",
+		APIURL:       srv.URL,
+		AgentToken:   testToken,
+		FullInterval: 100 * time.Millisecond,
+		Debounce:     20 * time.Millisecond,
+		MinGap:       20 * time.Millisecond,
+		DesiredPoll:  50 * time.Millisecond,
+		MDNamespace:  "kube-system",
+		MaxReplicas:  50,
+		PodName:      "agent-pod",
+	}, client, dyn, nil)
+	ag.lease = testLease
+	return ag, client
+}
+
+// storedHolder reads the acting Lease's holder ("" = none or no Lease).
+func storedHolder(client *fake.Clientset) string {
+	l, err := client.CoordinationV1().Leases(config.DefaultNamespace).Get(context.Background(), leader.LeaseName, metav1.GetOptions{})
+	if err != nil || l.Spec.HolderIdentity == nil {
+		return ""
+	}
+	return *l.Spec.HolderIdentity
+}
+
+func waitUntil(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func holdsIt(client *fake.Clientset) bool {
+	return strings.HasPrefix(storedHolder(client), "agent-pod_")
+}
+
+// SHUTDOWN waits for the acting loop: Run returns only after the drain and
+// the lease release are done, because main exits as soon as Run returns. A
+// release cut off by the exit leaves the successor waiting the lease out.
+func TestAgent_ShutdownWaitsForTheLeaseRelease(t *testing.T) {
+	ag, client := actingAgent(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	var mu sync.Mutex
+	var released time.Time
+	client.PrependReactor("update", "leases", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		u, ok := a.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		if l, ok := u.GetObject().(*coordinationv1.Lease); ok && l.Spec.HolderIdentity != nil && *l.Spec.HolderIdentity == "" {
+			time.Sleep(500 * time.Millisecond) // a slow apiserver
+			mu.Lock()
+			released = time.Now()
+			mu.Unlock()
+		}
+		return false, nil, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan time.Time, 1)
+	go func() {
+		_ = ag.Run(ctx)
+		done <- time.Now()
+	}()
+	waitUntil(t, "the agent never acquired the acting lease", 5*time.Second, func() bool { return holdsIt(client) })
+
+	cancel()
+	var returned time.Time
+	select {
+	case returned = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if released.IsZero() {
+		t.Fatal("Run returned before the acting lease was released — main would exit with the release still to do")
+	}
+	if returned.Before(released) {
+		t.Errorf("Run returned %s before the release finished", released.Sub(returned))
+	}
+}
+
+// STEP-DOWN: the acting replica is the cluster's one reporter (a standby is
+// silent while a peer holds the lease), so a holder whose heartbeats keep
+// failing would silence every replica that can report. After the step-down
+// window it releases the lease and stays out of the race; once a heartbeat
+// goes through it contends again.
+func TestAgent_StepsDownWhileItsHeartbeatsFail(t *testing.T) {
+	var failing atomic.Bool
+	var ok atomic.Int32
+	ag, client := actingAgent(t, func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		ok.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	ag.stepDownAfter = 300 * time.Millisecond
+	ag.sendBackoff = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ag.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitUntil(t, "the agent never acquired the acting lease", 5*time.Second, func() bool { return holdsIt(client) && ok.Load() > 0 })
+
+	failing.Store(true)
+	waitUntil(t, "the holder kept the acting lease while its heartbeats failed", 5*time.Second, func() bool { return storedHolder(client) == "" })
+	time.Sleep(600 * time.Millisecond)
+	if holdsIt(client) {
+		t.Fatal("the replica took the lease back while its heartbeats still failed")
+	}
+
+	failing.Store(false)
+	waitUntil(t, "the replica never contended again after a heartbeat went through", 5*time.Second, func() bool { return holdsIt(client) })
+}
+
+// A FORMER HOLDER drops its queued beat once it sees the new holder. The beat
+// failed while this replica still held the lease; its retry carries no
+// actions and, sent after a peer took over, would erase the peer's.
+func TestAgent_FormerHolderDropsItsQueuedBeat(t *testing.T) {
+	var failing atomic.Bool
+	var failed atomic.Int32
+	ag, client := actingAgent(t, func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			failed.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	leasetest.EnforceResourceVersion(client)
+	ag.sendBackoff = 100 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ag.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitUntil(t, "the agent never acquired the acting lease", 5*time.Second, func() bool { return holdsIt(client) })
+
+	failing.Store(true)
+	waitUntil(t, "no heartbeat failed", 5*time.Second, func() bool { return failed.Load() > 0 })
+
+	// A peer takes the Lease, with the apiserver's compare-and-swap.
+	leases := client.CoordinationV1().Leases(config.DefaultNamespace)
+	waitUntil(t, "the test could not hand the Lease to the peer", 5*time.Second, func() bool {
+		l, err := leases.Get(context.Background(), leader.LeaseName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		peer, thirty := "peer-replica_0000", int32(30)
+		now := metav1.NewMicroTime(time.Now())
+		l.Spec.HolderIdentity, l.Spec.LeaseDurationSeconds = &peer, &thirty
+		l.Spec.AcquireTime, l.Spec.RenewTime = &now, &now
+		_, err = leases.Update(context.Background(), l, metav1.UpdateOptions{})
+		return err == nil
+	})
+
+	// The former holder's next renewal fails and its read shows the peer.
+	time.Sleep(1500 * time.Millisecond)
+	before := failed.Load()
+	time.Sleep(1500 * time.Millisecond)
+	if after := failed.Load(); after != before {
+		t.Errorf("%d beats sent after the peer took the acting lease, want 0: a queued retry went out", after-before)
+	}
+	if got := storedHolder(client); got != "peer-replica_0000" {
+		t.Errorf("stored holder = %q, want the peer", got)
+	}
+}
+
+// RECOVERY when the peer's Lease is deleted. A replica stepped down (its
+// heartbeats failed), a peer took the Lease, and the replica went silent for
+// it. Then the peer stops and its Lease is deleted, and the platform is
+// reachable again. The replica's reads now answer NotFound: that is no peer,
+// so its beats go out again, the successful beat makes it eligible, and it
+// creates and acquires the Lease. Without that it would stay silent and out
+// of the race for good: only a successful beat makes it eligible, and only
+// an eligible replica creates the Lease.
+func TestAgent_RecoversWhenThePeersLeaseIsDeleted(t *testing.T) {
+	var failing atomic.Bool
+	var ok atomic.Int32
+	ag, client := actingAgent(t, func(w http.ResponseWriter, _ *http.Request) {
+		if failing.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		ok.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+	ag.stepDownAfter = 300 * time.Millisecond
+	ag.sendBackoff = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = ag.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitUntil(t, "the agent never acquired the acting lease", 5*time.Second, func() bool { return holdsIt(client) })
+
+	// The heartbeats fail; the replica steps down and releases the Lease.
+	failing.Store(true)
+	waitUntil(t, "the holder never stepped down", 5*time.Second, func() bool { return storedHolder(client) == "" })
+
+	// A peer takes the Lease, and the replica goes silent for it.
+	leases := client.CoordinationV1().Leases(config.DefaultNamespace)
+	l, err := leases.Get(context.Background(), leader.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	peer, thirty := "peer-replica_0000", int32(30)
+	now := metav1.NewMicroTime(time.Now())
+	l.Spec.HolderIdentity, l.Spec.LeaseDurationSeconds = &peer, &thirty
+	l.Spec.AcquireTime, l.Spec.RenewTime = &now, &now
+	if _, err := leases.Update(context.Background(), l, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("hand the lease to the peer: %v", err)
+	}
+	before := ok.Load()
+	// Let the replica read the peer's record before the platform comes
+	// back, so that no beat goes out before the gate closes.
+	time.Sleep(500 * time.Millisecond)
+	failing.Store(false)
+	time.Sleep(time.Second)
+	if got := ok.Load(); got != before {
+		t.Fatalf("%d beats went out while the peer held the Lease, want 0 (precondition)", got-before)
+	}
+	if holdsIt(client) {
+		t.Fatal("the replica took the Lease from a live peer (precondition)")
+	}
+
+	// The peer is gone and its Lease is deleted.
+	if err := leases.Delete(context.Background(), leader.LeaseName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete lease: %v", err)
+	}
+	waitUntil(t, "no beat went out after the peer's Lease was deleted: the replica stays silent for a peer that is gone",
+		5*time.Second, func() bool { return ok.Load() > before })
+	waitUntil(t, "the replica never acquired the Lease again after its beats went through",
+		5*time.Second, func() bool { return holdsIt(client) })
 }
 
 func waitForPayload(t *testing.T, mu *sync.Mutex, payloads *[]state.Payload, match func(state.Payload) bool) {
