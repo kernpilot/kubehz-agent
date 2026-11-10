@@ -98,8 +98,12 @@ func (c *Client) bearer() string {
 // and 429 (401/403 stay *publisher.AuthError, the marker the full-backoff
 // discipline keys on), or a 2xx body that fails validation. The poller
 // treats both kinds the same way: it drops the cached document and its ETag,
-// and acts again only on a NEW document. Transport failures, 5xx, 408, 429
-// and undecodable bodies are not rejections; they are transient.
+// and acts again only on a NEW document. A 2xx body is invalid when it is
+// complete JSON that breaks the contract: a missing or null field, a value
+// out of range, a field of the wrong JSON type, or a body above
+// maxBodyBytes. Transport failures, 5xx, 408, 429 and a body that is not
+// complete JSON (a transfer cut short) are not rejections; they are
+// transient.
 type RejectedError struct {
 	// Status is the HTTP status of the answer (a 2xx for an invalid document).
 	Status int
@@ -189,7 +193,9 @@ func (c *Client) fetch(ctx context.Context, revalidate bool) (*Doc, bool, error)
 	case resp.StatusCode == http.StatusNotModified:
 		return nil, true, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		// One byte more than the bound, so an oversized body is seen as
+		// oversized and not as a cut-short one.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 		if err != nil {
 			return nil, false, fmt.Errorf("read desired doc: %w", err)
 		}
@@ -218,17 +224,27 @@ func (c *Client) fetch(ctx context.Context, revalidate bool) (*Doc, bool, error)
 	}
 }
 
-// decodeDoc decodes and validates one 200 body. A body that is not JSON is a
-// plain error (it can be a truncated transfer); a JSON document that breaks
-// the contract is a *RejectedError.
+// decodeDoc decodes and validates one 200 body. A body that is not complete
+// JSON is a plain error: it can be a transfer cut short, and the next poll
+// can bring the whole document. Everything else that fails is the platform's
+// complete answer and a *RejectedError: a body above maxBodyBytes, and JSON
+// that breaks the contract, a field of the wrong JSON type included (for
+// example "desiredReplicas":"3"). Such a document can carry flags that turn
+// execution off, so it must revoke the cached one, never leave it in force.
 func decodeDoc(body []byte) (*Doc, error) {
+	if len(body) > maxBodyBytes {
+		return nil, &RejectedError{Err: fmt.Errorf("desired doc exceeds %d bytes", maxBodyBytes)}
+	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("decode desired doc: the body is not complete JSON")
+	}
 	var doc Doc
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("decode desired doc: %w", err)
+		return nil, &RejectedError{Err: fmt.Errorf("decode desired doc: %w", err)}
 	}
 	var present docPresence
 	if err := json.Unmarshal(body, &present); err != nil {
-		return nil, fmt.Errorf("decode desired doc: %w", err)
+		return nil, &RejectedError{Err: fmt.Errorf("decode desired doc: %w", err)}
 	}
 	if err := present.check(); err != nil {
 		return nil, &RejectedError{Err: err}

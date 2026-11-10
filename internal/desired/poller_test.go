@@ -786,6 +786,11 @@ func TestPoller_RejectionRevokesTheCachedDocument(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"revision":4,"kubernetesVersion":null,"workerPools":[{"name":"pool-a"}],`+
 				`"execution":{"scaling":true,"upgrades":false}}`)
 		},
+		"wrong field type": func(w http.ResponseWriter) {
+			w.Header().Set("ETag", `"4-001"`)
+			_, _ = fmt.Fprint(w, `{"revision":4,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":"3"}],`+
+				`"execution":{"scaling":true,"upgrades":false}}`)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var mu sync.Mutex

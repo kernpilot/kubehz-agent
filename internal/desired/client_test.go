@@ -406,11 +406,21 @@ func TestClient_ClassifiesRejections(t *testing.T) {
 		"negative revision": {func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte(`{"revision":-1,"kubernetesVersion":null,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`))
 		}, true},
+		// Complete JSON with a field of the wrong type is the platform's whole
+		// answer, not a transfer cut short.
+		"wrong field type": {func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":4,"kubernetesVersion":null,"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":"3"}],"execution":{"scaling":true,"upgrades":false}}`))
+		}, true},
+		"wrong top-level type": {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`[]`)) }, true},
+		"oversized body": {func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"revision":4,"pad":"` + strings.Repeat("x", maxBodyBytes) + `"}`))
+		}, true},
 		"408":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(408) }, false},
 		"429":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(429) }, false},
 		"500":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(500) }, false},
 		"503":          {func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(503) }, false},
 		"garbage body": {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{nope")) }, false},
+		"cut short":    {func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"revision":4,"workerPools":[`)) }, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := httptest.NewServer(tc.h)
