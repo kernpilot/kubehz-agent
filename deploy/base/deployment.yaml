@@ -13,8 +13,12 @@ spec:
   # Single replica by default. More than one is SAFE now: ACTING is gated on a
   # leader-elected Lease (kubehz-system/kubehz-live-agent, RBAC in
   # deploy/managed/), so exactly one replica ever patches a MachineDeployment
-  # or deletes a Machine while the others report. Strategy Recreate still
-  # avoids two agents briefly double-reporting during a rollout.
+  # or deletes a Machine. The holder also does the reporting; the others stand
+  # by and send no heartbeats while it holds the lease, and a holder whose
+  # heartbeats fail for 5 minutes steps down. Strategy Recreate still avoids
+  # two agents briefly double-reporting during a rollout. On shutdown the agent
+  # drains and releases the lease before it exits; the default 30 s
+  # terminationGracePeriodSeconds covers that.
   replicas: 1
   strategy:
     type: Recreate

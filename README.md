@@ -332,7 +332,11 @@ How they work, truthfully:
    `304` cannot bring it back, and the agent acts again only on a new
    document. An **incomplete** document is rejected whole: a pool without
    `desiredReplicas` (missing or `null` is not zero — zero would remove every
-   server of the pool), or an enabled healing policy with a missing number. A
+   server of the pool), or an enabled healing policy with a missing number.
+   So is complete JSON with a field of the wrong type (`"desiredReplicas":
+   "3"`) and a body above 1 MiB. Only a body that is not complete JSON (a
+   transfer cut short) counts as a transient failure and keeps the cached
+   document until its freshness bound. A
    tier downgrade or kill-switch flip reaches the agent on its next poll
    (the flags are part of the ETag). 401/403 honor the full retry backoff,
    exactly like the heartbeat sender.
@@ -392,14 +396,18 @@ How they work, truthfully:
      transition time could have failed at the same moment as all the others,
      so its pool is not healed until it does, and across the worker set it
      counts as failed inside the window.
-   - **At most a third of a pool is out of service at once** (rounded down,
-     floored at one machine, so small pools still heal), and that counts what
-     earlier passes started: a machine being deleted, a replacement that has
-     not joined or is not Ready yet, a replica that does not exist yet. A
-     deletion keeps counting until its replacement serves, so the next one
-     waits for recovery instead of for the next pass. The rest waits and is
-     reported. This bounds the blast radius by the size of the pool instead
-     of by a number the platform sent.
+   - **Healing acts on a pool only while at most a third of it is out of
+     service** (rounded down, floored at one machine, so small pools still
+     heal). Out of service is every machine slot without a Ready node: the
+     unhealthy machines themselves, a machine being deleted, a replacement
+     that has not joined or is not Ready yet (also one that failed and is a
+     candidate now), a replica that does not exist yet. Deleting a machine
+     that does not serve leaves the count as it is; only a machine that
+     serves again lowers it. So healing's own deletions never put more than
+     a third of a pool out of service, across passes and restarts, and a
+     pool that is out beyond that is not healed at all: every candidate
+     waits and is reported. This bounds the blast radius by the size of the
+     pool instead of by a number the platform sent.
    **Eviction unwedge (the bounded follow-through):** when the healed node is
    truly dead (kubelet stopped), machine-controller's eviction of the pods
    stuck Terminating there can never confirm, so the deleted Machine sits in
@@ -450,9 +458,18 @@ How they work, truthfully:
    the lease, a standby sends **no heartbeats**: the platform keeps one
    action snapshot per cluster and reads a beat without actions as "clear",
    so a standby's beats would erase the holder's reports. The holder reports
-   the same live view; a standby reports again as soon as the lease is free
-   or stops being renewed. Upgrading from an agent that predates this:
-   re-apply `deploy/managed/`.
+   the same live view. The check runs before every send, a retry too, so a
+   beat queued before the standby saw the peer is dropped, not sent late. A
+   standby reports again when the lease is free, or when a read finds it
+   unchanged for one lease duration; a read that fails changes nothing, so
+   a standby that cannot read the Lease stays silent. Because the holder is
+   then the only reporter, **a holder whose heartbeats fail for 5 minutes
+   steps down**: it stops acting, releases the lease, and does not contend
+   again until one of its heartbeats goes through, so a replica that can
+   reach the platform takes over. On shutdown the process waits for the
+   drain and the release before it exits (the default 30 s grace period
+   covers both). Upgrading from an agent that predates this: re-apply
+   `deploy/managed/`.
 8. **Progress is reported, in memory only.** Every outcome
    (`pending → in-progress → done/failed`, with the acted `revision`) rides
    the heartbeat's `actions[]`; stale heal reports for self-recovered nodes
