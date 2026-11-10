@@ -85,6 +85,8 @@ type Healing struct {
 // nonsensical document is rejected here, before any acting code sees it.
 // Per-pool checks (name shape, replica bounds) stay in the executor, which
 // reports them as per-pool action outcomes instead of dropping the whole doc.
+// Missing values are rejected by the decoder (see docPresence), because a
+// decoded Doc cannot tell a missing field from a zero.
 func (d *Doc) Validate() error {
 	if d.Revision < 0 {
 		return fmt.Errorf("desired doc invalid: negative revision %d", d.Revision)
@@ -119,3 +121,59 @@ const (
 	maxHealingMaxUnhealthy = 1_000
 	maxHealingSeconds      = 1_000_000 // ≈11.5 days
 )
+
+// docPresence is decoded from the same body as Doc, only to tell a MISSING
+// (or null) field from an explicit zero. encoding/json cannot tell them
+// apart: both decode to 0. For the fields below, 0 is real intent with real
+// consequences, so a missing value must never become one:
+//
+//   - workerPools[].desiredReplicas: 0 scales the pool to nothing, which
+//     removes every server in it;
+//   - the healing numbers of an ENABLED policy: 0 means "never remediate"
+//     for maxUnhealthy, but the shortest (floored) window for the two
+//     timeouts and the cooldown.
+//
+// A document that leaves one of them out is incomplete, and the whole
+// document is rejected.
+type docPresence struct {
+	WorkerPools []struct {
+		Name            *string `json:"name"`
+		DesiredReplicas *int    `json:"desiredReplicas"`
+	} `json:"workerPools"`
+	Healing *struct {
+		Enabled                   bool `json:"enabled"`
+		MaxUnhealthy              *int `json:"maxUnhealthy"`
+		NodeStartupTimeoutSeconds *int `json:"nodeStartupTimeoutSeconds"`
+		UnhealthyAfterSeconds     *int `json:"unhealthyAfterSeconds"`
+		CooldownSeconds           *int `json:"cooldownSeconds"`
+	} `json:"healing"`
+}
+
+// check rejects a document with a missing required value (see docPresence).
+func (p *docPresence) check() error {
+	for i, pool := range p.WorkerPools {
+		if pool.Name == nil || *pool.Name == "" {
+			return fmt.Errorf("desired doc invalid: workerPools[%d] has no name", i)
+		}
+		if pool.DesiredReplicas == nil {
+			return fmt.Errorf("desired doc invalid: workerPools[%d] (%s) has no desiredReplicas — a missing count is not a request for zero",
+				i, *pool.Name)
+		}
+	}
+	if h := p.Healing; h != nil && h.Enabled {
+		for _, f := range []struct {
+			name string
+			v    *int
+		}{
+			{"maxUnhealthy", h.MaxUnhealthy},
+			{"nodeStartupTimeoutSeconds", h.NodeStartupTimeoutSeconds},
+			{"unhealthyAfterSeconds", h.UnhealthyAfterSeconds},
+			{"cooldownSeconds", h.CooldownSeconds},
+		} {
+			if f.v == nil {
+				return fmt.Errorf("desired doc invalid: healing is enabled but healing.%s is missing", f.name)
+			}
+		}
+	}
+	return nil
+}

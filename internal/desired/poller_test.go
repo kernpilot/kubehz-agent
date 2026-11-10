@@ -417,16 +417,12 @@ func TestPoller_RevalidationKeepsHealingAlive(t *testing.T) {
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
-		// The first poll has no cached ETag yet and is not a revalidation;
-		// count only the cache-busting ones.
-		if r.Header.Get("Cache-Control") == "no-cache" {
-			mu.Lock()
-			unconditional++
-			if revalidateHeaders == nil {
-				revalidateHeaders = r.Header.Clone()
-			}
-			mu.Unlock()
+		mu.Lock()
+		unconditional++
+		if revalidateHeaders == nil {
+			revalidateHeaders = r.Header.Clone()
 		}
+		mu.Unlock()
 		_, _ = fmt.Fprint(w, healingBody(3))
 	}))
 	defer ts.Close()
@@ -447,9 +443,10 @@ func TestPoller_RevalidationKeepsHealingAlive(t *testing.T) {
 	revalidations, headers := unconditional, revalidateHeaders
 	mu.Unlock()
 
-	if revalidations < 2 {
-		t.Errorf("unconditional revalidations = %d over %d polls, want at least 2 (every %d polls)",
-			revalidations, polls, staleRevalidateTicks)
+	// The first poll is unconditional too (nothing cached yet).
+	if revalidations < 1+polls/(staleRevalidateTicks+1) {
+		t.Errorf("unconditional revalidations = %d over %d polls, want at least %d (one every %d polls)",
+			revalidations, polls, 1+polls/(staleRevalidateTicks+1), staleRevalidateTicks+1)
 	}
 	if headers.Get("Cache-Control") != "no-cache" {
 		t.Errorf("revalidation Cache-Control = %q, want no-cache (no intermediary may answer it)",
@@ -605,4 +602,241 @@ func TestPoller_AuthErrorReloadsTokenFromFile(t *testing.T) {
 	cancel()
 	trigger <- time.Now()
 	wg.Wait()
+}
+
+// runPoller starts p and returns a stop function that ends it.
+func runPoller(t *testing.T, p *Poller, tm *timers) (stop func(trigger chan time.Time)) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); p.Run(ctx) }()
+	return func(trigger chan time.Time) {
+		cancel()
+		trigger <- time.Now()
+		wg.Wait()
+	}
+}
+
+// actsAfter reports whether the trail has an "act" at or after index i.
+func actsAfter(trail []string, i int) bool {
+	for _, s := range trail[i:] {
+		if s == "act" {
+			return true
+		}
+	}
+	return false
+}
+
+// A CACHED 200 must not stand in for the platform. The origin served an armed
+// document (no ETag) once and then went away; a cache keeps the copy and
+// serves it to every request that does not say no-cache. Every agent request
+// must say no-cache, so the cache must ask the dead origin, and the agent
+// acts on nothing it served after that and stops at the bound.
+func TestPoller_CachedOKWithoutETagDoesNotKeepActing(t *testing.T) {
+	var mu sync.Mutex
+	originUp := true
+	var missingNoCache int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		up := originUp
+		originUp = false
+		noCache := r.Header.Get("Cache-Control") == "no-cache"
+		if !noCache {
+			missingNoCache++
+		}
+		mu.Unlock()
+		switch {
+		case up:
+			_, _ = fmt.Fprint(w, healingBody(3)) // the origin: no ETag
+		case !noCache:
+			_, _ = fmt.Fprint(w, healingBody(3)) // the cache's stored copy
+		default:
+			w.WriteHeader(http.StatusGatewayTimeout) // the cache asked the dead origin
+		}
+	}))
+	defer ts.Close()
+
+	actor := &recordingActor{retry: func(int) bool { return true }}
+	p, tm := newTestPoller(t, ts.URL, actor)
+	stop := runPoller(t, p, tm)
+
+	drivePolls(t, tm, staleHealingTicks+5)
+	trigger := tm.next(t)
+
+	mu.Lock()
+	missing := missingNoCache
+	mu.Unlock()
+	if missing != 0 {
+		t.Errorf("%d requests went out without Cache-Control: no-cache — a cache could answer them from a stored copy", missing)
+	}
+	if got := actor.calls(); got != 1 {
+		t.Errorf("reconciles = %d, want 1: after the origin went away nothing may drive the healer (trail %v)",
+			got, actor.calltrail())
+	}
+	if len(actor.refused()) == 0 {
+		t.Errorf("no refusal reported after %d polls without the platform (trail %v)", staleHealingTicks+5, actor.calltrail())
+	}
+	stop(trigger)
+}
+
+// Only an UNCONDITIONAL answer proves the platform re-affirmed the document,
+// and revalidation has its own cadence. Here a broken cache answers every
+// conditional request with its stored 200 while the origin is down: those
+// 200s must not reset the freshness count, and the agent must stop acting at
+// the healing bound.
+func TestPoller_OrdinaryOKDoesNotResetFreshness(t *testing.T) {
+	var mu sync.Mutex
+	first := true
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		origin := first
+		first = false
+		mu.Unlock()
+		if origin || r.Header.Get("If-None-Match") != "" {
+			w.Header().Set("ETag", `"3-001"`)
+			_, _ = fmt.Fprint(w, healingBody(3))
+			return
+		}
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+	defer ts.Close()
+
+	actor := &recordingActor{retry: func(int) bool { return true }}
+	p, tm := newTestPoller(t, ts.URL, actor)
+	stop := runPoller(t, p, tm)
+
+	const polls = 3 * staleHealingTicks
+	drivePolls(t, tm, polls)
+	trigger := tm.next(t)
+
+	trail := actor.calltrail()
+	i := firstRefusal(trail)
+	if i < 0 {
+		t.Fatalf("no refusal after %d polls without one successful revalidation (trail %v)", polls, trail)
+	}
+	if actsAfter(trail, i) {
+		t.Errorf("acted again after refusing (trail %v)", trail)
+	}
+	if got := actor.calls(); got > staleHealingTicks+1 {
+		t.Errorf("reconciles = %d, want at most %d (the healing freshness bound)", got, staleHealingTicks+1)
+	}
+	stop(trigger)
+}
+
+// A revalidation refreshes FRESHNESS; it is not new intent. A scaling pass
+// that converged (retry=false) must not run again when the same document
+// comes back on a revalidation, or it would undo a manual change made since.
+// A changed document (here only an execution flag, same revision and ETag)
+// is new intent and runs.
+func TestPoller_RevalidationDoesNotReplayConvergedIntent(t *testing.T) {
+	var mu sync.Mutex
+	upgrades := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		up := upgrades
+		mu.Unlock()
+		w.Header().Set("ETag", `"3-10"`) // deliberately unchanged below
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"revision":3,"kubernetesVersion":null,`+
+			`"workerPools":[{"name":"pool-a","machineType":"cpx31","desiredReplicas":3}],`+
+			`"execution":{"scaling":true,"upgrades":%t}}`, up)
+	}))
+	defer ts.Close()
+
+	actor := &recordingActor{} // converged: retry=false
+	p, tm := newTestPoller(t, ts.URL, actor)
+	stop := runPoller(t, p, tm)
+
+	// Polls 1, 7, 13 and 19 are unconditional: three revalidations of the
+	// same document after the first pull. Park after poll 19.
+	drivePolls(t, tm, 3*(staleRevalidateTicks+1))
+	parked := tm.next(t)
+	if got := actor.calls(); got != 1 {
+		t.Fatalf("reconciles = %d over three revalidations of the same document, want 1 — converged intent was replayed", got)
+	}
+
+	mu.Lock()
+	upgrades = true
+	mu.Unlock()
+	parked <- time.Now()
+	drivePolls(t, tm, staleRevalidateTicks) // poll 25 is the next revalidation
+	trigger := tm.next(t)
+	if got := actor.calls(); got != 2 {
+		t.Fatalf("reconciles = %d, want 2: a changed document (same revision) is new intent", got)
+	}
+	if !actor.doc(1).Execution.Upgrades {
+		t.Error("the second pass did not get the changed document")
+	}
+	stop(trigger)
+}
+
+// A REJECTION revokes what the platform authorized before. After it, a 304 —
+// even one that answers a validator from before the rejection — must not
+// bring the old document back; only a new document restores acting.
+func TestPoller_RejectionRevokesTheCachedDocument(t *testing.T) {
+	for name, reject := range map[string]func(w http.ResponseWriter){
+		"403": func(w http.ResponseWriter) { w.WriteHeader(http.StatusForbidden) },
+		"404": func(w http.ResponseWriter) { w.WriteHeader(http.StatusNotFound) },
+		"invalid document": func(w http.ResponseWriter) {
+			w.Header().Set("ETag", `"4-001"`)
+			_, _ = fmt.Fprint(w, `{"revision":4,"kubernetesVersion":null,"workerPools":[{"name":"pool-a"}],`+
+				`"execution":{"scaling":true,"upgrades":false}}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var mu sync.Mutex
+			step := 0
+			serveNew := false
+			var inm []string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				step++
+				n, fresh := step, serveNew
+				inm = append(inm, r.Header.Get("If-None-Match"))
+				mu.Unlock()
+				switch {
+				case n == 1:
+					w.Header().Set("ETag", `"3-001"`)
+					_, _ = fmt.Fprint(w, healingBody(3))
+				case n == 2:
+					reject(w)
+				case fresh:
+					w.Header().Set("ETag", `"5-001"`)
+					_, _ = fmt.Fprint(w, healingBody(5))
+				default:
+					w.WriteHeader(http.StatusNotModified) // a cache, whatever was asked
+				}
+			}))
+			defer ts.Close()
+
+			actor := &recordingActor{retry: func(int) bool { return true }}
+			p, tm := newTestPoller(t, ts.URL, actor)
+			stop := runPoller(t, p, tm)
+
+			drivePolls(t, tm, 4) // polls 2..5: the rejection, then 304s
+			parked := tm.next(t)
+			if got := actor.calls(); got != 1 {
+				t.Fatalf("reconciles = %d, want 1: nothing may act after the rejection until a new document (trail %v)",
+					got, actor.calltrail())
+			}
+			mu.Lock()
+			afterReject := inm[2]
+			serveNew = true
+			mu.Unlock()
+			if afterReject != "" {
+				t.Errorf("the poll after the rejection sent If-None-Match %q — the revoked document's validator", afterReject)
+			}
+
+			parked <- time.Now()
+			trigger := tm.next(t)
+			if got := actor.calls(); got != 2 || actor.doc(1).Revision != 5 {
+				t.Errorf("reconciles = %d, want 2 with the new revision 5: a new document restores acting", got)
+			}
+			stop(trigger)
+		})
+	}
 }
