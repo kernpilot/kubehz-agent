@@ -27,14 +27,15 @@ loses the kubectl mirror (the agent warns once and keeps beating).
 exactly four things to the `kubehz-live-agent` ServiceAccount:
 
 1. **MachineDeployment patch** (namespaced Role, kube-system):
-   `get,list,watch,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
+   `list,patch` on `machinedeployments.cluster.k8s.io` (KubeOne's
    machine-controller API group — **not** `cluster.x-k8s.io`). Patch covers
    the two fields the executors edit: `spec.replicas` (P3 scaling) and
    `spec.template.spec.versions.kubelet` (P6 worker rolls).
-2. **Machine read + delete** (same Role): reads feed `machineIssues[]` and
-   the P5/P6 loops; **delete is the P5 self-healing permission** — loudly
+2. **Machine list + delete** (same Role): the list feeds `machineIssues[]`
+   and the P5/P6 loops; **delete is the P5 self-healing permission** — loudly
    documented in the file, removable independently (healing then fails
-   closed as a reported Forbidden).
+   closed as a reported Forbidden). Neither resource gets `get` or `watch`:
+   the agent reads both with one LIST per pass and runs no informer on them.
 3. **Pods delete** (ClusterRole `kubehz-live-agent-eviction-unwedge` —
    delete verb ONLY): exists solely to **unwedge evictions of heal-deleted
    machines' dead nodes**. When healing deletes a Machine whose node is

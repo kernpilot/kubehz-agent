@@ -305,19 +305,34 @@ How they work, truthfully:
    unhealthyAfterSeconds, cooldownSeconds}` policy. The ETag is treated as an
    **opaque token** (cached, echoed verbatim, never parsed) — a server-side
    format change costs one extra `200`, nothing else.
-   **Stale intent is not intent.** A `304` proves nothing about freshness: a
-   proxy, a CDN or a broken gateway can serve one from a frozen copy forever,
-   and healing asks to re-run on *every* tick. So the agent counts the polls
-   since the platform last *served* a document. After 5 it re-fetches
-   **unconditionally** (`no-cache`, no `If-None-Match` — no cache may answer
-   that with a `304`); past 10 such polls an armed healer **stops acting**,
-   past 60 every other retry stops, and the refusal is reported as a failed
-   action ("the agent does not act on intent nobody re-affirmed"). Healing
-   deletes machines, which is why it gets the tighter bound. One served
-   document clears it all.
+   **Stale intent is not intent.** Neither a `304` nor a `200` proves
+   freshness: a proxy, a CDN or a broken gateway can serve either one from a
+   frozen copy forever, and healing asks to re-run on *every* tick. Every
+   request carries `Cache-Control: no-cache`, so a cache that obeys it must
+   ask the platform first. For a cache that does not, the agent
+   **revalidates** on its own cadence: every 5 polls, whatever those polls
+   returned, it fetches **unconditionally** (no `If-None-Match` — no cache may
+   answer that with a `304`), and only a document served to that request
+   counts as proof. Past 10 polls without proof an armed healer **stops
+   acting**, past 60 every other retry stops, and the refusal is reported as
+   a failed action ("the agent does not act on intent nobody re-affirmed").
+   Healing deletes machines, which is why it gets the tighter bound. The next
+   successful revalidation clears it.
+   **Unchanged intent is not re-run.** A revalidation that returns the same
+   document (compared in full: the flags can change without a new revision)
+   is treated like a `304`: a pass that already converged does not run
+   again, so a manual change made since (a pool scaled by hand) stays. Only
+   new intent, or a pass that asked for a re-run (a transient failure, an
+   armed healer), runs.
 2. **Acting is server-gated with no local enable.** There is *no* agent-side
    configuration that can turn any execution on; when the server says
-   `false` (or any 4xx), the agent acts on nothing and clears its reports. A
+   `false`, the agent acts on nothing and clears its reports. A **rejection**
+   (401/403, any other 4xx except 408/429, or a document that fails
+   validation) also **revokes** the cached document and its ETag: a later
+   `304` cannot bring it back, and the agent acts again only on a new
+   document. An **incomplete** document is rejected whole: a pool without
+   `desiredReplicas` (missing or `null` is not zero — zero would remove every
+   server of the pool), or an enabled healing policy with a missing number. A
    tier downgrade or kill-switch flip reaches the agent on its next poll
    (the flags are part of the ETag). 401/403 honor the full retry backoff,
    exactly like the heartbeat sender.
@@ -355,12 +370,13 @@ How they work, truthfully:
    `maxUnhealthy` deletes *nothing* and reports every candidate `failed`
    ("unhealthy count N exceeds maxUnhealthy M — refusing (possible outage)");
    at most `maxUnhealthy` disruptions in flight (any already-deleting machine
-   counts); per-pool `cooldownSeconds` with the agent's start time as
-   baseline (**restart = fresh cooldown** — a crash-looping agent can never
-   become a machine-delete loop); autoscaler-owned pools and unowned machines
-   are refused. Healing re-evaluates every poll tick; detection windows are
-   floored at 60 s agent-side.
-   **Two bounds owe nothing to the server's numbers** — `maxUnhealthy`, the
+   counts); per-pool `cooldownSeconds`, **never below 5 minutes** whatever
+   the document says, with the agent's start time as baseline (**restart =
+   fresh cooldown** — a crash-looping agent can never become a machine-delete
+   loop); autoscaler-owned pools and unowned machines are refused. Healing
+   re-evaluates every poll tick; detection windows are floored at 60 s
+   agent-side.
+   **Three bounds owe nothing to the server's numbers** — `maxUnhealthy`, the
    cooldown and the budget all arrive in the document, and one
    wrong-but-plausible number (`maxUnhealthy: 50` on a 12-machine cluster)
    satisfies every one of them:
@@ -372,10 +388,18 @@ How they work, truthfully:
      restart does, and those leave the servers alive and running your
      workload while their nodes read `Unknown`. The agent cannot tell a dead
      node from a partitioned one, so it does not guess.
-   - **One pass remediates at most a third of a pool** (rounded down, floored
-     at one machine, so small pools still heal). The excess waits for the next
-     pass and is reported. This bounds the blast radius of a single pass by
-     the size of the pool instead of by a number the platform sent.
+   - **Missing evidence refuses.** A not-Ready node that reports no Ready
+     transition time could have failed at the same moment as all the others,
+     so its pool is not healed until it does, and across the worker set it
+     counts as failed inside the window.
+   - **At most a third of a pool is out of service at once** (rounded down,
+     floored at one machine, so small pools still heal), and that counts what
+     earlier passes started: a machine being deleted, a replacement that has
+     not joined or is not Ready yet, a replica that does not exist yet. A
+     deletion keeps counting until its replacement serves, so the next one
+     waits for recovery instead of for the next pass. The rest waits and is
+     reported. This bounds the blast radius by the size of the pool instead
+     of by a number the platform sent.
    **Eviction unwedge (the bounded follow-through):** when the healed node is
    truly dead (kubelet stopped), machine-controller's eviction of the pods
    stuck Terminating there can never confirm, so the deleted Machine sits in
@@ -409,27 +433,34 @@ How they work, truthfully:
    `kubectl delete ns kubehz-system` and nothing else changes.
 7. **Exactly one replica acts.** Acting is gated on a leader-elected Lease
    (`kubehz-system/kubehz-live-agent`, RBAC in `deploy/managed/`): the poller
-   and the executor start only while this replica holds it, and stop the
-   moment it is lost — the successor begins with a fresh cooldown baseline and
-   this replica clears its action reports. The reason is concrete: the
-   per-pool cooldown, the in-flight budget and the one-pool-at-a-time roll are
-   per-*process* state, so two actors would double every one of those bounds.
+   and the executor start only while this replica holds it. When the lease
+   is lost, or the agent shuts down, acting is cancelled **first**, and the
+   agent waits for it to return before anything else happens: it does not
+   contend again while acting may still run, and on shutdown it keeps the
+   lease renewed until acting has returned and only then releases it. The
+   successor begins with a fresh cooldown baseline and this replica clears
+   its action reports. The reason is concrete: the per-pool cooldown, the
+   in-flight budget and the one-pool-at-a-time roll are per-*process* state,
+   so two actors would double every one of those bounds.
    **No Lease, no acting**: without the coordination RBAC (or the API) the
    agent keeps reporting and never acts, and after two minutes without the
    lease it says so in its log — it cannot tell a peer holding the lease from
    a missing grant or an unreachable apiserver, so the one warning names all
-   three. Running more than one replica
-   is therefore safe; the live view is duplicated (latest-wins) and the acting
-   is not. Upgrading from an agent that predates this: re-apply
-   `deploy/managed/`.
+   three. Running more than one replica is therefore safe. While a peer holds
+   the lease, a standby sends **no heartbeats**: the platform keeps one
+   action snapshot per cluster and reads a beat without actions as "clear",
+   so a standby's beats would erase the holder's reports. The holder reports
+   the same live view; a standby reports again as soon as the lease is free
+   or stops being renewed. Upgrading from an agent that predates this:
+   re-apply `deploy/managed/`.
 8. **Progress is reported, in memory only.** Every outcome
    (`pending → in-progress → done/failed`, with the acted `revision`) rides
    the heartbeat's `actions[]`; stale heal reports for self-recovered nodes
    are pruned. Restart = re-poll + reconverge; because the executors are
    idempotent, that costs zero cluster writes.
 
-The acting RBAC — `patch` on machinedeployments (replicas + kubelet version)
-and read + **delete** on machines (kube-system-scoped Roles), a
+The acting RBAC — list + `patch` on machinedeployments (replicas + kubelet
+version) and list + **delete** on machines (kube-system-scoped Roles), a
 `coordination.k8s.io` Lease Role in `kubehz-system` (the single-actor proof;
 without it the agent refuses to act at all), plus a pods-**delete**-only
 ClusterRole for the eviction unwedge (the stuck pods span arbitrary
