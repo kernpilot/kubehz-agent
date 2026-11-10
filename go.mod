@@ -1,15 +1,15 @@
 module github.com/kernpilot/kubehz-agent
 
-go 1.25.0
+go 1.26.0
 
 // Keep in lockstep with the Dockerfile base and the workflows' GO_VERSION.
 // go1.26.6 fixes FIVE reachable stdlib advisories that govulncheck reports
 // against 1.26.4 — GO-2026-6218 (net/url), GO-2026-6090 + GO-2026-5856
 // (crypto/tls), GO-2026-5972 (encoding/asn1), GO-2026-5026 (net/http) — all
-// reachable through the heartbeat's single https client. 1.26.7 is the current
-// patch in that line. An older local toolchain builds a vulnerable binary and
-// fails govulncheck.
-toolchain go1.26.7
+// reachable through the heartbeat's single https client. go1.26.10 fixes
+// GO-2026-6809 (crypto/x509), reachable through the same client. An older
+// local toolchain builds a vulnerable binary and fails govulncheck.
+toolchain go1.26.10
 
 require (
 	k8s.io/api v0.35.6
@@ -39,11 +39,11 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/term v0.44.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/term v0.47.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
