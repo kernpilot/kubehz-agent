@@ -7,9 +7,10 @@ go 1.26.0
 // against 1.26.4 — GO-2026-6218 (net/url), GO-2026-6090 + GO-2026-5856
 // (crypto/tls), GO-2026-5972 (encoding/asn1), GO-2026-5026 (net/http) — all
 // reachable through the heartbeat's single https client. go1.26.10 fixes
-// GO-2026-6809 (crypto/x509), reachable through the same client. An older
-// local toolchain builds a vulnerable binary and fails govulncheck.
-toolchain go1.26.10
+// GO-2026-6809 (crypto/x509), reachable through the same client. go1.26.11
+// fixes GO-2026-6859 (net/http), reachable through the same client. An
+// older local toolchain builds a vulnerable binary and fails govulncheck.
+toolchain go1.26.11
 
 require (
 	k8s.io/api v0.35.6
