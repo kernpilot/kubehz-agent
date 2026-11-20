@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 	"testing"
@@ -66,18 +67,25 @@ func TestApplyCaps_TruncatesArraysAndStrings(t *testing.T) {
 	}
 }
 
-// The opt-in byNamespace map is the one otherwise-unbounded payload dimension;
-// it must be capped deterministically (lexicographic keep-set, stable across
-// consecutive snapshots).
+// The opt-in byNamespace map grows with the number of namespaces, and the api
+// refuses the whole beat over its bound. The cap must be deterministic
+// (lexicographic keep-set, stable across consecutive snapshots), and each kept
+// name keeps its own count.
 func TestApplyCaps_BoundsByNamespace(t *testing.T) {
 	p := &Payload{}
 	p.Workloads.Pods.ByNamespace = map[string]int{}
 	for i := 0; i < MaxNamespaces+25; i++ {
-		p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", i)] = i
+		p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", i)] = 3*i + 1
 	}
+	in := maps.Clone(p.Workloads.Pods.ByNamespace)
 	ApplyCaps(p)
 	if got := len(p.Workloads.Pods.ByNamespace); got != MaxNamespaces {
 		t.Fatalf("byNamespace not capped: %d, want %d", got, MaxNamespaces)
+	}
+	for k, v := range p.Workloads.Pods.ByNamespace {
+		if v != in[k] {
+			t.Errorf("%s: count %d after the cap, want its own count %d", k, v, in[k])
+		}
 	}
 	// Lexicographic keep-set: the lowest keys survive, the overflow is dropped.
 	if _, ok := p.Workloads.Pods.ByNamespace["ns-0000"]; !ok {
@@ -99,6 +107,12 @@ func TestApplyCaps_BoundsByNamespace(t *testing.T) {
 // api (server/utils/validation.ts, HeartbeatSchema). The api refuses the
 // WHOLE beat past each bound. The other cap tests compare with the agent's
 // own constants, so they still pass when a constant drifts from the api.
+//
+// The api also publishes the schema: GET /api/openapi (server/api/openapi.get.ts,
+// components.schemas.Heartbeat) carries maxLength, maxItems and maximum for
+// every field that the agent sends, but not for byNamespace. Its bound is a
+// zod refine, so the document has no maxProperties for it. This hand copy
+// exists because of that gap.
 func TestCapsMirrorAPIBounds(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -131,24 +145,44 @@ func TestCapsMirrorAPIBounds(t *testing.T) {
 
 // The api refuses the WHOLE beat when byNamespace has more than 100 entries
 // (HB_MAX_NAMESPACES). So one entry over the bound, and 150 entries, both
-// trim to exactly 100: the first 100 by name.
+// trim to exactly 100. ApplyCaps keeps the first 100 names in byte order,
+// and each kept name keeps its own count. Here the 100 "a-" names sort
+// before every "b-" name. The counts differ from the index and are not in
+// name order: the "b-" names hold the smallest and the largest counts, so a
+// keep-set chosen by count, in either direction, keeps a "b-" name.
 func TestApplyCaps_ByNamespaceTrimsToTheAPIBound(t *testing.T) {
 	const apiBound = 100 // HB_MAX_NAMESPACES
-	for _, n := range []int{apiBound + 1, 150} {
+	for _, over := range []int{1, 50} {
+		in := map[string]int{}
+		for i := 0; i < apiBound; i++ {
+			in[fmt.Sprintf("a-%03d", i)] = 1000 + (i*37)%apiBound
+		}
+		for j := 0; j < over; j++ {
+			if j%2 == 0 {
+				in[fmt.Sprintf("b-%03d", j)] = j
+			} else {
+				in[fmt.Sprintf("b-%03d", j)] = 1_000_000 + j
+			}
+		}
 		p := &Payload{}
-		p.Workloads.Pods.ByNamespace = map[string]int{}
-		for i := 0; i < n; i++ {
-			p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", i)] = i
-		}
+		p.Workloads.Pods.ByNamespace = maps.Clone(in)
 		ApplyCaps(p)
-		if got := len(p.Workloads.Pods.ByNamespace); got != apiBound {
-			t.Errorf("%d namespaces: %d entries after ApplyCaps, want %d", n, got, apiBound)
+		got := p.Workloads.Pods.ByNamespace
+		if len(got) != apiBound {
+			t.Errorf("%d namespaces: %d entries after ApplyCaps, want %d", len(in), len(got), apiBound)
 		}
-		if _, ok := p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", apiBound-1)]; !ok {
-			t.Errorf("%d namespaces: ns-%04d (the last one in the bound) was dropped", n, apiBound-1)
+		for i := 0; i < apiBound; i++ {
+			k := fmt.Sprintf("a-%03d", i)
+			if v, ok := got[k]; !ok {
+				t.Errorf("%d namespaces: %s (in the first 100 by name) was dropped", len(in), k)
+			} else if v != in[k] {
+				t.Errorf("%d namespaces: %s has count %d, want its own count %d", len(in), k, v, in[k])
+			}
 		}
-		if _, ok := p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", apiBound)]; ok {
-			t.Errorf("%d namespaces: ns-%04d (the first one over the bound) was kept", n, apiBound)
+		for k := range got {
+			if strings.HasPrefix(k, "b-") {
+				t.Errorf("%d namespaces: %s (after the first 100 by name) was kept", len(in), k)
+			}
 		}
 	}
 }
@@ -180,25 +214,54 @@ func TestApplyCaps_ClampsEventCountToTheAPIBound(t *testing.T) {
 
 // The api refuses the WHOLE beat when a node capacity cpu or memory string
 // is longer than 64 (HB_MAX_TYPE_LEN). apimachinery caps only binary-SI
-// quantities, so a decimal capacity in a node status can be longer.
-func TestApplyCaps_ClampsNodeCapacityToTheAPIBound(t *testing.T) {
+// quantities, so a decimal capacity in a node status can be longer. ApplyCaps
+// omits such a value, because a cut one is a wrong number. The over-bound
+// values sit on later nodes and end in a unit suffix, so a cut from either
+// end, or a check of node 0 only, shows here.
+func TestApplyCaps_OmitsAnOverBoundNodeCapacity(t *testing.T) {
 	const apiMax = 64 // HB_MAX_TYPE_LEN
-	long := strings.Repeat("9", apiMax+1)
+	digits := strings.Repeat("9", 70)
+	atBound := strings.Repeat("1", apiMax-2) + "Gi"
+	overByOne := strings.Repeat("1", apiMax-1) + "Gi"
 	p := &Payload{Nodes: []NodeState{
-		{Name: "n1", Capacity: &NodeCapacity{CPU: long, Memory: long}},
-		{Name: "n2", Capacity: &NodeCapacity{CPU: "4", Memory: "8148Mi"}},
-		{Name: "n3"},
+		{Name: "n0", Capacity: &NodeCapacity{CPU: "4", Memory: "8148Mi"}},
+		{Name: "n1", Capacity: &NodeCapacity{CPU: digits + "m", Memory: digits + "Gi"}},
+		{Name: "n2", Capacity: &NodeCapacity{CPU: "1500m", Memory: digits + "Ki"}},
+		{Name: "n3", Capacity: &NodeCapacity{CPU: digits, Memory: "16Gi"}},
+		{Name: "n4", Capacity: &NodeCapacity{CPU: atBound, Memory: atBound}},
+		{Name: "n5", Capacity: &NodeCapacity{CPU: overByOne, Memory: atBound}},
+		{Name: "n6", Capacity: &NodeCapacity{CPU: atBound, Memory: overByOne}},
+		{Name: "n7"},
 	}}
 	ApplyCaps(p)
-	if c := p.Nodes[0].Capacity; len(c.CPU) != apiMax || len(c.Memory) != apiMax {
-		t.Errorf("capacity of %d characters: cpu %d, memory %d after ApplyCaps, want %d",
-			apiMax+1, len(c.CPU), len(c.Memory), apiMax)
+	want := []*NodeCapacity{
+		{CPU: "4", Memory: "8148Mi"},
+		nil, // both values over the bound: no capacity at all
+		{CPU: "1500m"},
+		{Memory: "16Gi"},
+		{CPU: atBound, Memory: atBound},
+		{Memory: atBound},
+		{CPU: atBound},
+		nil,
 	}
-	if c := p.Nodes[1].Capacity; c.CPU != "4" || c.Memory != "8148Mi" {
-		t.Errorf("a capacity within the bound changed: %+v", *c)
+	for i, w := range want {
+		got := p.Nodes[i].Capacity
+		switch {
+		case w == nil && got != nil:
+			t.Errorf("%s: capacity %+v after ApplyCaps, want none", p.Nodes[i].Name, *got)
+		case w != nil && got == nil:
+			t.Errorf("%s: no capacity after ApplyCaps, want %+v", p.Nodes[i].Name, *w)
+		case w != nil && *got != *w:
+			t.Errorf("%s: capacity %+v after ApplyCaps, want %+v", p.Nodes[i].Name, *got, *w)
+		}
 	}
-	if p.Nodes[2].Capacity != nil {
-		t.Errorf("a node without capacity got one: %+v", *p.Nodes[2].Capacity)
+	// An omitted value is absent on the wire, not an empty string.
+	b, err := json.Marshal(p.Nodes[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"memory"`) {
+		t.Errorf("an omitted memory value is still on the wire: %s", b)
 	}
 }
 

@@ -20,7 +20,10 @@
 //     is never 400'd for an oversized payload.
 package state
 
-import "sort"
+import (
+	"sort"
+	"unicode/utf8"
+)
 
 // SchemaVersion marks this as the operator-mode live-view payload. Schema-1
 // (the bash CronJob) omits the field; the server treats its absence as v1.
@@ -50,9 +53,11 @@ const (
 	MaxMachineIssues = 20
 	// MaxDetailLen: an action detail shares the event-note cap (HB_MAX_NOTE_LEN).
 	MaxDetailLen = MaxNoteLen
-	// MaxCount mirrors HB_MAX_COUNT: the api accepts every count-like integer
-	// (pod and event counts, the acted desired-state revision) only in
-	// 0..MaxCount, and refuses the WHOLE beat outside it.
+	// MaxCount mirrors HB_MAX_COUNT: the api refuses the WHOLE beat when a
+	// count-like integer is outside 0..MaxCount. ApplyCaps clamps the event
+	// count and the acted desired-state revision to it. The pod counts get no
+	// clamp: the agent counts the pods itself, and no cluster holds MaxCount
+	// pods.
 	MaxCount = 10_000_000
 	// MaxRevision: the acted desired-state revision shares MaxCount.
 	MaxRevision = MaxCount
@@ -350,10 +355,20 @@ func ApplyCaps(p *Payload) {
 		p.Nodes[i].InstanceType = clamp(p.Nodes[i].InstanceType, MaxTypeLen)
 		p.Nodes[i].KubeletVersion = clamp(p.Nodes[i].KubeletVersion, MaxVersionLen)
 		// apimachinery caps only binary-SI quantities, so a decimal capacity
-		// in a node status can be longer than the api's bound.
+		// in a node status can be longer than the api's bound. Omit such a
+		// value instead of cutting it: a cut quantity is a wrong number (a
+		// cut "m" suffix makes it 1000 times larger). The api accepts a node
+		// without cpu or memory, and without capacity.
 		if c := p.Nodes[i].Capacity; c != nil {
-			c.CPU = clamp(c.CPU, MaxTypeLen)
-			c.Memory = clamp(c.Memory, MaxTypeLen)
+			if utf8.RuneCountInString(c.CPU) > MaxTypeLen {
+				c.CPU = ""
+			}
+			if utf8.RuneCountInString(c.Memory) > MaxTypeLen {
+				c.Memory = ""
+			}
+			if c.CPU == "" && c.Memory == "" {
+				p.Nodes[i].Capacity = nil
+			}
 		}
 	}
 
