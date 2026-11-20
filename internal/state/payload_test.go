@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -91,6 +92,113 @@ func TestApplyCaps_BoundsByNamespace(t *testing.T) {
 	ApplyCaps(small)
 	if small.Workloads.Pods.ByNamespace["default"] != 3 || len(small.Workloads.Pods.ByNamespace) != 1 {
 		t.Errorf("within-limit map modified: %+v", small.Workloads.Pods.ByNamespace)
+	}
+}
+
+// TestCapsMirrorAPIBounds pins every cap to the literal bound of the kubehz
+// api (server/utils/validation.ts, HeartbeatSchema). The api refuses the
+// WHOLE beat past each bound. The other cap tests compare with the agent's
+// own constants, so they still pass when a constant drifts from the api.
+func TestCapsMirrorAPIBounds(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		got     int
+		apiName string
+		api     int
+	}{
+		{"MaxNodes", MaxNodes, "HB_MAX_NODES", 500},
+		{"MaxComponents", MaxComponents, "HB_MAX_COMPONENTS", 50},
+		{"MaxEvents", MaxEvents, "HB_MAX_EVENTS", 50},
+		{"MaxActions", MaxActions, "HB_MAX_ACTIONS", 20},
+		{"MaxMachineIssues", MaxMachineIssues, "HB_MAX_MACHINE_ISSUES", 20},
+		{"MaxAddons", MaxAddons, "HB_MAX_INVENTORY_ADDONS", 100},
+		{"MaxNamespaces", MaxNamespaces, "HB_MAX_NAMESPACES", 100},
+		{"MaxNameLen", MaxNameLen, "HB_MAX_NAME_LEN", 253},
+		{"MaxStatusLen", MaxStatusLen, "HB_MAX_STATUS_LEN", 63},
+		{"MaxRolesLen", MaxRolesLen, "HB_MAX_ROLES_LEN", 253},
+		{"MaxTypeLen", MaxTypeLen, "HB_MAX_TYPE_LEN", 64},
+		{"MaxVersionLen", MaxVersionLen, "HB_MAX_VERSION_LEN", 64},
+		{"MaxNoteLen", MaxNoteLen, "HB_MAX_NOTE_LEN", 256},
+		{"MaxDetailLen", MaxDetailLen, "HB_MAX_NOTE_LEN", 256},
+		{"MaxCount", MaxCount, "HB_MAX_COUNT", 10_000_000},
+		{"MaxRevision", MaxRevision, "HB_MAX_COUNT", 10_000_000},
+	} {
+		if c.got != c.api {
+			t.Errorf("%s = %d, want %d: it mirrors the api bound %s", c.name, c.got, c.api, c.apiName)
+		}
+	}
+}
+
+// The api refuses the WHOLE beat when byNamespace has more than 100 entries
+// (HB_MAX_NAMESPACES). So one entry over the bound, and 150 entries, both
+// trim to exactly 100: the first 100 by name.
+func TestApplyCaps_ByNamespaceTrimsToTheAPIBound(t *testing.T) {
+	const apiBound = 100 // HB_MAX_NAMESPACES
+	for _, n := range []int{apiBound + 1, 150} {
+		p := &Payload{}
+		p.Workloads.Pods.ByNamespace = map[string]int{}
+		for i := 0; i < n; i++ {
+			p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", i)] = i
+		}
+		ApplyCaps(p)
+		if got := len(p.Workloads.Pods.ByNamespace); got != apiBound {
+			t.Errorf("%d namespaces: %d entries after ApplyCaps, want %d", n, got, apiBound)
+		}
+		if _, ok := p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", apiBound-1)]; !ok {
+			t.Errorf("%d namespaces: ns-%04d (the last one in the bound) was dropped", n, apiBound-1)
+		}
+		if _, ok := p.Workloads.Pods.ByNamespace[fmt.Sprintf("ns-%04d", apiBound)]; ok {
+			t.Errorf("%d namespaces: ns-%04d (the first one over the bound) was kept", n, apiBound)
+		}
+	}
+}
+
+// The event writer sets the count. The api accepts only 0..10,000,000
+// (HB_MAX_COUNT) and refuses the WHOLE beat outside it.
+func TestApplyCaps_ClampsEventCountToTheAPIBound(t *testing.T) {
+	const apiMax = 10_000_000 // HB_MAX_COUNT
+	counts := []struct{ in, want int32 }{
+		{apiMax + 1, apiMax},
+		{math.MaxInt32, apiMax},
+		{-1, 0},
+		{math.MinInt32, 0},
+		{apiMax, apiMax},
+		{0, 0},
+		{7, 7},
+	}
+	p := &Payload{}
+	for _, c := range counts {
+		p.Events = append(p.Events, EventState{Reason: "BackOff", Kind: "Pod", Count: c.in})
+	}
+	ApplyCaps(p)
+	for i, c := range counts {
+		if got := p.Events[i].Count; got != c.want {
+			t.Errorf("event count %d: %d after ApplyCaps, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// The api refuses the WHOLE beat when a node capacity cpu or memory string
+// is longer than 64 (HB_MAX_TYPE_LEN). apimachinery caps only binary-SI
+// quantities, so a decimal capacity in a node status can be longer.
+func TestApplyCaps_ClampsNodeCapacityToTheAPIBound(t *testing.T) {
+	const apiMax = 64 // HB_MAX_TYPE_LEN
+	long := strings.Repeat("9", apiMax+1)
+	p := &Payload{Nodes: []NodeState{
+		{Name: "n1", Capacity: &NodeCapacity{CPU: long, Memory: long}},
+		{Name: "n2", Capacity: &NodeCapacity{CPU: "4", Memory: "8148Mi"}},
+		{Name: "n3"},
+	}}
+	ApplyCaps(p)
+	if c := p.Nodes[0].Capacity; len(c.CPU) != apiMax || len(c.Memory) != apiMax {
+		t.Errorf("capacity of %d characters: cpu %d, memory %d after ApplyCaps, want %d",
+			apiMax+1, len(c.CPU), len(c.Memory), apiMax)
+	}
+	if c := p.Nodes[1].Capacity; c.CPU != "4" || c.Memory != "8148Mi" {
+		t.Errorf("a capacity within the bound changed: %+v", *c)
+	}
+	if p.Nodes[2].Capacity != nil {
+		t.Errorf("a node without capacity got one: %+v", *p.Nodes[2].Capacity)
 	}
 }
 

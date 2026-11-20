@@ -37,10 +37,11 @@ const (
 	MaxTypeLen    = 64
 	MaxVersionLen = 64
 	MaxNoteLen    = 256
-	// MaxNamespaces bounds the opt-in byNamespace pod-count map — the one
-	// otherwise-unbounded payload dimension (a many-tenant cluster can carry
-	// thousands of namespaces).
-	MaxNamespaces = 500
+	// MaxNamespaces mirrors HB_MAX_NAMESPACES: the api refuses the WHOLE beat
+	// when the opt-in byNamespace pod-count map has more entries. A
+	// many-tenant cluster can carry thousands of namespaces, so ApplyCaps
+	// keeps the first MaxNamespaces by name.
+	MaxNamespaces = 100
 	// MaxActions mirrors HB_MAX_ACTIONS (kubehz-api dfa9b7a): the P3
 	// desired-state action reports are capped at 20 per beat.
 	MaxActions = 20
@@ -49,9 +50,12 @@ const (
 	MaxMachineIssues = 20
 	// MaxDetailLen: an action detail shares the event-note cap (HB_MAX_NOTE_LEN).
 	MaxDetailLen = MaxNoteLen
-	// MaxRevision mirrors HB_MAX_COUNT — the server bounds every count-like
-	// integer, including the acted desired-state revision.
-	MaxRevision = 10_000_000
+	// MaxCount mirrors HB_MAX_COUNT: the api accepts every count-like integer
+	// (pod and event counts, the acted desired-state revision) only in
+	// 0..MaxCount, and refuses the WHOLE beat outside it.
+	MaxCount = 10_000_000
+	// MaxRevision: the acted desired-state revision shares MaxCount.
+	MaxRevision = MaxCount
 	// MaxAddons mirrors HB_MAX_INVENTORY_ADDONS (kubehz-api f628c97,
 	// validation.ts): the server's zod schema HARD-caps inventory.addons at
 	// 100 — one entry more 400s the WHOLE beat, exactly like an empty action
@@ -345,6 +349,12 @@ func ApplyCaps(p *Payload) {
 		p.Nodes[i].Roles = clamp(p.Nodes[i].Roles, MaxRolesLen)
 		p.Nodes[i].InstanceType = clamp(p.Nodes[i].InstanceType, MaxTypeLen)
 		p.Nodes[i].KubeletVersion = clamp(p.Nodes[i].KubeletVersion, MaxVersionLen)
+		// apimachinery caps only binary-SI quantities, so a decimal capacity
+		// in a node status can be longer than the api's bound.
+		if c := p.Nodes[i].Capacity; c != nil {
+			c.CPU = clamp(c.CPU, MaxTypeLen)
+			c.Memory = clamp(c.Memory, MaxTypeLen)
+		}
 	}
 
 	if len(p.Components) > MaxComponents {
@@ -363,6 +373,14 @@ func ApplyCaps(p *Payload) {
 		p.Events[i].Kind = clamp(p.Events[i].Kind, MaxStatusLen)
 		p.Events[i].Namespace = clamp(p.Events[i].Namespace, MaxNameLen)
 		p.Events[i].Note = clamp(p.Events[i].Note, MaxNoteLen)
+		// The event writer sets the count (an int32). One count outside
+		// 0..MaxCount would make the api refuse the whole beat.
+		if p.Events[i].Count < 0 {
+			p.Events[i].Count = 0
+		}
+		if p.Events[i].Count > MaxCount {
+			p.Events[i].Count = MaxCount
+		}
 	}
 
 	// Actions: the server requires target to be 1..253 chars, so an entry with
