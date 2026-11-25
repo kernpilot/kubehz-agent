@@ -1,0 +1,111 @@
+# The daily scan of the Go dependencies: govulncheck on every module.
+#
+# The vulnerability database moves without a commit. A green pull request can
+# be red one day later: that finding is the reason for this workflow.
+#
+# Red: the code calls a vulnerable symbol and .github/dep-scan-ignore.json has
+# no valid entry for it, or an entry of that file is expired. The rules are in
+# .github/scripts/dep_scan.py.
+#
+# govulncheck reports the standard library of the Go that runs it. So the job
+# takes the Go version from the golang image in Dockerfile. It scans
+# the source at this commit, not an image that was built before.
+#
+# ci.yaml runs govulncheck on every pull request and before every image. So a
+# pull request starts this workflow only when it changes the scan itself.
+name: dep-scan
+
+on:
+  schedule:
+    - cron: '8 5 * * *'
+  workflow_dispatch:
+  # A pull request runs its own copy of this file. The job holds no secret,
+  # and its token can only read.
+  pull_request:
+    paths:
+      - '.github/workflows/dep-scan.yml'
+      - '.github/dep-scan-ignore.json'
+      - '.github/scripts/dep_scan*.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dep-scan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # As in the golang images: do not download another toolchain.
+      GOTOOLCHAIN: local
+      # As in the image build: no cgo.
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: the tests of the verdict script
+        run: python3 -B .github/scripts/dep_scan_test.py
+      - name: the Go version of the image build
+        id: image
+        run: |
+          set -euo pipefail
+          mapfile -t versions < <(sed -nE 's/^FROM golang:([0-9]+(\.[0-9]+)+)[^ ]* AS build$/\1/p' Dockerfile)
+          if [ "${#versions[@]}" -ne 1 ]; then
+            echo "::error::no golang version for the stage build of Dockerfile, found: ${versions[*]:-none}"
+            exit 1
+          fi
+          echo "go=${versions[0]}" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: ${{ steps.image.outputs.go }}
+          # A tag without a patch (1.26) is the newest patch, as in the registry.
+          check-latest: true
+          # No cache: this job must not write the module cache of the other jobs.
+          cache: false
+      - name: the Go is the Go of the image build
+        env:
+          WANT: ${{ steps.image.outputs.go }}
+        run: |
+          set -euo pipefail
+          got="$(go env GOVERSION)"
+          case "$got" in
+            "go$WANT" | "go$WANT".*) echo "scan with $got" ;;
+            *) echo "::error::the image build uses Go $WANT, this job has $got"; exit 1 ;;
+          esac
+          # A newer patch is a warning. The scan itself is red when the patch fixes
+          # something that the code calls.
+          if newest="$(curl -fsSL --retry 5 --retry-all-errors --max-time 60 'https://go.dev/dl/?mode=json' \
+            | jq -r --arg line "${got%.*}." '[.[].version | select(startswith($line))][0] // "none, the line is not supported"')"; then
+            if [ "$newest" != "$got" ]; then
+              echo "::warning::the scan uses $got, the newest patch of that line: $newest"
+            fi
+          else
+            echo "::warning::the list of Go releases did not load"
+          fi
+      - name: govulncheck on every module
+        run: |
+          set -euo pipefail
+          # Pinned: the scanner is part of the supply chain too. The Go checksum
+          # database checks the download.
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          mapfile -t modules < <(git ls-files 'go.mod' '*/go.mod')
+          if [ "${#modules[@]}" -eq 0 ]; then
+            echo "::error::no go.mod found: nothing was scanned"
+            exit 1
+          fi
+          out="$RUNNER_TEMP/dep-scan"
+          mkdir -p "$out"
+          for module in "${modules[@]}"; do
+            dir="$(dirname "$module")"
+            name="${dir//\//-}"
+            if [ "$dir" = . ]; then name=root; fi
+            echo "govulncheck: $name"
+            # In this format the exit status is 0 with findings too. Every other
+            # status is a scan that failed, and it stops the job.
+            (cd "$dir" && govulncheck -format json ./... > "$out/$name.json")
+          done
+          python3 -B .github/scripts/dep_scan.py --ignore .github/dep-scan-ignore.json "$out"/*.json

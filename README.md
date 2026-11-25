@@ -570,6 +570,10 @@ guessed (see `AGENTS.md`).
 `gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`, then builds the
 moving `main` image and the internal Harbor mirror.
 
+`dep-scan.yml` runs `govulncheck` each day on `main`, with the Go of the image
+build: a new advisory shows without a commit. An accepted finding is an entry in
+`.github/dep-scan-ignore.json` with a reason and an expiry date.
+
 `release.yaml` cuts the customer artifact for a `vX.Y.Z` git tag. Tags belong to
 it alone — `ci.yaml` skips them, because two workflows building one tag produce
 two different digests for one version and the registry tag then points at
