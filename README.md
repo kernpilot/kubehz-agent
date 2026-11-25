@@ -613,6 +613,12 @@ Versions are verified against their registries before pinning, never guessed
 `gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`, then builds the
 moving `main` image and the Harbor mirror.
 
+`dep-scan.yml` runs `osv-scanner` each day on `main`: a new advisory shows without
+a commit. It matches offline against a downloaded archive of advisories, so it
+sends nothing about the dependencies. It reads every `go.mod` and the standard
+library of the image build. An accepted finding is an entry in
+`.github/dep-scan-ignore.json` with a reason and an expiry date.
+
 `release.yaml` cuts the customer artifact for a `vX.Y.Z` git tag. Tags belong to
 it alone, and `ci.yaml` skips them. Two workflows that build one tag would
 produce two different digests for one version, and the registry tag would then

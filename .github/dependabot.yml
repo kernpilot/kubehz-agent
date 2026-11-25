@@ -1,0 +1,30 @@
+# Dependency PRs: weekly and grouped. No automerge: a merge to main publishes
+# the `main` image.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+  # The Go of the Dockerfile, the `toolchain` line of go.mod and GO_VERSION in the
+  # workflows move together. Dependabot moves only the Dockerfile: add the other
+  # two to its pull request.
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+  # The actions are pinned by commit SHA. Dependabot moves the SHA and the
+  # version in the comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday }
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
