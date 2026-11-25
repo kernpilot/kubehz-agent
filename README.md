@@ -16,8 +16,8 @@ the bash heartbeat.
 > `availableUpdates` come back to the CR status (visible via plain kubectl).
 > The server gates every acting capability: it computes the `/desired`
 > `execution{}` flags from tier × access × platform kill switch. The agent
-> adds hard, unit-tested guardrails. It reports anything authorized but not
-> built as an unsupported action and never improvises. Acting is
+> adds hard, unit-tested guardrails. An action that is authorized but not
+> built is reported as unsupported, never improvised. Acting is
 > single-writer (a leader-elected Lease), so it is safe to run more than one
 > replica. Control-plane upgrades stay user-driven.
 
@@ -42,17 +42,19 @@ recur. Unit tests keep the mapping as a regression guard.
   agent-token `A` (`khz_agt_<hex64>`) from the in-cluster Secret `kubehz-agent`
   and sends `Authorization: Bearer A` to the existing heartbeat endpoint. The
   server's authenticated-heartbeat ratchet applies unchanged.
-- **Least privilege.** The base is read-only on nodes/pods/events and the lok8s
-  `ClusterInventory`, with a single name-scoped `get` on its own token Secret.
-  No logs/exec, no other secret reads.
+- **Least privilege.** The base reads nodes/pods/events, the lok8s
+  `ClusterInventory`, the CertificateSigningRequests (`list`) and the URLs
+  `/readyz` and `/version`. It has a single name-scoped `get` on its own token
+  Secret. No logs/exec, no other secret reads.
   - Every **acting** write is an opt-in RBAC overlay (`deploy/managed/`),
     absent from the base entirely. The acting writes are the MachineDeployment
-    patch (replicas / kubelet version) and the Machine **delete**.
-  - The Machine delete (self-healing) is the sharpest permission the agent
-    holds. `deploy/managed/rbac-managed.yaml` documents it loudly, and you can
-    remove it independently.
-  - The overlay also holds the acting Lease. With it, the agent proves that it
-    is the only actor before it writes anything.
+    patch (replicas / kubelet version), the Machine **delete**, the pod
+    **delete** (cluster-wide, for the eviction unwedge) and the acting Lease.
+  - The Machine delete (self-healing) and the cluster-wide pod delete are the
+    sharpest permissions the agent holds. `deploy/managed/rbac-managed.yaml`
+    documents them, and you can remove each one independently.
+  - With the acting Lease, the agent proves that it is the only actor before it
+    writes to a machine or a pool.
   - The base's one write, `patch` on `clusterinventories/status`, is a
     visibility mirror on the cluster's own reporting object (see the inventory
     section), not an acting permission.
@@ -108,7 +110,7 @@ recur. Unit tests keep the mapping as a regression guard.
 | `internal/leader` | the acting Lease: leader election gating the desired-state loop (one actor, or none) |
 | `internal/agent` | wiring: informers → coalescer → sender; poller → executor → actions → beats |
 | `internal/buildinfo` | build-stamped version |
-| `deploy/` | base (read-only) + `managed/` overlay (acting RBAC). The resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
+| `deploy/` | base (read-only, plus the `clusterinventories/status` patch) + `managed/` overlay (acting RBAC). The resources are named `kubehz-live-agent*` to coexist with the bash CronJob agent's `kubehz-agent*` RBAC (see `deploy/README.md`) |
 
 The debounce policy is a **pure function** (`publisher.decide`), with no timers
 in the tested code path. Thus unit tests cover the whole cadence (debounce /
@@ -118,10 +120,9 @@ min-gap / periodic) exhaustively.
 
 The agent POSTs to the **existing** heartbeat endpoint
 `POST /api/clusters/{id}/heartbeat` with `Authorization: Bearer A`, carrying an
-**additive** `schema: 2` body. The server's heartbeat schema is *non-strict*, so
-a schema-2 payload is **accepted today**: the server strips unknown fields and
-keeps the schema-1 base fields. So the payload degrades gracefully until the API
-is extended.
+**additive** `schema: 2` body. The server's heartbeat schema is *non-strict*: the
+API ingests the schema-2 fields that it knows (see "The API side of this
+contract" below) and strips the others.
 
 ```jsonc
 {
@@ -177,7 +178,7 @@ is extended.
         "category": "networking", "source": "addon" }
     ]
   }
-  // forward-compat, populated in later phases: "pools":[…], "desired":{…}
+  // forward-compat, not sent yet: "pools":[…], "desired":{…}
 }
 ```
 
@@ -214,9 +215,10 @@ Machine objects that machine-controller maintains:
 
 - **terminal** `status.errorReason`/`errorMessage` ("manual intervention
   required": InvalidConfiguration, CreateError, …);
-- **retry-loop** Warning events on Machines, with the reason
-  `ReconcilingError`. Here lives "webhook accepted it, hcloud rejects every
-  create: *unsupported location for server type*". It is never a status field;
+- **retry-loop**: every Warning event on a Machine that still exists. A typical
+  reason is `ReconcilingError`. Here lives "webhook accepted it, hcloud rejects
+  every create: *unsupported location for server type*". It is never a status
+  field;
 - an agent-synthesized `NodeJoinTimeout` for machines with no node 10 minutes
   after creation.
 
@@ -289,7 +291,8 @@ name ≤ 253, status ≤ 63, …), so a well-behaved agent is never 400'd.
 **Privacy gating.** `byNamespace` pod counts and event `namespace`/`note` are
 included **only** when `KUBEHZ_REPORT_NAMESPACES=true`. The default is phase-only
 counts and reason/kind-only events: workload *visibility* without workload
-*contents*.
+*contents*. The gate does not cover `machineIssues[]`: with the managed overlay,
+that block carries the Machine name and the message text of the error or event.
 
 The API side of this contract is **shipped**:
 
@@ -392,8 +395,8 @@ How they work, truthfully:
    - **Never control-plane**: node role labels, machine labels, and the same
      CP-MD heuristic scaling uses.
    - A **storm brake**: more unhealthy than `maxUnhealthy` deletes *nothing* and
-     reports every candidate `failed` ("unhealthy count N exceeds maxUnhealthy
-     M", with the note that this is a possible outage).
+     reports every candidate `failed`. The detail says "unhealthy count N
+     exceeds maxUnhealthy M" and "refusing (possible outage)".
    - At most `maxUnhealthy` disruptions in flight (any already-deleting machine
      counts).
    - A per-pool `cooldownSeconds`, **never below 5 minutes** whatever the
@@ -410,8 +413,9 @@ How they work, truthfully:
    - **Simultaneous failure is an outage, not hardware.** When *every* node of
      a pool goes unhealthy inside 5 minutes, the agent refuses to remediate
      anything there and reports why. The same rule applies to the whole worker
-     set, which is how one-machine pools are covered. Independent hardware does
-     not fail together. A partition, an apiserver outage or a control-plane
+     set, which is how one-machine pools are covered. The rule needs at least
+     two nodes: it does not cover a cluster with one worker. Independent
+     hardware does not fail together. A partition, an apiserver outage or a control-plane
      restart does, and those leave the servers alive and running your
      workload while their nodes read `Unknown`. The agent cannot tell a dead
      node from a partitioned one, so it does not guess.
@@ -441,8 +445,9 @@ How they work, truthfully:
    `KUBEHZ_HEAL_EVICTION_TIMEOUT_SECONDS` (default 300), *and* whose node is
    still unreachable (Ready Unknown/False). Then it force-deletes exactly the
    pods **already Terminating on that node** (grace 0, UID-preconditioned so a
-   same-name replacement is never hit), **once per machine**. It reports this
-   on the heal action ("eviction unwedged: force-deleted N pod(s)…"). The
+   same-name replacement is never hit), **once per machine** and at most 100
+   pods. It reports this on the heal action ("eviction unwedged after …:
+   force-deleted N pod(s) stuck terminating on unreachable node …"). The
    agent never touches a manually-deleted machine (in-memory tracking: a
    restart conservatively forgets) and leaves a recovered node alone. Without
    the pods-delete ClusterRole the attempt warns loudly and fails soft, while
@@ -457,13 +462,18 @@ How they work, truthfully:
    An unknown observed version refuses, never guesses.) **One pool rolls at
    a time.** Progress reports per pool as `"vFROM → vTO (n/m)"` (n = machines
    at target with a joined node). Autoscaler pools report unsupported. A
-   failure stops the upgrade (halt-on-failure). Workers only: the agent never
-   upgrades a control plane.
+   failed patch stops that pass (halt-on-failure): the later pools wait, and
+   the next poll tries again. Workers only: the agent never upgrades a control
+   plane.
 6. **The cluster's own machinery does the provisioning.** Every write wakes
    the in-cluster machine-controller, which creates/deletes Hetzner servers
    with the credentials **it already holds**. The agent contains no hcloud
    token, no SSH key, no provisioner. To revoke the platform's access, run
-   `kubectl delete ns kubehz-system`. Nothing else changes.
+   `kubectl delete ns kubehz-system`. This deletes everything in the namespace:
+   both agents, their ServiceAccounts and the Secret with the cluster identity.
+   So the heartbeats stop too. The ClusterRoles and the Role in `kube-system`
+   stay without a subject until you delete them. Your nodes, pools and workloads
+   do not change.
 7. **Exactly one replica acts.** Acting is gated on a leader-elected Lease
    (`kubehz-system/kubehz-live-agent`, RBAC in `deploy/managed/`): the poller
    and the executor start only while this replica holds it. When the lease
@@ -527,6 +537,8 @@ unaffected. See [deploy/README.md](deploy/README.md).
 | `KUBEHZ_API_URL` | none (required) | api base; **https** (http only for loopback) |
 | `KUBEHZ_AGENT_TOKEN_FILE` | `/var/run/secrets/kubehz/agent-token` | mounted bearer A |
 | `KUBEHZ_AGENT_TOKEN` | none | token via env (discouraged; tests/local only) |
+| `KUBEHZ_NAMESPACE` | `kubehz-system` | namespace of the Secret for the API fallback |
+| `KUBEHZ_SECRET_NAME` | `kubehz-agent` | name of the Secret for the API fallback |
 | `KUBEHZ_FULL_INTERVAL` | `60s` | periodic full-snapshot push |
 | `KUBEHZ_DEBOUNCE` | `10s` | coalesce a change burst |
 | `KUBEHZ_MIN_GAP` | `15s` | floor between two pushes |
@@ -577,7 +589,8 @@ docker build -t kubehz-agent:dev --build-arg VERSION=dev .
 # contract and the image digest-pinning rules.
 kubectl apply -k deploy/          # registered tier: observe + report only
 kubectl apply -k deploy/managed/  # managed tier: + acting RBAC (scale/upgrade
-                                  #   patch, machineIssues read, heal delete)
+                                  #   patch, machineIssues read, heal delete,
+                                  #   pod delete, acting Lease)
 ```
 
 Toolchain: **Go 1.26** · **client-go v0.35.6** (matches Kubernetes v1.35.x).
@@ -589,8 +602,10 @@ Versions are verified against their registries before pinning, never guessed
 - **Image:** distroless `static-debian12:nonroot`, pinned by digest; static
   `CGO_ENABLED=0` binary; runs non-root (65532), read-only rootfs, all caps
   dropped, seccomp `RuntimeDefault`.
-- **The token `A` is never logged or printed.** `Config.String()` redacts it. The
-  claim-code `C` is never mounted or read by this agent.
+- **The token `A` is never logged or printed.** `Config.String()` redacts it.
+- **The claim code `C` is never mounted or used.** The Deployment mounts only the
+  `agent-token` key. The API fallback reads the whole Secret object, and that
+  object also holds `claim-code`. The agent takes only `agent-token` from it.
 
 ### Two lanes: `ci.yaml` and `release.yaml`
 
@@ -599,9 +614,9 @@ Versions are verified against their registries before pinning, never guessed
 moving `main` image and the Harbor mirror.
 
 `release.yaml` cuts the customer artifact for a `vX.Y.Z` git tag. Tags belong to
-it alone, and `ci.yaml` skips them. Two workflows building one tag produce two
-different digests for one version, and the registry tag then points at
-whichever run finished last.
+it alone, and `ci.yaml` skips them. Two workflows that build one tag would
+produce two different digests for one version, and the registry tag would then
+point at whichever run finished last.
 
 What a release publishes:
 
@@ -613,7 +628,7 @@ What a release publishes:
 | **cosign-signed** | Keyless, through the Actions OIDC identity. No long-lived key exists. |
 | **SBOM attached** | SPDX, generated from the pushed image, attested with `cosign attest --type spdxjson`, and uploaded to the release. BuildKit's own SBOM and SLSA provenance also ride inside the image index. |
 | **Pinned by digest in the manifests** | `deploy/base/deployment.yaml` carries a digest, never a tag. The release renders `install.yaml` / `install-managed.yaml` with the released digest and refuses to publish if a moving tag survived. |
-| **Verifiable** | The workflow runs the same `cosign verify` and `cosign verify-attestation` commands this README gives customers, against the public image, before it publishes. A digest a customer cannot verify never ships. |
+| **Verifiable** | The workflow runs the `cosign verify` and `cosign verify-attestation` commands of [deploy/README.md](deploy/README.md) against the pushed image, before it publishes the GitHub Release. If one fails, there is no release for that digest. |
 
 Actions are pinned by commit SHA in both lanes. A tag can move; a commit
 cannot.
@@ -627,7 +642,7 @@ after bumping the digest in `deploy/base/deployment.yaml`). On a lok8s
 cluster, re-run `lo kubehz deploy` after lok8s re-vendors `deploy/`
 (`internal/kubehz/manifests/live-agent/`, digest-pinned). Rolling back is
 the same step with the previous digest. Nothing on the platform side can
-change what runs in a customer's cluster.
+change which agent image runs in a customer's cluster.
 
 ### Publishing a release
 
@@ -636,7 +651,7 @@ can pull `ghcr.io/kernpilot/kubehz-agent` today with no credentials. So cutting 
 version is one owner action and nothing else:
 
 ```bash
-git tag -a v0.1.0 -m "kubehz-agent v0.1.0" && git push origin v0.1.0
+git tag -a vX.Y.Z -m "kubehz-agent vX.Y.Z" && git push origin vX.Y.Z
 ```
 
 That runs `release.yaml`: verify, build, sign, attest, verify again, then
@@ -647,13 +662,14 @@ If a run dies halfway, re-run the workflow by hand (**Actions → Release → Ru
 workflow**) with the same tag. Every step is idempotent.
 
 The Harbor mirror step needs the `HARBOR_USERNAME` / `HARBOR_PASSWORD`
-repository secrets. Without them it prints a line and skips. Harbor is a
+repository secrets. Without them it prints a line and skips. Harbor is a private
 convenience mirror, so its absence must never hold up a customer release.
 
-## Follow-ups (later phases)
+## Follow-ups
 
 - **Dashboard** live surfaces: node capacity and instance type, a workloads
-  card, "reported n s ago".
+  card, "reported n s ago". A reader of the payload uses the `ready` bool, not
+  the `status` text (`NotReady` contains `Ready`).
 - **Observed pools:** a MachineDeployment informer feeding `pools[]` (observed
   replicas/ready per pool) once the API ingests it. It closes the
   desired→observed convergence loop in the dashboard. Also an apps deployments
