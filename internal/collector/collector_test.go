@@ -36,7 +36,7 @@ func TestBuildPayload_FullSnapshot(t *testing.T) {
 		events: []*corev1.Event{warnEvent("e", "BackOff", "Pod", "d", "m", 1, fixed)},
 	}
 	p := BuildPayload(src, Meta{
-		ClusterID:     "kubehz.in.net",
+		ClusterID:     "cluster.example.com",
 		ServerVersion: "v1.35.5",
 		AgentVersion:  "0.1.0",
 		Now:           func() time.Time { return fixed },
@@ -45,7 +45,7 @@ func TestBuildPayload_FullSnapshot(t *testing.T) {
 	if p.Schema != state.SchemaVersion {
 		t.Errorf("schema = %d", p.Schema)
 	}
-	if p.ClusterID != "kubehz.in.net" || p.Kubernetes.Version != "v1.35.5" {
+	if p.ClusterID != "cluster.example.com" || p.Kubernetes.Version != "v1.35.5" {
 		t.Errorf("meta wrong: %+v", p)
 	}
 	if p.Agent.Mode != state.ModeOperator {

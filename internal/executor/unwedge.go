@@ -1,6 +1,6 @@
 // P5 EVICTION UNWEDGE — the bounded follow-through to a heal deletion.
 //
-// Dogfood finding (2026-07-05, kubehz.in.net): after healing deletes a Machine
+// Dogfood finding (2026-07-05): after healing deletes a Machine
 // whose node is truly dead (kubelet stopped), machine-controller retries
 // eviction indefinitely (~11s loop) because the non-DaemonSet pods stuck
 // Terminating on the unreachable node never confirm deletion — the Machine

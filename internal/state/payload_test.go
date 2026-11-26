@@ -415,7 +415,7 @@ func TestPayload_ActionsWireShape(t *testing.T) {
 }
 
 func TestApplyCaps_Idempotent(t *testing.T) {
-	p := &Payload{ClusterID: "kubehz.in.net", Nodes: []NodeState{{Name: "n1"}}}
+	p := &Payload{ClusterID: "cluster.example.com", Nodes: []NodeState{{Name: "n1"}}}
 	ApplyCaps(p)
 	first, _ := json.Marshal(p)
 	ApplyCaps(p)
@@ -444,7 +444,7 @@ func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
 func TestPayload_WireNames(t *testing.T) {
 	p := &Payload{
 		Schema:     SchemaVersion,
-		ClusterID:  "kubehz.in.net",
+		ClusterID:  "cluster.example.com",
 		Timestamp:  "2026-07-05T00:00:00Z",
 		Agent:      AgentMeta{Version: "0.1.0", Mode: ModeOperator},
 		Kubernetes: KubeInfo{Version: "v1.35.5"},
@@ -461,7 +461,7 @@ func TestPayload_WireNames(t *testing.T) {
 	}
 	s := string(b)
 	for _, want := range []string{
-		`"schema":2`, `"clusterId":"kubehz.in.net"`, `"kubernetes":{"version":"v1.35.5"}`,
+		`"schema":2`, `"clusterId":"cluster.example.com"`, `"kubernetes":{"version":"v1.35.5"}`,
 		`"instanceType":"cx32"`, `"roles":"control-plane"`, `"ready":true`,
 		`"kubeletVersion":"v1.35.5"`, `"mode":"operator"`, `"workloads"`,
 	} {

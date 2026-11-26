@@ -38,7 +38,7 @@ func TestSender_RetriesUntilSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pub := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	pub := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	s := NewSender(pub, time.Millisecond, time.Millisecond, nil)
 	s.afterFunc = instantAfter
 
@@ -236,7 +236,7 @@ func TestSender_AuthErrorReloadsTokenFromFile(t *testing.T) {
 	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pub := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	pub := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	pub.SetTokenReloader(func(context.Context) (string, error) {
 		return config.ReadTokenFile(os.ReadFile, tokenFile)
 	})
@@ -288,7 +288,7 @@ func TestSender_AuthErrorUnchangedTokenStillBacksOff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	pub := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	pub := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	var reloads int32
 	pub.SetTokenReloader(func(context.Context) (string, error) {
 		atomic.AddInt32(&reloads, 1)

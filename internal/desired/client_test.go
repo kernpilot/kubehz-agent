@@ -32,7 +32,7 @@ func TestClient_ETagConditionalGet(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+testToken {
 			t.Errorf("bad Authorization header: %q", got)
 		}
-		if r.URL.Path != "/api/clusters/kubehz.in.net/desired" {
+		if r.URL.Path != "/api/clusters/cluster.example.com/desired" {
 			t.Errorf("bad path: %q", r.URL.Path)
 		}
 		if r.Header.Get("If-None-Match") == etag {
@@ -44,7 +44,7 @@ func TestClient_ETagConditionalGet(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 
 	doc, notModified, err := c.Fetch(context.Background())
 	if err != nil || notModified {
@@ -93,7 +93,7 @@ func TestClient_ETagIsOpaque(t *testing.T) {
 			_, _ = w.Write([]byte(docBody))
 		}))
 
-		c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+		c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 		if _, _, err := c.Fetch(context.Background()); err != nil {
 			t.Fatalf("etag %s: first fetch: %v", etag, err)
 		}
@@ -127,7 +127,7 @@ func TestClient_ETagFormatChangeRecaches(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	if _, _, err := c.Fetch(context.Background()); err != nil {
 		t.Fatalf("first fetch: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestClient_DecodesHealingBlock(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	doc, _, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
@@ -181,7 +181,7 @@ func TestClient_MissingHealingBlockIsDisabled(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	doc, _, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
@@ -301,7 +301,7 @@ func TestClient_RevalidateBypassesCaches(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	if _, _, err := c.Fetch(context.Background()); err != nil { // caches the ETag
 		t.Fatalf("priming fetch: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestClient_Revalidate304IsAnError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	doc, notModified, err := c.Revalidate(context.Background())
 	if err == nil {
 		t.Fatalf("revalidate accepted a 304: doc=%v notModified=%v", doc, notModified)
@@ -451,7 +451,7 @@ func TestClient_ForgetETagAndNoCache(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	c := NewClient(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	for i := 0; i < 2; i++ {
 		if _, _, err := c.Fetch(context.Background()); err != nil {
 			t.Fatalf("fetch %d: %v", i, err)

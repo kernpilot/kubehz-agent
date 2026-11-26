@@ -109,7 +109,7 @@ var namespaceRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 var podNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 
 // clusterIDRE constrains CLUSTER_ID to a DNS-name-like shape (the cluster
-// domain, e.g. "kubehz.in.net"). The value is embedded in the heartbeat URL
+// domain, e.g. "cluster.example.com"). The value is embedded in the heartbeat URL
 // path, so anything with separators/whitespace ('/', '?', '#', spaces, …) is
 // rejected up front — a typo'd CLUSTER_ID must fail fast, not silently POST to
 // a mangled path. The publisher additionally path-escapes it (defense in depth).
@@ -117,7 +117,7 @@ var clusterIDRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-
 
 // Config is the fully-resolved agent configuration.
 type Config struct {
-	ClusterID string // cluster domain, e.g. "kubehz.in.net"
+	ClusterID string // cluster domain, e.g. "cluster.example.com"
 	APIURL    string // kubehz-api base, e.g. "https://api.kubehz.cloud"
 
 	// AgentToken is bearer A. May be empty here when it is to be read from the
