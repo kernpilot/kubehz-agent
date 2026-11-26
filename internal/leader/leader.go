@@ -246,7 +246,9 @@ func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interfa
 		}
 		if !leaseRefused(err) {
 			if refused {
-				log.Info("the acting lease is readable now; contending for it", "lease", lease, "identity", cfg.Identity)
+				// Not "readable": a timeout or a server error also ends the
+				// wait, and the election then handles it.
+				log.Info("the apiserver no longer refuses a read of the acting lease; contending for it", "lease", lease, "identity", cfg.Identity)
 			}
 			return true
 		}
@@ -275,13 +277,19 @@ func leaseRefused(err error) bool {
 	return apierrors.IsForbidden(err) && !apierrors.IsUnexpectedServerError(err)
 }
 
-// refusalLock reports the first refused read of the election to refused.
-// The access read before a term cannot see a refusal that comes later: a
-// first read that failed for another reason (a timeout while the apiserver
-// starts), or a grant removed while this process contends. The library would
-// then repeat the refused read every RetryPeriod, and log each one, for as
-// long as the pod runs. term ends instead, and Run goes back to the access
-// read, which says so once.
+// refusalLock reports each refused read of the election to refused, and the
+// first one ends the term. The access read before a term cannot see a
+// refusal that comes later: a first read that failed for another reason (a
+// timeout while the apiserver starts), or a grant removed while this process
+// contends or leads. The library would then repeat the refused read every
+// RetryPeriod, and log each one, for as long as the pod runs. term ends
+// instead, and Run goes back to the access read, which says so once.
+//
+// One refusal is enough, also while this process leads: acting stops at that
+// renewal, not after RenewDeadline, even if the next read would pass. That is
+// the safe side. Until the acting callback has returned, the library can
+// repeat the read at each RetryPeriod, at most RenewDeadline/RetryPeriod
+// times.
 type refusalLock struct {
 	resourcelock.Interface
 	refused func()

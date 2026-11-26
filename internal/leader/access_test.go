@@ -187,7 +187,7 @@ func TestRun_LaterGrantStartsActingWithoutRestart(t *testing.T) {
 		if n := strings.Count(out, "level=WARN"); n != 1 {
 			t.Errorf("%d warnings, want exactly one:\n%s", n, out)
 		}
-		if !strings.Contains(out, "readable now") {
+		if !strings.Contains(out, "no longer refuses") {
 			t.Errorf("log = %q, want the agent to say that it contends now", out)
 		}
 	})
@@ -427,19 +427,33 @@ func TestRun_RefusalWhileLeadingStopsActingAtTheNextRenewal(t *testing.T) {
 		cfg := productionConfig(client, &logs)
 
 		ctx, cancel := context.WithCancel(context.Background())
-		leading, stopped := make(chan struct{}), make(chan time.Time, 1)
+		leading, stopped := make(chan struct{}, 1), make(chan time.Time, 1)
 		done := make(chan error, 1)
 		go func() {
 			done <- Run(ctx, cfg, func(actCtx context.Context) {
-				close(leading)
+				select {
+				case leading <- struct{}{}:
+				default:
+				}
 				<-actCtx.Done()
-				stopped <- time.Now()
+				select {
+				case stopped <- time.Now():
+				default:
+				}
 			})
 		}()
+		// fatal ends Run first: the bubble ends only when Run has returned.
+		fatal := func(msg string) {
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Errorf("Run returned %v, want context.Canceled", err)
+			}
+			t.Fatal(msg)
+		}
 		select {
 		case <-leading:
 		case <-time.After(time.Hour):
-			t.Fatal("never acted with the grant in place")
+			fatal("never acted with the grant in place")
 		}
 
 		// Between two renewals, so the next one is at most RetryPeriod away.
@@ -453,7 +467,7 @@ func TestRun_RefusalWhileLeadingStopsActingAtTheNextRenewal(t *testing.T) {
 				t.Errorf("acting stopped %v after the grant was removed, want at most %v", d, DefaultRetryPeriod)
 			}
 		case <-time.After(time.Hour):
-			t.Fatal("acting did not stop after the grant was removed")
+			fatal("acting did not stop after the grant was removed")
 		}
 		time.Sleep(52 * time.Minute)
 		cancel()
