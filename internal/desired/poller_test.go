@@ -135,7 +135,7 @@ func (tm *timers) next(t *testing.T) chan time.Time {
 
 func newTestPoller(t *testing.T, srvURL string, actor Actor) (*Poller, *timers) {
 	t.Helper()
-	c := NewClient(srvURL, "kubehz.in.net", testToken, "0.1.0", nil)
+	c := NewClient(srvURL, "cluster.example.com", testToken, "0.1.0", nil)
 	p := NewPoller(c, actor, time.Minute, time.Second, time.Minute, nil)
 	tm := newTimers()
 	p.afterFunc = tm.afterFunc
@@ -223,7 +223,7 @@ func TestPoller_AuthErrorBacksOffAndNeverActs(t *testing.T) {
 	defer ts.Close()
 
 	actor := &recordingActor{}
-	c := NewClient(ts.URL, "kubehz.in.net", testToken, "0.1.0", nil)
+	c := NewClient(ts.URL, "cluster.example.com", testToken, "0.1.0", nil)
 	p := NewPoller(c, actor, time.Minute, time.Second, time.Minute, nil)
 	tm := newTimers()
 	p.afterFunc = tm.afterFunc
@@ -510,7 +510,7 @@ func TestPoller_LogsHealingArmStateAndPolicy(t *testing.T) {
 
 			var buf syncBuffer
 			logger := slog.New(slog.NewTextHandler(&buf, nil))
-			c := NewClient(ts.URL, "kubehz.in.net", testToken, "0.1.0", nil)
+			c := NewClient(ts.URL, "cluster.example.com", testToken, "0.1.0", nil)
 			p := NewPoller(c, &recordingActor{}, time.Minute, time.Second, time.Minute, logger)
 			tm := newTimers()
 			p.afterFunc = tm.afterFunc

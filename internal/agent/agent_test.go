@@ -81,7 +81,7 @@ func TestAgent_RunPublishesAndShutsDown(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cluster.example.com",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 150 * time.Millisecond,
@@ -160,7 +160,7 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 	var mu sync.Mutex
 	var payloads []state.Payload
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/clusters/cluster.example.com/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		var p state.Payload
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			t.Errorf("payload decode: %v", err)
@@ -170,7 +170,7 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/clusters/cluster.example.com/desired", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+testToken {
 			t.Errorf("desired GET bad Authorization: %q", got)
 		}
@@ -186,7 +186,7 @@ func TestAgent_DesiredLoopScalesAndReportsActions(t *testing.T) {
 	defer srv.Close()
 
 	cfg := &config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cluster.example.com",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 150 * time.Millisecond,
@@ -268,20 +268,20 @@ func TestAgent_StandbySendsNoBeatsWhileAPeerHoldsTheLease(t *testing.T) {
 	var mu sync.Mutex
 	var beats []time.Time
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /api/clusters/cluster.example.com/heartbeat", func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
 		beats = append(beats, time.Now())
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /api/clusters/cluster.example.com/desired", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	cfg := &config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cluster.example.com",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 100 * time.Millisecond,
@@ -713,7 +713,7 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 	// non-empty → absent key → empty [].
 	respBody := `{"status":"ok","availableUpdates":[{"name":"cilium","current":"1.16.1","latest":"1.17.4"}]}`
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/clusters/cluster.example.com/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		var p state.Payload
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			t.Errorf("payload decode: %v", err)
@@ -727,14 +727,14 @@ func TestAgent_InventoryRidesTheBeat(t *testing.T) {
 		// returns them in the heartbeat response (kubehz-api f628c97).
 		_, _ = fmt.Fprint(w, body)
 	})
-	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/clusters/cluster.example.com/desired", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	cfg := &config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cluster.example.com",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 150 * time.Millisecond,
@@ -862,7 +862,7 @@ func TestAgent_NoInventoryCRNoBlock(t *testing.T) {
 	var mu sync.Mutex
 	var raws []string
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/clusters/kubehz.in.net/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/clusters/cluster.example.com/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -872,14 +872,14 @@ func TestAgent_NoInventoryCRNoBlock(t *testing.T) {
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("GET /api/clusters/kubehz.in.net/desired", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/clusters/cluster.example.com/desired", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, `{"revision":0,"workerPools":[],"execution":{"scaling":false,"upgrades":false}}`)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	cfg := &config.Config{
-		ClusterID:    "kubehz.in.net",
+		ClusterID:    "cluster.example.com",
 		APIURL:       srv.URL,
 		AgentToken:   testToken,
 		FullInterval: 150 * time.Millisecond,

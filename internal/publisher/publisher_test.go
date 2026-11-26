@@ -17,7 +17,7 @@ const testToken = "khz_agt_" + "0123456789abcdef0123456789abcdef0123456789abcdef
 func samplePayload() *state.Payload {
 	return &state.Payload{
 		Schema:     state.SchemaVersion,
-		ClusterID:  "kubehz.in.net",
+		ClusterID:  "cluster.example.com",
 		Timestamp:  "2026-07-05T00:00:00Z",
 		Agent:      state.AgentMeta{Version: "0.1.0", Mode: state.ModeOperator},
 		Kubernetes: state.KubeInfo{Version: "v1.35.5"},
@@ -42,7 +42,7 @@ func TestPublish_SendsBearerAndCorrectRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	if err := p.Publish(context.Background(), samplePayload()); err != nil {
 		t.Fatalf("Publish returned error: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestPublish_SendsBearerAndCorrectRequest(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %q, want POST", gotMethod)
 	}
-	if gotPath != "/api/clusters/kubehz.in.net/heartbeat" {
+	if gotPath != "/api/clusters/cluster.example.com/heartbeat" {
 		t.Errorf("path = %q", gotPath)
 	}
 	if gotCT != "application/json" {
@@ -62,7 +62,7 @@ func TestPublish_SendsBearerAndCorrectRequest(t *testing.T) {
 	if gotUA != "kubehz-agent/0.1.0" {
 		t.Errorf("user-agent = %q", gotUA)
 	}
-	if gotBody.ClusterID != "kubehz.in.net" || gotBody.Schema != state.SchemaVersion {
+	if gotBody.ClusterID != "cluster.example.com" || gotBody.Schema != state.SchemaVersion {
 		t.Errorf("decoded body wrong: %+v", gotBody)
 	}
 }
@@ -101,8 +101,8 @@ func TestPublish_RetryableErrorOn500(t *testing.T) {
 }
 
 func TestNew_TrimsTrailingSlash(t *testing.T) {
-	p := New("https://api.kubehz.cloud/", "kubehz.in.net", testToken, "0.1.0", nil)
-	want := "https://api.kubehz.cloud/api/clusters/kubehz.in.net/heartbeat"
+	p := New("https://api.kubehz.cloud/", "cluster.example.com", testToken, "0.1.0", nil)
+	want := "https://api.kubehz.cloud/api/clusters/cluster.example.com/heartbeat"
 	if p.URL() != want {
 		t.Errorf("URL() = %q, want %q", p.URL(), want)
 	}
@@ -141,7 +141,7 @@ func TestPublish_ParsesAvailableUpdates(t *testing.T) {
 	defer srv.Close()
 
 	var got []state.AvailableUpdate
-	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	p.OnAvailableUpdates(func(_ context.Context, updates []state.AvailableUpdate) { got = updates })
 
 	if err := p.Publish(context.Background(), samplePayload()); err != nil {
@@ -182,7 +182,7 @@ func TestPublish_AbsentKeyIsNoVerdict(t *testing.T) {
 			defer srv.Close()
 
 			called := false
-			p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+			p := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 			p.OnAvailableUpdates(func(context.Context, []state.AvailableUpdate) { called = true })
 
 			if err := p.Publish(context.Background(), samplePayload()); err != nil {
@@ -208,7 +208,7 @@ func TestPublish_EmptyListIsAVerdict(t *testing.T) {
 
 	called := false
 	var got []state.AvailableUpdate
-	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	p.OnAvailableUpdates(func(_ context.Context, updates []state.AvailableUpdate) {
 		called = true
 		got = updates
@@ -234,7 +234,7 @@ func TestPublish_NoConsumerNoRead(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := New(srv.URL, "kubehz.in.net", testToken, "0.1.0", srv.Client())
+	p := New(srv.URL, "cluster.example.com", testToken, "0.1.0", srv.Client())
 	if err := p.Publish(context.Background(), samplePayload()); err != nil {
 		t.Fatalf("Publish returned error: %v", err)
 	}
