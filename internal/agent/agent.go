@@ -361,7 +361,7 @@ func (a *Agent) mayLead(sender *publisher.Sender) func() error {
 // while reporting need not be). Losing the lease stops the loop and clears the
 // action reports, so this replica stops asserting outcomes the new leader now
 // owns. A leader-election failure — no Lease RBAC, no coordination API — is
-// loud and leaves the agent reporting, never acting. obs records the
+// logged and leaves the agent reporting, never acting. obs records the
 // election's reads of the Lease for the reporting side; mayLead is the
 // step-down condition (see Agent.mayLead).
 func (a *Agent) runActingLoop(

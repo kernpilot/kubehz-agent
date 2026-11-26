@@ -53,9 +53,10 @@ exactly four things to the `kubehz-live-agent` ServiceAccount:
    `kubehz-live-agent`. Acting is single-writer — the per-pool cooldown, the
    in-flight budget and the one-pool-at-a-time roll are per-process state
    that a second replica cannot see, so two actors would double every bound.
-   **Without this Role the agent does not act at all**: it logs the missing
-   lease and keeps reporting. Upgrading from an agent that predates leader
-   election means re-applying this overlay.
+   **Without this Role the agent does not act at all**: it logs once that
+   it may not read the lease, keeps reporting, and reads it again every 5
+   minutes. Upgrading from an agent that predates leader election means
+   re-applying this overlay.
 
 Every write is executed only when the platform's `/desired` document
 authorizes it — the overlay grants ability, never intent.
