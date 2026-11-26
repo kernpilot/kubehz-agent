@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ── Runtime stage ────────────────────────────────────────────────────────────
 # distroless static (no shell, no package manager, minimal CVE surface), running
 # as the built-in nonroot user. Pinned by digest (gcr.io, verified 2026-07-05).
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 # OCI metadata (spec §1.5: public, auditable image).
 LABEL org.opencontainers.image.title="kubehz-agent" \
