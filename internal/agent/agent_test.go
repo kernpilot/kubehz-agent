@@ -331,7 +331,10 @@ func TestAgent_StandbySendsNoBeatsWhileAPeerHoldsTheLease(t *testing.T) {
 
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not stop after context cancel")
 	}
