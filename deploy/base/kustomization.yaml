@@ -28,14 +28,14 @@ resources:
 # (base/deployment.yaml) — nothing to configure for a normal customer.
 #
 # Override here, never by editing deployment.yaml, when you pull from
-# somewhere else: our own Harbor dogfood mirror, an air-gapped mirror, or a
+# somewhere else: an internal mirror, an air-gapped mirror, or a
 # corporate pull-through cache. Keep the DIGEST — that is what makes the ref
 # verifiable and rollback-able; only the registry/repository changes.
 #
 # images:
 #   - name: ghcr.io/kernpilot/kubehz-agent
-#     newName: docker.kubehz.in.net/kubehz-builds/kubehz-agent
-#     digest: sha256:474994f0a64acf179fa5d8524aac8ee963b347ae29407895c8a8f51ec6d064aa
+#     newName: registry.example.com/mirror/kubehz-agent
+#     digest: sha256:54bba61ef3e7900f8cd7af8439e3a2164b7968024c336a9d836c269598b24080
 #
 # To move to a specific release instead, take the digest from that release's
 # `digest.txt` (or apply its `install.yaml` directly).

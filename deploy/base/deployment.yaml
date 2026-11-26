@@ -10,15 +10,18 @@ metadata:
     app.kubernetes.io/part-of: kubehz
     app.kubernetes.io/component: live-view
 spec:
-  # Single replica by default. More than one is SAFE now: ACTING is gated on a
-  # leader-elected Lease (kubehz-system/kubehz-live-agent, RBAC in
-  # deploy/managed/), so exactly one replica ever patches a MachineDeployment
-  # or deletes a Machine. The holder also does the reporting; the others stand
-  # by and send no heartbeats while it holds the lease, and a holder whose
-  # heartbeats fail for 5 minutes steps down. Strategy Recreate still avoids
-  # two agents briefly double-reporting during a rollout. On shutdown the agent
-  # drains and releases the lease before it exits; the default 30 s
-  # terminationGracePeriodSeconds covers that.
+  # Single replica by default. More than one is SAFE with deploy/managed/
+  # only: ACTING is gated on a leader-elected Lease
+  # (kubehz-system/kubehz-live-agent, RBAC in deploy/managed/), so exactly one
+  # replica ever patches a MachineDeployment or deletes a Machine. The holder
+  # also does the reporting; the others stand by and send no heartbeats while
+  # it holds the lease, and a holder whose heartbeats fail for 5 minutes steps
+  # down. With the base alone (registered tier) no replica may read the Lease,
+  # so no election runs and every replica sends heartbeats: keep one replica
+  # there. Strategy Recreate still avoids two agents briefly double-reporting
+  # during a rollout. On shutdown the agent drains and releases the lease
+  # before it exits; the default 30 s terminationGracePeriodSeconds covers
+  # that.
   replicas: 1
   strategy:
     type: Recreate
@@ -67,22 +70,24 @@ spec:
       containers:
         - name: agent
           # PINNED BY DIGEST (multi-arch index: linux/amd64 + linux/arm64) on
-          # the PUBLIC, anonymously-pullable GHCR package — the ref a customer
-          # cluster can actually resolve. It used to default to the kubehz
-          # Harbor mirror (docker.kubehz.in.net), which no customer can pull:
-          # Harbor is private and IP-allowlisted, so the shipped default was a
-          # guaranteed ImagePullBackOff outside our own pilot.
+          # the PUBLIC, anonymously-pullable GHCR package: the ref every
+          # cluster can resolve. A default on a private or network-restricted
+          # registry is an ImagePullBackOff for anyone outside that network.
           #
-          # Dogfood / private-registry users override the REGISTRY, never this
-          # line — see the `images:` block in kustomization.yaml. The digest is
-          # the same in both registries (one build, mirrored by digest), so an
-          # override changes where the bytes come from, not which bytes.
+          # To pull from a mirror (an internal one, an air-gapped copy),
+          # override the REGISTRY, never this line: see the `images:` block in
+          # kustomization.yaml. The digest is the same in every mirror (one
+          # build, mirrored by digest), so an override changes where the bytes
+          # come from, not which bytes.
           #
           # Never a moving tag (`latest`, `main`): a digest is the only ref
-          # `cosign verify` and a rollback can reason about. Release artifacts
-          # (install.yaml on the GitHub Release) carry the released digest;
-          # this committed default tracks the last known-good main build.
-          image: ghcr.io/kernpilot/kubehz-agent@sha256:474994f0a64acf179fa5d8524aac8ee963b347ae29407895c8a8f51ec6d064aa
+          # `cosign verify` and a rollback can reason about. On main this is
+          # the newest release (the digest in its digest.txt; a commit after
+          # each release moves it). At a tag it is an OLDER image next to the
+          # manifests of that tag, because a tag cannot hold the digest of its
+          # own build: never install from a tag. For one exact version, apply
+          # that release's install.yaml or install-managed.yaml.
+          image: ghcr.io/kernpilot/kubehz-agent@sha256:54bba61ef3e7900f8cd7af8439e3a2164b7968024c336a9d836c269598b24080
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:
@@ -105,7 +110,7 @@ spec:
               memory: 64Mi
             limits:
               # Memory scales with the informer cache (nodes+pods+events). 256Mi
-              # is ample for the pilot; raise for very pod-dense clusters.
+              # is ample for most clusters; raise for very pod-dense ones.
               cpu: 200m
               memory: 256Mi
           securityContext:

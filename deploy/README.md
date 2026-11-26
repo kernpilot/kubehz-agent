@@ -1,13 +1,24 @@
 # Deploying kubehz-agent (live view + desired state)
 
 ```bash
-# Registered tier — observe + report only (no ACTING RBAC; the single write
-# is the ClusterInventory status mirror, see below):
-kubectl apply -k deploy/
+# One exact release, pinned: that release's own manifests (vX.Y.Z = the tag).
+# Registered tier: observe + report only (no ACTING RBAC; the single write is
+# the ClusterInventory status mirror, see below).
+kubectl apply -f https://github.com/kernpilot/kubehz-agent/releases/download/vX.Y.Z/install.yaml
+# Managed tier: adds the acting permission for server-gated worker scaling.
+kubectl apply -f https://github.com/kernpilot/kubehz-agent/releases/download/vX.Y.Z/install-managed.yaml
 
-# Managed tier — adds the acting permission for server-gated worker scaling:
+# Or from this tree, on main only (a tag holds an older image):
+kubectl apply -k deploy/
 kubectl apply -k deploy/managed/
 ```
+
+A release's manifests carry that release's own image. `deploy/` on `main`
+pins the newest release. At a tag, `deploy/` holds the manifests of that tag
+but an **older** image: the image digest of a tag exists only after the tag is
+built, so the tag cannot hold it (see [Image](#image)). That mix is not a
+release, so do not install from a tag. `SHA256SUMS` on the release covers both
+manifests.
 
 ## The base/managed RBAC split
 
@@ -109,23 +120,30 @@ committed default is the **public** package
 `ghcr.io/kernpilot/kubehz-agent@sha256:…`, which anyone can pull without a
 registry login. That is the ref a customer cluster resolves.
 
-It used to default to the internal Harbor mirror
-(`docker.kubehz.in.net/kubehz-builds/kubehz-agent`). Harbor is private and
-IP-allowlisted, so the shipped default was an `ImagePullBackOff` everywhere
-except our own pilot. Harbor is still mirrored by digest for dogfood pulls, but
-it is now the **override**, not the default:
+Which digest the tree holds:
+
+- On `main`: the newest release. After each release, a commit sets the image
+  to the digest in that release's `digest.txt`, so `kubectl kustomize deploy/`
+  pins the same image as the release's `install.yaml`.
+- At a tag `vX.Y.Z`: an older image (at v0.2.0, the v0.1.0 image) next to the
+  manifests of `vX.Y.Z`. The digest of `vX.Y.Z` exists only after the tag is
+  built, so the tag cannot hold it. Do not install from a tag. For exactly
+  `vX.Y.Z`, apply that release's `install.yaml` or `install-managed.yaml`.
+
+A mirror (an internal one, an air-gapped copy, or a pull-through cache) is an
+**override**, not the default. A default on a private or network-restricted
+registry is an `ImagePullBackOff` for anyone outside that network.
 
 ```yaml
 # deploy/kustomization.yaml (or deploy/managed/kustomization.yaml)
 images:
   - name: ghcr.io/kernpilot/kubehz-agent
-    newName: docker.kubehz.in.net/kubehz-builds/kubehz-agent
+    newName: registry.example.com/mirror/kubehz-agent
     digest: sha256:<the same digest>
 ```
 
-The same override retargets an air-gapped mirror or a pull-through cache. Keep
-the digest and change only the registry — one build is mirrored by digest, so
-the bytes are identical either way.
+Keep the digest and change only the registry. One build is mirrored by digest,
+so the bytes are identical either way.
 
 Never deploy a moving tag (`main`, `latest`). A digest is the only ref that
 `cosign verify` and a rollback can reason about. The release artifacts hold to
