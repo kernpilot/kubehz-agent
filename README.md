@@ -486,10 +486,15 @@ How they work, truthfully:
    in-flight budget and the one-pool-at-a-time roll are per-*process* state,
    so two actors would double every one of those bounds.
    **No Lease, no acting**: without the coordination RBAC (or the API) the
-   agent keeps reporting and never acts. After two minutes without the lease
-   it says so in its log. It cannot tell a peer holding the lease from a
-   missing grant or an unreachable apiserver, so the one warning names all
-   three. Running more than one replica is therefore safe. While a peer holds
+   agent keeps reporting and never acts. Before it contends, it reads the
+   Lease once. When the apiserver refuses that read, as on the base install,
+   the agent says so once in its log and does not contend. It reads the
+   Lease again every 5 minutes, so a grant that you apply later starts
+   acting without a restart. In every other case it contends, and after two
+   minutes without the lease it says so in its log. It cannot tell a peer
+   holding the lease from a missing write grant or an unreachable
+   apiserver, so that warning names all three. Running more than one
+   replica is therefore safe. While a peer holds
    the lease, a standby sends **no heartbeats**: the platform keeps one
    action snapshot per cluster and reads a beat without actions as "clear",
    so a standby's beats would erase the holder's reports. The holder reports

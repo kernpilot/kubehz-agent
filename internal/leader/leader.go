@@ -13,7 +13,13 @@
 // arbitrated by the apiserver. No Lease — no RBAC, no coordination API, an
 // unreachable apiserver, or simply a peer holding it — means no acting. The
 // agent keeps reporting, the same fail-toward-report-only posture every other
-// guard has, and says so in its log (see AcquireWarnAfter).
+// guard has, and says so in its log (see AccessRecheck and AcquireWarnAfter).
+//
+// A process that may not even READ the Lease (the base install grants no
+// Lease verb) does not contend at all. The election library would retry the
+// refused read every RetryPeriod and log each refusal through klog, for as
+// long as the pod runs. Run reads the Lease once instead, says once that it
+// may not, and reads again every AccessRecheck.
 //
 // The handover order is the safety property, so Run owns it instead of the
 // election library:
@@ -79,9 +85,14 @@ const (
 	// DefaultAcquireWarnAfter is how long the agent waits for the lease before
 	// it says, in its OWN log, that it is reporting but not acting. Contending
 	// forever is silent by design — a standby replica must not shout — and a
-	// missing RBAC grant looks exactly the same from here, so the one warning
-	// names both causes.
+	// missing write grant looks exactly the same from here, so the one warning
+	// names both causes. (A missing READ grant is found before the election
+	// starts, see DefaultAccessRecheck.)
 	DefaultAcquireWarnAfter = 2 * time.Minute
+	// DefaultAccessRecheck is how often a process that may not read the Lease
+	// reads it again. A grant applied later then starts acting within this
+	// time, without a restart, at the cost of one refused read per interval.
+	DefaultAccessRecheck = 5 * time.Minute
 )
 
 // Config configures Run. Client, Namespace and Identity are required; the
@@ -99,6 +110,9 @@ type Config struct {
 	// AcquireWarnAfter bounds the silence: without the lease by then, the agent
 	// logs that it is reporting and not acting (default DefaultAcquireWarnAfter).
 	AcquireWarnAfter time.Duration
+	// AccessRecheck is how often Run reads the Lease again while the apiserver
+	// refuses this process the read (default DefaultAccessRecheck).
+	AccessRecheck time.Duration
 	// Observer, when set, records every read of the Lease, so the reporting
 	// side can tell when ANOTHER replica holds it (see Observer).
 	Observer *Observer
@@ -157,6 +171,9 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 	if cfg.AcquireWarnAfter <= 0 {
 		cfg.AcquireWarnAfter = DefaultAcquireWarnAfter
 	}
+	if cfg.AccessRecheck <= 0 {
+		cfg.AccessRecheck = DefaultAccessRecheck
+	}
 	// No drain margin = a window in which a peer may act while this replica
 	// still does (see the Default timings).
 	if cfg.LeaseDuration <= cfg.RenewDeadline+cfg.RetryPeriod {
@@ -182,6 +199,9 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 	}
 
 	for {
+		if !awaitLeaseAccess(ctx, cfg, lock, log) {
+			return ctx.Err()
+		}
 		if !awaitMayLead(ctx, cfg, lock, log) {
 			return ctx.Err()
 		}
@@ -197,6 +217,47 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(cfg.RetryPeriod):
+		}
+	}
+}
+
+// awaitLeaseAccess returns true once the apiserver lets this process read the
+// Lease, and false when ctx ends first. It reads through lock, so the Observer
+// records the read like any other (the first heartbeat waits for one).
+//
+// Only a Forbidden answer keeps the process out of the race. Any other result
+// (the Lease, its absence, a timeout, a server error) goes to the election as
+// before: the library retries it, and AcquireWarnAfter names the causes. A
+// refused read is the base install, where no replica can ever hold the Lease,
+// so contending would only repeat the refusal every RetryPeriod.
+func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interface, log *slog.Logger) bool {
+	lease := cfg.Namespace + "/" + cfg.Name
+	refused := false
+	for {
+		rctx, cancel := context.WithTimeout(ctx, cfg.RenewDeadline)
+		_, _, err := lock.Get(rctx)
+		cancel()
+		if ctx.Err() != nil {
+			return false
+		}
+		if !apierrors.IsForbidden(err) {
+			if refused {
+				log.Info("the acting lease is readable now; contending for it", "lease", lease, "identity", cfg.Identity)
+			}
+			return true
+		}
+		if !refused {
+			refused = true
+			log.Warn("the apiserver refuses this agent the acting lease, so the agent is REPORTING but NOT acting and does not contend for it."+
+				" Acting needs the Lease Role of the managed tier (deploy/managed). The agent reads the lease again every "+cfg.AccessRecheck.String(),
+				"lease", lease, "identity", cfg.Identity, "error", err.Error())
+		}
+		t := time.NewTimer(cfg.AccessRecheck)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
 		}
 	}
 }

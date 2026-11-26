@@ -883,8 +883,8 @@ func (s *syncBuffer) String() string {
 }
 
 // Without the Lease RBAC the agent must NOT act — and must say so in its own
-// log. The election library retries a denied lease exactly like a held one, so
-// the agent cannot tell them apart; the one warning names both causes.
+// log. The refused read keeps it out of the election (access_test.go has the
+// counts); the warning names the missing overlay.
 func TestRun_WithoutLeaseRBACItReportsAndDoesNotAct(t *testing.T) {
 	client := fake.NewClientset()
 	client.PrependReactor("*", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
