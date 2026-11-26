@@ -490,7 +490,10 @@ How they work, truthfully:
    Lease once. When the apiserver refuses that read, as on the base install,
    the agent says so once in its log and does not contend. It reads the
    Lease again every 5 minutes, so a grant that you apply later starts
-   acting without a restart. In every other case it contends, and after two
+   acting without a restart. A grant removed later has the same effect: the
+   next refused read ends the election (and stops acting at the next
+   renewal), and the agent goes back to that read. In every other case it
+   contends, and after two
    minutes without the lease it says so in its log. It cannot tell a peer
    holding the lease from a missing write grant or an unreachable
    apiserver, so that warning names all three. Running more than one

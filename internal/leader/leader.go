@@ -19,7 +19,8 @@
 // Lease verb) does not contend at all. The election library would retry the
 // refused read every RetryPeriod and log each refusal through klog, for as
 // long as the pod runs. Run reads the Lease once instead, says once that it
-// may not, and reads again every AccessRecheck.
+// may not, and reads again every AccessRecheck. A refused read inside the
+// election ends the term and comes back to that read.
 //
 // The handover order is the safety property, so Run owns it instead of the
 // election library:
@@ -53,6 +54,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -225,11 +227,13 @@ func Run(ctx context.Context, cfg Config, onLeading func(context.Context)) error
 // Lease, and false when ctx ends first. It reads through lock, so the Observer
 // records the read like any other (the first heartbeat waits for one).
 //
-// Only a Forbidden answer keeps the process out of the race. Any other result
-// (the Lease, its absence, a timeout, a server error) goes to the election as
-// before: the library retries it, and AcquireWarnAfter names the causes. A
-// refused read is the base install, where no replica can ever hold the Lease,
-// so contending would only repeat the refusal every RetryPeriod.
+// Only a refused read (leaseRefused) keeps the process out of the race. Any
+// other result (the Lease, its absence, a timeout, a server error) goes to
+// the election as before: the library retries it, and AcquireWarnAfter names
+// the causes. A refused read is the base install, where no replica can ever
+// hold the Lease, so contending would only repeat the refusal every
+// RetryPeriod. A refusal that comes later, inside the election, ends the term
+// and brings the process back here (see refusalLock).
 func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interface, log *slog.Logger) bool {
 	lease := cfg.Namespace + "/" + cfg.Name
 	refused := false
@@ -240,7 +244,7 @@ func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interfa
 		if ctx.Err() != nil {
 			return false
 		}
-		if !apierrors.IsForbidden(err) {
+		if !leaseRefused(err) {
 			if refused {
 				log.Info("the acting lease is readable now; contending for it", "lease", lease, "identity", cfg.Identity)
 			}
@@ -248,7 +252,7 @@ func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interfa
 		}
 		if !refused {
 			refused = true
-			log.Warn("the apiserver refuses this agent the acting lease, so the agent is REPORTING but NOT acting and does not contend for it."+
+			log.Warn("the apiserver refuses this agent a read of the acting lease, so the agent is REPORTING but NOT acting and does not contend for it."+
 				" Acting needs the Lease Role of the managed tier (deploy/managed). The agent reads the lease again every "+cfg.AccessRecheck.String(),
 				"lease", lease, "identity", cfg.Identity, "error", err.Error())
 		}
@@ -260,6 +264,35 @@ func awaitLeaseAccess(ctx context.Context, cfg Config, lock resourcelock.Interfa
 		case <-t.C:
 		}
 	}
+}
+
+// leaseRefused reports whether err is the apiserver's own refusal of a Lease
+// request: a Forbidden Status that client-go decoded from the response. Like
+// a 404 (see leaseAbsent), a 403 page without a Status (from a proxy, say) is
+// marked as an unexpected server response, and it proves nothing about the
+// grant, so it goes to the election like any other failure.
+func leaseRefused(err error) bool {
+	return apierrors.IsForbidden(err) && !apierrors.IsUnexpectedServerError(err)
+}
+
+// refusalLock reports the first refused read of the election to refused.
+// The access read before a term cannot see a refusal that comes later: a
+// first read that failed for another reason (a timeout while the apiserver
+// starts), or a grant removed while this process contends. The library would
+// then repeat the refused read every RetryPeriod, and log each one, for as
+// long as the pod runs. term ends instead, and Run goes back to the access
+// read, which says so once.
+type refusalLock struct {
+	resourcelock.Interface
+	refused func()
+}
+
+func (l *refusalLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	rec, raw, err := l.Interface.Get(ctx)
+	if leaseRefused(err) {
+		l.refused()
+	}
+	return rec, raw, err
 }
 
 // awaitMayLead returns true once cfg.MayLead lets this process contend, and
@@ -302,8 +335,8 @@ func awaitMayLead(ctx context.Context, cfg Config, lock resourcelock.Interface, 
 func term(ctx context.Context, cfg Config, lock resourcelock.Interface, onLeading func(context.Context), log *slog.Logger) error {
 	lease := cfg.Namespace + "/" + cfg.Name
 
-	// termCtx ends the term: the caller's cancel (a shutdown) or a step-down
-	// (MayLead). Both take the same path below.
+	// termCtx ends the term: the caller's cancel (a shutdown), a step-down
+	// (MayLead) or a refused read (refusalLock). All take the same path below.
 	termCtx, stopTerm := context.WithCancel(ctx)
 	defer stopTerm()
 
@@ -319,9 +352,10 @@ func term(ctx context.Context, cfg Config, lock resourcelock.Interface, onLeadin
 	electorDone := make(chan struct{})
 
 	// One warning per attempt if the lease stays out of reach. The library
-	// retries a held lease, a denied one and an unreachable apiserver the
+	// retries a held lease, a denied write and an unreachable apiserver the
 	// same way, and none of them reaches this code as an error, so the
-	// warning names all three causes and the agent keeps contending.
+	// warning names all three causes and the agent keeps contending. (A
+	// denied read ends the term, see refusalLock.)
 	go func() {
 		select {
 		case <-acquired:
@@ -369,8 +403,16 @@ func term(ctx context.Context, cfg Config, lock resourcelock.Interface, onLeadin
 		}()
 	}
 
+	// A refused read ends the term in the step-down order. The access read in
+	// Run then says so once and waits AccessRecheck.
+	var refused atomic.Bool
+	electLock := &refusalLock{Interface: lock, refused: func() {
+		refused.Store(true)
+		stopTerm()
+	}}
+
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:          lock,
+		Lock:          electLock,
 		LeaseDuration: cfg.LeaseDuration,
 		RenewDeadline: cfg.RenewDeadline,
 		RetryPeriod:   cfg.RetryPeriod,
@@ -415,6 +457,9 @@ func term(ctx context.Context, cfg Config, lock resourcelock.Interface, onLeadin
 		switch {
 		case led && ctx.Err() != nil:
 			log.Info("agent stopping; acting stopped and drained", "lease", lease, "identity", cfg.Identity)
+		case led && refused.Load():
+			log.Warn("the apiserver refused a read of the acting lease; acting stopped and drained (reporting continues)",
+				"lease", lease, "identity", cfg.Identity)
 		case led:
 			log.Info("stepped down; acting stopped and drained", "lease", lease, "identity", cfg.Identity)
 		}

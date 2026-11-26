@@ -923,4 +923,12 @@ func TestRun_WithoutLeaseRBACItReportsAndDoesNotAct(t *testing.T) {
 	if !strings.Contains(out, "deploy/managed") {
 		t.Errorf("log = %q, want the missing RBAC overlay named as a cause", out)
 	}
+	// The warning is the access read's. The election's own warning (due after
+	// AcquireWarnAfter, well inside this run) would mean that it contended.
+	if !strings.Contains(out, "refuses this agent a read") {
+		t.Errorf("log = %q, want the refused read named", out)
+	}
+	if strings.Contains(out, "no acting lease after") {
+		t.Errorf("log = %q: the agent contended for a Lease it may not read", out)
+	}
 }
