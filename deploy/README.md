@@ -8,16 +8,17 @@ kubectl apply -f https://github.com/kernpilot/kubehz-agent/releases/download/vX.
 # Managed tier: adds the acting permission for server-gated worker scaling.
 kubectl apply -f https://github.com/kernpilot/kubehz-agent/releases/download/vX.Y.Z/install-managed.yaml
 
-# Or from this tree: the same two tiers.
+# Or from this tree, on main only (a tag holds an older image):
 kubectl apply -k deploy/
 kubectl apply -k deploy/managed/
 ```
 
-The release manifests are the only install that names one exact version.
-`deploy/` on `main` pins the newest release, but `deploy/` at a tag pins the
-release BEFORE that tag: the image digest of a tag exists only after the tag
-is built, so the tag cannot hold it (see [Image](#image)). `SHA256SUMS` on the
-release covers both manifests.
+A release's manifests carry that release's own image. `deploy/` on `main`
+pins the newest release. At a tag, `deploy/` holds the manifests of that tag
+but an **older** image: the image digest of a tag exists only after the tag is
+built, so the tag cannot hold it (see [Image](#image)). That mix is not a
+release, so do not install from a tag. `SHA256SUMS` on the release covers both
+manifests.
 
 ## The base/managed RBAC split
 
@@ -122,11 +123,12 @@ registry login. That is the ref a customer cluster resolves.
 Which digest the tree holds:
 
 - On `main`: the newest release. After each release, a commit sets the image
-  to that release's `digest.txt`, so `kubectl kustomize deploy/` pins the same
-  image as the release's `install.yaml`.
-- At a tag `vX.Y.Z`: the release before it. The digest of `vX.Y.Z` exists only
-  after the tag is built, so the tag cannot hold it. For exactly `vX.Y.Z`,
-  apply that release's `install.yaml` or `install-managed.yaml`.
+  to the digest in that release's `digest.txt`, so `kubectl kustomize deploy/`
+  pins the same image as the release's `install.yaml`.
+- At a tag `vX.Y.Z`: an older image (at v0.2.0, the v0.1.0 image) next to the
+  manifests of `vX.Y.Z`. The digest of `vX.Y.Z` exists only after the tag is
+  built, so the tag cannot hold it. Do not install from a tag. For exactly
+  `vX.Y.Z`, apply that release's `install.yaml` or `install-managed.yaml`.
 
 A mirror (an internal one, an air-gapped copy, or a pull-through cache) is an
 **override**, not the default. A default on a private or network-restricted

@@ -595,8 +595,8 @@ docker build -t kubehz-agent:dev --build-arg VERSION=dev .
 # deploy (after the kubehz-agent Secret is bootstrapped by the lok8s plumbing);
 # coexists with the bash CronJob agent: see deploy/README.md for the naming
 # contract and the image digest-pinning rules. One exact release: apply its
-# install.yaml or install-managed.yaml (deploy/README.md). From this tree, main
-# pins the newest release, and a tag pins the release before it:
+# install.yaml or install-managed.yaml (deploy/README.md). From this tree, use
+# main only (the newest release): a tag holds an older image.
 kubectl apply -k deploy/          # registered tier: observe + report only
 kubectl apply -k deploy/managed/  # managed tier: + acting RBAC (scale/upgrade
                                   #   patch, machineIssues read, heal delete,
@@ -664,7 +664,7 @@ change which agent image runs in a customer's cluster.
 
 The repository is public and the GHCR package is already public: a customer
 can pull `ghcr.io/kernpilot/kubehz-agent` today with no credentials. So cutting a
-version is one owner action and nothing else:
+version takes one owner action, then the repin of `main` after the run (below):
 
 ```bash
 git tag -a vX.Y.Z -m "kubehz-agent vX.Y.Z" && git push origin vX.Y.Z
@@ -679,11 +679,10 @@ workflow**) with the same tag. Every step is idempotent.
 
 After the release run, pin `main` to it. Set the image in `deploy/base/deployment.yaml`
 and the digest in the two override examples (`deploy/kustomization.yaml`,
-`deploy/base/kustomization.yaml`) to the release's `digest.txt`. Check that
-`kubectl kustomize deploy/` and `deploy/managed/` render the image of
-`install.yaml` and `install-managed.yaml`. The tag itself keeps the digest of
-the release before it, because the release run makes the new digest from the
-tag.
+`deploy/base/kustomization.yaml`) to the digest in the release's `digest.txt`.
+Check that `kubectl kustomize deploy/` and `deploy/managed/` render the image of
+`install.yaml` and `install-managed.yaml`. The tag itself keeps the older image,
+because the release run makes the new digest from the tag.
 
 The internal mirror step needs the `HARBOR_USERNAME` / `HARBOR_PASSWORD`
 repository secrets. Without them it prints a line and skips. The mirror is
