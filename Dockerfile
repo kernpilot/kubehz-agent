@@ -5,7 +5,7 @@
 # Docker Hub on 2026-11-11. Update the tag AND the digest together, and keep
 # both in lockstep with go.mod's `toolchain` and the workflows' GO_VERSION —
 # older toolchains carry reachable stdlib advisories (see go.mod).
-FROM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS build
+FROM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS build
 
 WORKDIR /src
 
