@@ -67,22 +67,23 @@ spec:
       containers:
         - name: agent
           # PINNED BY DIGEST (multi-arch index: linux/amd64 + linux/arm64) on
-          # the PUBLIC, anonymously-pullable GHCR package — the ref a customer
-          # cluster can actually resolve. It used to default to the kubehz
-          # Harbor mirror (docker.kubehz.in.net), which no customer can pull:
-          # Harbor is private and IP-allowlisted, so the shipped default was a
-          # guaranteed ImagePullBackOff outside our own pilot.
+          # the PUBLIC, anonymously-pullable GHCR package: the ref every
+          # cluster can resolve. A default on a private or network-restricted
+          # registry is an ImagePullBackOff for anyone outside that network.
           #
-          # Dogfood / private-registry users override the REGISTRY, never this
-          # line — see the `images:` block in kustomization.yaml. The digest is
-          # the same in both registries (one build, mirrored by digest), so an
-          # override changes where the bytes come from, not which bytes.
+          # To pull from a mirror (an internal one, an air-gapped copy),
+          # override the REGISTRY, never this line: see the `images:` block in
+          # kustomization.yaml. The digest is the same in every mirror (one
+          # build, mirrored by digest), so an override changes where the bytes
+          # come from, not which bytes.
           #
           # Never a moving tag (`latest`, `main`): a digest is the only ref
-          # `cosign verify` and a rollback can reason about. Release artifacts
-          # (install.yaml on the GitHub Release) carry the released digest;
-          # this committed default tracks the last known-good main build.
-          image: ghcr.io/kernpilot/kubehz-agent@sha256:474994f0a64acf179fa5d8524aac8ee963b347ae29407895c8a8f51ec6d064aa
+          # `cosign verify` and a rollback can reason about. On main this is
+          # the newest release (its digest.txt; a commit after each release
+          # moves it). At a tag it is the release BEFORE that tag, because a
+          # tag cannot hold the digest of its own build. For one exact
+          # version, apply that release's install.yaml or install-managed.yaml.
+          image: ghcr.io/kernpilot/kubehz-agent@sha256:54bba61ef3e7900f8cd7af8439e3a2164b7968024c336a9d836c269598b24080
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:

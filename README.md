@@ -594,7 +594,9 @@ docker build -t kubehz-agent:dev --build-arg VERSION=dev .
 
 # deploy (after the kubehz-agent Secret is bootstrapped by the lok8s plumbing);
 # coexists with the bash CronJob agent: see deploy/README.md for the naming
-# contract and the image digest-pinning rules.
+# contract and the image digest-pinning rules. One exact release: apply its
+# install.yaml or install-managed.yaml (deploy/README.md). From this tree, main
+# pins the newest release, and a tag pins the release before it:
 kubectl apply -k deploy/          # registered tier: observe + report only
 kubectl apply -k deploy/managed/  # managed tier: + acting RBAC (scale/upgrade
                                   #   patch, machineIssues read, heal delete,
@@ -619,7 +621,7 @@ Versions are verified against their registries before pinning, never guessed
 
 `ci.yaml` is the continuous lane. Every push to `main` runs
 `gofmt`/`vet`/`golangci-lint`/`go test -race`/`govulncheck`, then builds the
-moving `main` image and the Harbor mirror.
+moving `main` image and its copy in the internal mirror.
 
 `dep-scan.yml` runs `osv-scanner` each day on `main`: a new advisory shows without
 a commit. It matches offline against a downloaded archive of advisories, so it
@@ -636,7 +638,7 @@ What a release publishes:
 
 | Requirement | How it ships |
 |---|---|
-| **Public** image | `ghcr.io/kernpilot/kubehz-agent`, anonymously pullable. GHCR is the only registry on the critical path; Harbor is mirrored afterwards and cannot fail a release. |
+| **Public** image | `ghcr.io/kernpilot/kubehz-agent`, anonymously pullable. GHCR is the only registry on the critical path; the internal mirror is copied afterwards and cannot fail a release. |
 | **Multi-arch** | `linux/amd64` + `linux/arm64`. A step reads the published index back and fails the release if either platform is missing. |
 | **Distroless/static base** | `gcr.io/distroless/static-debian12:nonroot`, itself pinned by digest in the `Dockerfile`. |
 | **cosign-signed** | Keyless, through the Actions OIDC identity. No long-lived key exists. |
@@ -675,9 +677,18 @@ publish the GitHub Release with `install.yaml`, `install-managed.yaml`,
 If a run dies halfway, re-run the workflow by hand (**Actions → Release → Run
 workflow**) with the same tag. Every step is idempotent.
 
-The Harbor mirror step needs the `HARBOR_USERNAME` / `HARBOR_PASSWORD`
-repository secrets. Without them it prints a line and skips. Harbor is a private
-convenience mirror, so its absence must never hold up a customer release.
+After the release run, pin `main` to it. Set the image in `deploy/base/deployment.yaml`
+and the digest in the two override examples (`deploy/kustomization.yaml`,
+`deploy/base/kustomization.yaml`) to the release's `digest.txt`. Check that
+`kubectl kustomize deploy/` and `deploy/managed/` render the image of
+`install.yaml` and `install-managed.yaml`. The tag itself keeps the digest of
+the release before it, because the release run makes the new digest from the
+tag.
+
+The internal mirror step needs the `HARBOR_USERNAME` / `HARBOR_PASSWORD`
+repository secrets. Without them it prints a line and skips. The mirror is
+private and only a convenience, so its absence must never hold up a customer
+release.
 
 ## Follow-ups
 
