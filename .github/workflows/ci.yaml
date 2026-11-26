@@ -3,7 +3,7 @@ name: CI
 # Actions are pinned by COMMIT SHA (README "Security & supply chain": a tag
 # can move, a commit cannot). The trailing comment records the tag each SHA
 # was resolved from — the same SHAs release.yaml carries (verified against
-# the GitHub API 2026-08-21; golangci-lint v2.13.2 verified 2026-09-05).
+# the GitHub API 2026-08-21; golangci-lint v2.15.0 verified 2026-11-26).
 # Bump the SHA and the comment together, never one alone. Until the first
 # vX.Y.Z release is cut, the `main` image this lane builds IS what customers
 # and lok8s pin, so this lane holds the release lane's pinning bar.
@@ -61,8 +61,9 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           # Pinned, not `latest`: a linter release can add checks that turn a
-          # green tree red with no code change.
-          version: v2.13.2
+          # green tree red with no code change. release.yaml has the same
+          # pin: change the two together.
+          version: v2.15.0
 
       - name: go test (race + coverage)
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
